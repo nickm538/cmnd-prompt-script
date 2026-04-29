@@ -24,10 +24,12 @@ import sys
 import time
 import json
 import logging
+import math
 import warnings
 import traceback
 from massive import RESTClient
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -37,6 +39,8 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 import yfinance as yf
+
+ET_TZ = ZoneInfo("US/Eastern")
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -75,6 +79,11 @@ ALPHAVANTAGE_API_KEY = os.environ.get(
 MBOUM_API_KEY = os.environ.get(
     "MBOUM_API_KEY", "xfAMuSlx5yUmX4PKegfarmd7y8799RcxjxKiNAUh"
 )
+# Options-tier MBOUM key (different plan that includes the /v1/markets/options
+# endpoint). Set via env var or falls back to the user's options-plan key.
+MBOUM_OPTIONS_KEY = os.environ.get(
+    "MBOUM_OPTIONS_KEY", "642|Splqvb0O7fzSSI0ptlYIs4qXt4N4UaqwJHToVQ1X"
+)
 MBOUM_BASE_URL = "https://api.mboum.com"
 MASSIVE_BASE_URL = "https://api.massive.com/v2"
 
@@ -108,8 +117,43 @@ log = logging.getLogger("pipeline")
 
 def now_et() -> str:
     """Current time in US/Eastern as formatted string."""
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("US/Eastern")).strftime("%Y-%m-%d %H:%M:%S ET")
+    return datetime.now(ET_TZ).strftime("%Y-%m-%d %H:%M:%S ET")
+
+
+def now_et_dt() -> datetime:
+    """Current timezone-aware ET datetime."""
+    return datetime.now(ET_TZ)
+
+
+def is_market_open_now() -> bool:
+    """Returns True if RTH market is currently open (Mon-Fri 09:30-16:00 ET).
+    Holiday-aware-best-effort: skips obvious weekend; intra-day partial-bar
+    detection still uses last-bar timestamp comparison upstream."""
+    now = now_et_dt()
+    if now.weekday() >= 5:
+        return False
+    open_t = dtime(9, 30)
+    close_t = dtime(16, 0)
+    return open_t <= now.time() <= close_t
+
+
+def last_bar_is_partial(df: pd.DataFrame) -> bool:
+    """Detect if the final OHLCV bar represents an in-progress session.
+    During RTH, vendors expose today's intraday-aggregated bar whose volume is
+    incomplete -- using it for volume-surge / volume-ratio checks is a
+    well-known false-negative source. Returns True only if last bar's date
+    matches today (ET) AND market is still open."""
+    if df is None or df.empty:
+        return False
+    if not is_market_open_now():
+        return False
+    try:
+        last_idx = df.index[-1]
+        last_date = pd.Timestamp(last_idx).date()
+        today = now_et_dt().date()
+        return last_date == today
+    except Exception:
+        return False
 
 
 def is_missing_value(val) -> bool:
@@ -174,6 +218,270 @@ def clamp(val, lo, hi):
 class PipelineError(Exception):
     """Fatal pipeline error -- stop immediately per SKILL policy."""
     pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MACRO REGIME -- live geopolitical / market-context overlay
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MacroRegime:
+    """
+    Real-time macro context. Pulled from public Yahoo v8 chart endpoints
+    (no key required). Drives the panel "M" (market direction) score and
+    final position-sizing scaler.
+
+    Tracked symbols and rationale (no hardcoded equity tickers -- only
+    indices/factors used universally as macro context):
+      - ^GSPC  (S&P 500)              -- broad equities trend
+      - ^NDX   (Nasdaq 100)           -- risk / growth proxy
+      - ^RUT   (Russell 2000)         -- small-cap risk-on gauge
+      - ^VIX   (CBOE Volatility)      -- fear gauge / IV regime
+      - ^TNX   (10Y UST yield)        -- duration / discount-rate
+      - ^IRX   (3M UST yield)         -- short rate
+      - DX-Y.NYB (DXY)                -- USD strength (geopolitical risk-off)
+      - GC=F   (Gold futures)         -- safe haven / inflation hedge
+      - CL=F   (WTI crude)            -- supply-shock / geopolitics
+      - HG=F   (Copper)               -- global growth proxy
+      - ^MOVE  (bond vol, optional)   -- credit/rate stress
+    """
+
+    SYMBOLS = {
+        "spx": "^GSPC",
+        "ndx": "^NDX",
+        "rut": "^RUT",
+        "vix": "^VIX",
+        "tnx": "^TNX",
+        "irx": "^IRX",
+        "dxy": "DX-Y.NYB",
+        "gold": "GC=F",
+        "wti": "CL=F",
+        "copper": "HG=F",
+    }
+
+    def __init__(self):
+        self.yahoo = YahooDirectAPI()
+        self.snapshot: Dict[str, Dict] = {}
+        self.regime_score: float = 60.0
+        self.regime_label: str = "NEUTRAL"
+        self.notes: List[str] = []
+
+    def _series(self, symbol: str, range_: str = "2y") -> Optional[pd.DataFrame]:
+        """Pull recent OHLCV via Yahoo v8 chart -- no key needed."""
+        url = f"{self.yahoo.BASE_URL}/{symbol}"
+        params = {"range": range_, "interval": "1d", "includePrePost": "false"}
+        try:
+            r = self.yahoo.session.get(url, params=params, timeout=12)
+            if r.status_code != 200:
+                return None
+            data = r.json().get("chart", {}).get("result")
+            if not data:
+                return None
+            chart = data[0]
+            ts = chart.get("timestamp", []) or []
+            quote = chart.get("indicators", {}).get("quote", [{}])[0]
+            closes = quote.get("close", []) or []
+            if len(ts) < 30 or len(closes) < 30:
+                return None
+            idx = pd.to_datetime(ts, unit="s")
+            df = pd.DataFrame({"Close": closes}, index=idx).dropna()
+            return df if len(df) >= 30 else None
+        except Exception:
+            return None
+
+    def load(self) -> None:
+        """Fetch all macro symbols in parallel and compute regime score."""
+        log.info("Loading live macro regime context (VIX, yields, DXY, gold, oil, indices)...")
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futures = {ex.submit(self._series, sym): name
+                       for name, sym in self.SYMBOLS.items()}
+            for f in as_completed(futures):
+                name = futures[f]
+                try:
+                    df = f.result()
+                    if df is not None:
+                        self.snapshot[name] = {
+                            "df": df,
+                            "last": float(df["Close"].iloc[-1]),
+                            "ret_1d": float(df["Close"].pct_change().iloc[-1]) if len(df) >= 2 else 0.0,
+                            "ret_5d": float(df["Close"].pct_change(5).iloc[-1]) if len(df) >= 6 else 0.0,
+                            "ret_20d": float(df["Close"].pct_change(20).iloc[-1]) if len(df) >= 21 else 0.0,
+                            "ret_63d": float(df["Close"].pct_change(63).iloc[-1]) if len(df) >= 64 else 0.0,
+                        }
+                except Exception:
+                    pass
+
+        self._score_regime()
+
+    def _score_regime(self) -> None:
+        """Composite 0-100 macro regime score. Higher = more risk-on."""
+        score = 50.0
+        notes = []
+
+        spx = self.snapshot.get("spx")
+        if spx is not None and len(spx["df"]) >= 200:
+            close = spx["df"]["Close"]
+            sma50 = close.rolling(50).mean().iloc[-1]
+            sma200 = close.rolling(200).mean().iloc[-1]
+            last = close.iloc[-1]
+            if last > sma50 > sma200:
+                score += 18
+                notes.append("SPX in uptrend (above 50/200d SMA, golden alignment)")
+            elif last > sma200:
+                score += 9
+                notes.append("SPX above 200d SMA")
+            elif last > sma50:
+                score += 4
+                notes.append("SPX above 50d SMA (mixed)")
+            else:
+                score -= 12
+                notes.append("SPX below key MAs -- defensive regime")
+
+        # VIX regime
+        vix = self.snapshot.get("vix")
+        if vix is not None:
+            vlast = vix["last"]
+            if vlast < 14:
+                score += 8
+                notes.append(f"VIX {vlast:.1f} -- complacent / risk-on")
+            elif vlast < 18:
+                score += 4
+                notes.append(f"VIX {vlast:.1f} -- benign")
+            elif vlast < 25:
+                score -= 2
+                notes.append(f"VIX {vlast:.1f} -- elevated")
+            elif vlast < 35:
+                score -= 12
+                notes.append(f"VIX {vlast:.1f} -- stressed")
+            else:
+                score -= 22
+                notes.append(f"VIX {vlast:.1f} -- panic regime")
+
+        # Yield curve (10Y - 3M proxy via ^TNX - ^IRX, in percentage points)
+        # Yahoo `^TNX` is typically quoted as yield * 10 (e.g. 43.0 => 4.30%),
+        # while `^IRX` is already in percent. Normalize both to percent first.
+        tnx = self.snapshot.get("tnx")
+        irx = self.snapshot.get("irx")
+        if tnx is not None and irx is not None:
+            tnx_pct = tnx["last"] / 10.0
+            irx_pct = irx["last"]
+            spread = tnx_pct - irx_pct
+            if spread > 1.5:
+                score += 6
+                notes.append(f"Yield curve steep (+{spread:.2f}pp) -- pro-growth")
+            elif spread > 0.25:
+                score += 2
+                notes.append(f"Yield curve positive (+{spread:.2f}pp)")
+            elif spread > -0.25:
+                score -= 2
+                notes.append(f"Yield curve flat ({spread:+.2f}pp)")
+            else:
+                score -= 8
+                notes.append(f"Yield curve INVERTED ({spread:+.2f}pp) -- recession signal")
+
+        # DXY -- strong USD pressures multinationals/EM, mixed for domestics
+        dxy = self.snapshot.get("dxy")
+        if dxy is not None:
+            r20 = dxy.get("ret_20d", 0.0)
+            if r20 > 0.04:
+                score -= 4
+                notes.append(f"DXY +{r20:.1%} 20d -- USD strength = EPS headwind")
+            elif r20 < -0.03:
+                score += 3
+                notes.append(f"DXY {r20:.1%} 20d -- USD weakness = EPS tailwind")
+
+        # Crude (geopolitics / supply shock)
+        wti = self.snapshot.get("wti")
+        if wti is not None:
+            r20 = wti.get("ret_20d", 0.0)
+            if r20 > 0.15:
+                score -= 4
+                notes.append(f"WTI +{r20:.1%} 20d -- supply shock / inflation risk")
+            elif r20 < -0.15:
+                score += 1
+                notes.append(f"WTI {r20:.1%} 20d -- demand softness or supply easing")
+
+        # Gold (safe-haven flow, geopolitical tension)
+        gold = self.snapshot.get("gold")
+        if gold is not None and vix is not None:
+            r20 = gold.get("ret_20d", 0.0)
+            if r20 > 0.06 and vix["last"] > 20:
+                score -= 3
+                notes.append(f"Gold +{r20:.1%} with elevated VIX -- safe-haven bid")
+
+        # Copper (global growth proxy, "Dr. Copper")
+        copper = self.snapshot.get("copper")
+        if copper is not None:
+            r20 = copper.get("ret_20d", 0.0)
+            if r20 > 0.05:
+                score += 3
+                notes.append(f"Copper +{r20:.1%} 20d -- pro-cyclical signal")
+            elif r20 < -0.05:
+                score -= 3
+                notes.append(f"Copper {r20:.1%} 20d -- growth concern")
+
+        # Russell vs SPX (small-cap leadership = risk-on)
+        rut = self.snapshot.get("rut")
+        if rut is not None and spx is not None:
+            excess = rut.get("ret_20d", 0.0) - spx.get("ret_20d", 0.0)
+            if excess > 0.02:
+                score += 3
+                notes.append(f"RUT outperforming SPX by {excess:.1%} -- breadth healthy")
+            elif excess < -0.04:
+                score -= 4
+                notes.append(f"RUT lagging SPX by {excess:.1%} -- narrow leadership")
+
+        score = clamp(score, 0.0, 100.0)
+        if score >= 75:
+            label = "RISK_ON"
+        elif score >= 60:
+            label = "CONSTRUCTIVE"
+        elif score >= 45:
+            label = "NEUTRAL"
+        elif score >= 30:
+            label = "DEFENSIVE"
+        else:
+            label = "RISK_OFF"
+
+        self.regime_score = float(score)
+        self.regime_label = label
+        self.notes = notes
+
+        log.info(f"  Macro regime: {label} (score {score:.0f}/100)")
+        for n in notes:
+            log.info(f"    - {n}")
+
+    def position_sizing_scalar(self) -> float:
+        """Multiplier in [0.4, 1.2] for downstream position sizing.
+        Used to scale the recommended dollar exposure based on regime."""
+        s = self.regime_score
+        if s >= 75:
+            return 1.20
+        if s >= 60:
+            return 1.00
+        if s >= 45:
+            return 0.80
+        if s >= 30:
+            return 0.55
+        return 0.40
+
+    def panel_m_score(self) -> float:
+        """Use the regime score directly as O'Neil's M (Market Direction)
+        score, replacing the SPX-only proxy with a real macro composite."""
+        return float(self.regime_score)
+
+    def to_dict(self) -> Dict:
+        out = {"regime_score": round(self.regime_score, 1),
+               "regime_label": self.regime_label,
+               "notes": list(self.notes),
+               "snapshots": {}}
+        for name, snap in self.snapshot.items():
+            out["snapshots"][name] = {
+                "last": round(snap["last"], 4),
+                "ret_1d": round(snap.get("ret_1d", 0.0), 4),
+                "ret_20d": round(snap.get("ret_20d", 0.0), 4),
+                "ret_63d": round(snap.get("ret_63d", 0.0), 4),
+            }
+        return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -383,6 +691,58 @@ class MboumAPI:
                 pass
         return result
 
+    def get_options_meta(self, symbol: str) -> Optional[Dict]:
+        """Fetch the options meta envelope for a symbol.
+        Returns the first body element which contains:
+          - expirationDates: list of unix-second epochs
+          - strikes: list of all strike prices on the chain
+          - quote: full live quote (regularMarketPrice, bid, ask, IV envelope)
+          - options: list with the FIRST expiration's chain (calls+puts)
+        Use the dedicated options-tier key.
+        """
+        url = f"{self.base}/v1/markets/options"
+        params = {"symbol": symbol}
+        headers = {"Authorization": f"Bearer {MBOUM_OPTIONS_KEY}"}
+        try:
+            resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                time.sleep(2)
+                resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            body = data.get("body")
+            if isinstance(body, list) and body:
+                return body[0]
+            if isinstance(body, dict):
+                return body
+        except Exception:
+            return None
+        return None
+
+    def get_options_for_expiration(self, symbol: str, expiration_epoch: int) -> Optional[Dict]:
+        """Fetch the calls+puts chain for ONE expiration date.
+        Returns the {'expirationDate', 'calls': [...], 'puts': [...]} entry."""
+        url = f"{self.base}/v1/markets/options"
+        params = {"symbol": symbol, "expiration": int(expiration_epoch)}
+        headers = {"Authorization": f"Bearer {MBOUM_OPTIONS_KEY}"}
+        try:
+            resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                time.sleep(2)
+                resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            body = data.get("body")
+            if isinstance(body, list) and body:
+                opts = body[0].get("options", [])
+                if opts:
+                    return opts[0]
+        except Exception:
+            return None
+        return None
+
     def get_screener(self, list_name: str = "most_actives") -> List[Dict]:
         """Fetch screener results."""
         try:
@@ -570,6 +930,26 @@ class DataFetcher:
             f"{failed} excluded (insufficient history)."
         )
 
+        # CRITICAL FIX: drop intraday partial-bars when market is currently
+        # open. Today's in-progress bar has incomplete volume which
+        # systematically breaks volume-surge / volume-ratio rules and yields
+        # zero survivors during RTH. We always operate on closed bars.
+        if is_market_open_now():
+            trimmed = 0
+            for t in list(all_data.keys()):
+                df = all_data[t]
+                if last_bar_is_partial(df):
+                    if len(df) > 1:
+                        all_data[t] = df.iloc[:-1].copy()
+                        trimmed += 1
+                    else:
+                        del all_data[t]
+            if trimmed:
+                log.info(
+                    f"  Trimmed {trimmed} intraday partial bars "
+                    f"(market currently open ET) -- using last fully-closed session."
+                )
+
         if len(all_data) == 0:
             raise PipelineError(
                 "No tickers had sufficient OHLCV data. Pipeline STOPPED."
@@ -639,15 +1019,39 @@ class TechnicalEngine:
 
     @staticmethod
     def vwap_daily(high: pd.Series, low: pd.Series, close: pd.Series,
-                   volume: pd.Series) -> pd.Series:
+                   volume: pd.Series, window: int = 20) -> pd.Series:
         """
-        Session VWAP proxy using typical price × volume cumulative ratio.
-        For daily bars this gives the most recent session's VWAP.
+        Rolling N-day VWAP using typical price (H+L+C)/3 weighted by volume.
+        For daily bars, a rolling 20-day VWAP is the institutional reference
+        used by professional desks (Markert/Almgren) for entry-quality. A
+        rolling(1) implementation collapses to (H+L+C)/3 which is meaningless
+        as a VWAP confirmation signal.
         """
         tp = (high + low + close) / 3
-        cumtp_vol = (tp * volume).rolling(window=1).sum()
-        cum_vol = volume.rolling(window=1).sum()
+        tpv = tp * volume
+        cumtp_vol = tpv.rolling(window=window, min_periods=max(2, window // 2)).sum()
+        cum_vol = volume.rolling(window=window, min_periods=max(2, window // 2)).sum()
         return cumtp_vol / cum_vol.replace(0, np.nan)
+
+    @staticmethod
+    def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Wilder's Average Directional Index -- trend strength gauge.
+        ADX > 25 indicates a real trend (Wilder); used by Minervini/Livermore
+        equivalents to filter range-bound chop."""
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=low.index)
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        plus_di = 100 * plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        return dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
     @staticmethod
     def compute_all(df: pd.DataFrame) -> pd.DataFrame:
@@ -731,6 +1135,23 @@ class TechnicalEngine:
             (l - c.shift(1)).abs()
         ], axis=1).max(axis=1)
         df["ATR_14"] = tr.rolling(window=14, min_periods=14).mean()
+        df["ATR_pct"] = df["ATR_14"] / c.replace(0, np.nan)
+
+        # ADX (14) -- trend strength filter (Wilder)
+        df["ADX_14"] = TechnicalEngine.adx(h, l, c, 14)
+
+        # Realized volatility (20d, annualized) -- for IV/RV ratio
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = c / c.shift(1)
+            ratio = ratio.where(ratio > 0)  # drop non-positive ratios
+            log_ret = np.log(ratio)
+        df["RVol_20"] = log_ret.rolling(20, min_periods=20).std() * np.sqrt(252)
+
+        # Distance to 52-week high / low (fundamental break-out reference)
+        roll_high_252 = c.rolling(window=252, min_periods=126).max()
+        roll_low_252 = c.rolling(window=252, min_periods=126).min()
+        df["Pct_From_52w_High"] = (c - roll_high_252) / roll_high_252.replace(0, np.nan)
+        df["Pct_Above_52w_Low"] = (c - roll_low_252) / roll_low_252.replace(0, np.nan)
 
         return df
 
@@ -768,6 +1189,11 @@ class ExecutionGuards:
         )
         return survivors, rejected
 
+    # Real-money execution thresholds. Setting to $5M avg dollar volume
+    # ensures retail-size positions (typical $5-50K) move <5bp at the
+    # institutional spread, per Almgren-Chriss execution-cost models.
+    MIN_DOLLAR_VOLUME = 5_000_000
+
     @staticmethod
     def _check(ticker: str, df: pd.DataFrame) -> Optional[str]:
         """Returns rejection reason or None if passes all guards."""
@@ -783,24 +1209,42 @@ class ExecutionGuards:
         if missing_pct > 0.05:
             return f"GUARD_A: {missing_pct:.1%} bars missing (> 5%)"
 
-        # GUARD_A: Check for stale data (last bar should be recent)
-        last_date = df.index[-1]
-        if hasattr(last_date, "date"):
-            last_date = last_date.date() if hasattr(last_date, "date") else last_date
-        today = datetime.now().date()
-        days_stale = (today - pd.Timestamp(last_date).date()).days
+        # GUARD_A: Check for stale data (last bar should be recent in ET).
+        # Uses ET timezone -- prevents false stale flags when run on a UTC
+        # server before US market data has rolled over locally.
+        try:
+            last_date = pd.Timestamp(df.index[-1]).date()
+        except Exception:
+            return "GUARD_A: Last bar timestamp invalid"
+        today_et = now_et_dt().date()
+        days_stale = (today_et - last_date).days
         if days_stale > 5:  # Allow weekends + holidays
             return f"GUARD_A: Stale data ({days_stale} days old)"
 
-        # GUARD_B: Liquidity -- avg daily dollar volume over 20 days
+        # GUARD_A: Reject zero-volume or constant-price bars (delisted/halted)
+        last_30 = df.iloc[-30:] if len(df) >= 30 else df
+        if (last_30["Volume"] <= 0).all():
+            return "GUARD_A: All recent volume zero (suspended/halted)"
+        if last_30["Close"].nunique() <= 2:
+            return "GUARD_A: Stale price (< 3 unique closes in 30 days)"
+
+        # GUARD_B: Liquidity -- avg daily dollar volume over 20 days.
+        # $5M minimum gives institutional-grade execution; cheaper names get
+        # routed away on principle (real-money policy).
         avg_dv = last.get("Avg_Dollar_Vol_20", 0)
-        if pd.isna(avg_dv) or avg_dv < 1_000_000:
-            return f"GUARD_B: Low liquidity (avg $vol ${avg_dv:,.0f} < $1M)"
+        if pd.isna(avg_dv) or avg_dv < ExecutionGuards.MIN_DOLLAR_VOLUME:
+            return f"GUARD_B: Low liquidity (avg $vol ${avg_dv:,.0f} < ${ExecutionGuards.MIN_DOLLAR_VOLUME:,.0f})"
 
         # GUARD_B: 3-month performance must be positive
         ret_63d = last.get("Return_63d", np.nan)
         if pd.isna(ret_63d) or ret_63d < 0:
             return f"GUARD_B: Negative 3mo return ({ret_63d:.2%})"
+
+        # GUARD_B2: Avoid hyper-volatile names (ATR/price > 12%) -- options
+        # premiums become unaffordable and equity risk uncontrollable.
+        atr_pct = last.get("ATR_pct", np.nan)
+        if not pd.isna(atr_pct) and atr_pct > 0.12:
+            return f"GUARD_B: Excessive volatility (ATR {atr_pct:.1%} > 12%)"
 
         # GUARD_C: Penny stock exclusion
         close = last["Close"]
@@ -871,7 +1315,7 @@ class HardBuyRules:
 
     @staticmethod
     def near_misses(
-        data: Dict[str, pd.DataFrame], top_n: int = 3
+        data: Dict[str, pd.DataFrame], top_n: int = 25
     ) -> List[Dict]:
         """
         Evaluate ALL 10 rules for every ticker without short-circuiting.
@@ -1185,25 +1629,25 @@ class MLRanker:
         self,
         survivors: List[Dict],
         all_data: Dict[str, pd.DataFrame],
+        training_universe: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> List[Dict]:
         """
-        Train ML models on historical data from surviving tickers,
-        then score each survivor.
+        Train ML models on historical data, then score each survivor.
+
+        training_universe (optional): broader pool of tickers used to fit the
+        models. Using the full guarded universe (~2500 names × 252 days)
+        instead of just survivors (~50) provides 50x more samples and far
+        better discriminative power -- a key request from the panel review.
         """
         log.info(f"STAGE 4: ML Ranking -- {len(survivors)} survivors")
 
-        if len(survivors) < 5:
-            log.warning("Too few survivors for meaningful ML -- assigning uniform scores")
-            for s in survivors:
-                s["ml_score_xgb"] = 0.5
-                s["ml_score_rf"] = 0.5
-                s["ml_ensemble_score"] = 0.5
-                s["lstm_score"] = None
+        if len(survivors) < 1:
             return survivors
 
-        # Build training dataset from historical data
+        # Build training dataset from broad universe; score the survivors.
+        train_pool = training_universe if training_universe else all_data
         X_train, y_train, X_current, current_tickers = self._build_dataset(
-            survivors, all_data
+            survivors, all_data, train_pool
         )
 
         if X_train is None or len(X_train) < 100:
@@ -1271,46 +1715,65 @@ class MLRanker:
         self,
         survivors: List[Dict],
         all_data: Dict[str, pd.DataFrame],
+        training_pool: Dict[str, pd.DataFrame],
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, List[str]]:
         """
         Build training and current-day feature matrices.
-        Training: for each ticker, use days [0..T-20] as samples with
-        forward 20-day return as target.
-        Current: most recent day's features for scoring.
+
+        training_pool: broader universe used to fit the model. The forward
+        20-day return label is generated identically across the pool. This
+        prevents survivor-only training (heavy positive class bias) that
+        previously made the classifier near-uniform.
+
+        Current: most recent day's features for scoring (survivors only).
         """
         train_rows = []
         train_labels = []
         current_rows = []
         current_tickers = []
 
-        for s in survivors:
-            ticker = s["ticker"]
-            df = all_data.get(ticker)
-            if df is None or len(df) < MIN_TRADING_DAYS:
+        # ---- TRAINING DATA: full guarded universe -----------------------
+        # Cap per-ticker rows so a few long-history names don't dominate.
+        MAX_TRAIN_ROWS_PER_TICKER = 252  # ~1 calendar year per name
+        for ticker, df in training_pool.items():
+            if df is None or len(df) < 60:
                 continue
 
-            # Extract feature columns
-            feat_df = df[self.FEATURE_COLS].copy()
+            try:
+                feat_df = df[self.FEATURE_COLS].copy()
+            except KeyError:
+                continue
             close = df["Close"]
 
-            # Compute forward 20-day returns for training labels
+            # Forward 20-day return label
             fwd_ret = close.shift(-20) / close - 1
             label = (fwd_ret > 0).astype(int)
 
-            # Training samples: exclude last 20 rows (no label) and rows with NaN features
             train_section = feat_df.iloc[:-20]
             label_section = label.iloc[:-20]
 
-            # Drop NaN rows
             valid = train_section.dropna()
             valid_labels = label_section.loc[valid.index].dropna()
             common_idx = valid.index.intersection(valid_labels.index)
+
+            if len(common_idx) > MAX_TRAIN_ROWS_PER_TICKER:
+                # Take the most recent slice (most relevant regime)
+                common_idx = common_idx[-MAX_TRAIN_ROWS_PER_TICKER:]
 
             if len(common_idx) > 0:
                 train_rows.append(valid.loc[common_idx].values)
                 train_labels.append(valid_labels.loc[common_idx].values)
 
-            # Current features (last row)
+        # ---- CURRENT-DAY FEATURES: only the survivors we will score -----
+        for s in survivors:
+            ticker = s["ticker"]
+            df = all_data.get(ticker)
+            if df is None:
+                continue
+            try:
+                feat_df = df[self.FEATURE_COLS].copy()
+            except KeyError:
+                continue
             current_feat = feat_df.iloc[-1].values
             if not np.any(np.isnan(current_feat)):
                 current_rows.append(current_feat)
@@ -1681,33 +2144,33 @@ class FundamentalsFetcher:
                     elif isinstance(ed, str):
                         info["earnings_date"] = ed
 
-                # Supplement with Massive metrics (PE, beta, 52w range)
+                # Supplement with Massive metrics (PE, beta, 52w range).
+                # NOTE: previous code passed a literal "{symbol}" template
+                # in the URL which never substituted -- fixed to use the
+                # ticker-formatted endpoint with the canonical query string.
                 try:
+                    snap_url = f"https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
                     r = self.massive_session.get(
-                        "https://api.massive.com/v2/snapshot?symbol={symbol}&apiKey=hTRjnsG45cxV1K4GpLeGxpZp7rgPu6tU",
-                        params={"symbol": ticker, "metric": "all"},
-                        timeout=250,
+                        snap_url,
+                        params={"apiKey": MASSIVE_API_KEY},
+                        timeout=15,
                     )
                     if r.status_code == 200:
-                        fm = r.json().get("metric", {})
-                        if is_missing_value(info["pe_ratio"]):
-                            info["pe_ratio"] = normalize_api_scalar(
-                                fm.get("peBasicExclExtraTTM", np.nan)
-                            )
-                        if is_missing_value(info["beta"]):
-                            info["beta"] = normalize_api_scalar(fm.get("beta", np.nan))
-                        if is_missing_value(info["52w_high"]):
-                            info["52w_high"] = normalize_api_scalar(
-                                fm.get("52WeekHigh", np.nan)
-                            )
-                        if is_missing_value(info["52w_low"]):
-                            info["52w_low"] = normalize_api_scalar(
-                                fm.get("52WeekLow", np.nan)
-                            )
-                        if is_missing_value(info["revenue_growth"]):
-                            info["revenue_growth"] = normalize_api_scalar(
-                                fm.get("revenueGrowthQuarterlyYoy", np.nan)
-                            )
+                        # Massive single-ticker snapshot returns a {"ticker":{...}} payload
+                        snap_payload = r.json() or {}
+                        ticker_data = (
+                            snap_payload.get("ticker")
+                            or snap_payload.get("results")
+                            or {}
+                        )
+                        if isinstance(ticker_data, list) and ticker_data:
+                            ticker_data = ticker_data[0]
+                        last_trade = ticker_data.get("lastTrade") or ticker_data.get("last_trade") or {}
+                        last_quote = ticker_data.get("lastQuote") or ticker_data.get("last_quote") or {}
+                        info["live_last"] = normalize_api_scalar(last_trade.get("p"))
+                        info["live_bid"] = normalize_api_scalar(last_quote.get("p"))
+                        info["live_ask"] = normalize_api_scalar(last_quote.get("P"))
+                        info["live_ts"] = normalize_api_scalar(last_trade.get("t"))
                 except Exception:
                     pass
 
@@ -1754,8 +2217,36 @@ class InvestorPanel:
     Composite minimum: 60. Consensus: >= 3 panelists score >= 55.
     """
 
-    def __init__(self):
+    def __init__(self, macro: Optional["MacroRegime"] = None):
         self.spy_data = None
+        self.macro = macro
+        # Universe-wide percentile lookups (computed lazily)
+        self._rs_universe_returns: Optional[np.ndarray] = None
+
+    def set_universe_returns(self, all_data: Dict[str, pd.DataFrame]) -> None:
+        """Cache 63-day returns of the broad guarded universe for true
+        IBD-style RS-rank percentile (vs prior heuristic absolute thresholds)."""
+        rets = []
+        for df in all_data.values():
+            try:
+                if len(df) >= 64:
+                    last = df["Close"].iloc[-1]
+                    base = df["Close"].iloc[-64]
+                    if base and base > 0 and pd.notna(last) and pd.notna(base):
+                        rets.append(float(last / base - 1.0))
+            except Exception:
+                continue
+        if rets:
+            self._rs_universe_returns = np.array(rets)
+
+    def rs_percentile(self, ret_63d: float) -> float:
+        """Return the IBD-style RS rank percentile (0-100) of a 3-month
+        return vs the live universe. Falls back to 50 if uncalibrated."""
+        if self._rs_universe_returns is None or len(self._rs_universe_returns) < 50:
+            return 50.0
+        if ret_63d is None or pd.isna(ret_63d):
+            return 50.0
+        return float((self._rs_universe_returns < ret_63d).mean() * 100.0)
 
     def load_benchmark(self):
         """Load SPY data for relative strength calculations via MBOUM."""
@@ -1965,19 +2456,28 @@ class InvestorPanel:
             else:
                 macro_score = 40
 
-        # 2. Catalyst Proximity (25%) -- earnings date proximity
+        # 2. Catalyst Proximity (25%) -- earnings date proximity.
+        # Druckenmiller-style: catalyst SOON (sweet spot 7-30 days out). Too
+        # close (<= 5 days) = binary event risk; flag separately so options
+        # stage can avoid IV-crush trades. Pure post-earnings drift (5-21
+        # days post-print) = highest expected drift edge per academic research.
         catalyst_score = 55
         earnings_date = fund.get("earnings_date")
         if earnings_date:
             try:
-                ed = pd.Timestamp(earnings_date)
-                days_to = (ed - pd.Timestamp.now()).days
-                if 0 < days_to <= 14:
-                    catalyst_score = 90
+                ed = pd.Timestamp(earnings_date).tz_localize(None)
+                today_naive = pd.Timestamp(now_et_dt().date())
+                days_to = (ed - today_naive).days
+                if 0 < days_to <= 5:
+                    catalyst_score = 70  # Imminent -- binary risk, slight bonus
+                elif 5 < days_to <= 14:
+                    catalyst_score = 92  # Sweet spot
                 elif 14 < days_to <= 30:
-                    catalyst_score = 75
+                    catalyst_score = 78
                 elif 30 < days_to <= 60:
                     catalyst_score = 60
+                elif -21 <= days_to <= 0:
+                    catalyst_score = 80  # Just-printed -- post-earnings drift
             except Exception:
                 pass
 
@@ -2015,8 +2515,30 @@ class InvestorPanel:
             else:
                 flow_score = 40
 
-        # 5. Position Sizing Confidence (10%) -- composite of above
-        sizing_score = (macro_score + catalyst_score + rr_score + flow_score) / 4
+        # 5. Position Sizing Confidence (10%) -- empirical Kelly proxy
+        # built from the stock's own rolling win-rate and payoff ratio over
+        # the last 60 sessions. Replaces the prior circular self-average
+        # which contained zero new information.
+        sizing_score = 50.0
+        if len(df) >= 63:
+            recent = df["Return_1d"].iloc[-60:].dropna()
+            if len(recent) >= 30:
+                wins = recent[recent > 0]
+                losses = recent[recent < 0]
+                w = len(wins) / max(len(recent), 1)
+                avg_win = wins.mean() if len(wins) else 0.0
+                avg_loss = abs(losses.mean()) if len(losses) else 1.0
+                payoff = avg_win / max(avg_loss, 1e-6)
+                # Kelly fraction: f* = w - (1-w)/payoff. Cap, then map to 0-100.
+                kelly = w - (1 - w) / max(payoff, 1e-6)
+                kelly_capped = clamp(kelly, -0.5, 0.5)
+                # Map [-0.5, 0.5] -> [0, 100]; positive Kelly = positive edge.
+                sizing_score = clamp(50 + kelly_capped * 100, 0, 100)
+        # Pull macro regime in as additional weight (Druckenmiller is the
+        # macro guy -- if regime is risk-off, even great names get marked down)
+        if self.macro is not None:
+            macro_overlay = self.macro.regime_score
+            macro_score = 0.7 * macro_score + 0.3 * macro_overlay
 
         return (
             macro_score * 0.25 + catalyst_score * 0.25 +
@@ -2185,20 +2707,28 @@ class InvestorPanel:
                 elif stop_dist > 0.10:
                     entry_score = max(0, entry_score - 10)
 
-        # 4. Relative Strength Rank (15%)
+        # 4. Relative Strength Rank (15%) -- true universe-based percentile.
+        # Minervini explicitly requires RS Rank >= 70 IBD-style. We compute
+        # the percentile of this name's 3-month return vs the live universe
+        # (replaces previous absolute thresholds which mis-fire across regimes).
         rs_rank_score = 60
         ret_63d = last.get("Return_63d", np.nan)
         ret_20d = last.get("Return_20d", np.nan)
         if not pd.isna(ret_63d):
-            # Estimate RS rank: >30% 3mo return is very strong
-            if ret_63d > 0.30:
+            pct = self.rs_percentile(float(ret_63d))
+            # Map IBD-style: >=85 elite, >=70 strong, >=50 average, <30 weak
+            if pct >= 90:
                 rs_rank_score = 95
-            elif ret_63d > 0.15:
-                rs_rank_score = 80
-            elif ret_63d > 0.05:
-                rs_rank_score = 60
+            elif pct >= 80:
+                rs_rank_score = 88
+            elif pct >= 70:
+                rs_rank_score = 78
+            elif pct >= 55:
+                rs_rank_score = 62
+            elif pct >= 40:
+                rs_rank_score = 48
             else:
-                rs_rank_score = 40
+                rs_rank_score = 30
 
         # 5. Earnings Acceleration (10%)
         ea_score = 55
@@ -2306,23 +2836,29 @@ class InvestorPanel:
             else:
                 i_score = 40
 
-        # M: Market Direction (10%) -- SPY trend
-        m_score = 60
-        if self.spy_data is not None and len(self.spy_data) >= 50:
-            spy_close = self.spy_data["Close"]
-            spy_sma50 = spy_close.rolling(50).mean()
-            spy_sma200 = spy_close.rolling(200).mean()
-            if (not pd.isna(spy_sma50.iloc[-1]) and not pd.isna(spy_sma200.iloc[-1]) and
-                    spy_close.iloc[-1] > spy_sma50.iloc[-1] > spy_sma200.iloc[-1]):
-                m_score = 90
-            elif (not pd.isna(spy_sma50.iloc[-1]) and
-                  spy_close.iloc[-1] > spy_sma50.iloc[-1]):
-                m_score = 70
-            elif (not pd.isna(spy_sma200.iloc[-1]) and
-                  spy_close.iloc[-1] > spy_sma200.iloc[-1]):
-                m_score = 55
-            else:
-                m_score = 30
+        # M: Market Direction (10%) -- Macro regime composite.
+        # O'Neil emphasized following the general market; we use the full
+        # macro snapshot (VIX, yields, DXY, gold, oil, breadth) instead of
+        # SPY alone. Falls back to SPY MA stack when macro unavailable.
+        if self.macro is not None:
+            m_score = self.macro.panel_m_score()
+        else:
+            m_score = 60
+            if self.spy_data is not None and len(self.spy_data) >= 50:
+                spy_close = self.spy_data["Close"]
+                spy_sma50 = spy_close.rolling(50).mean()
+                spy_sma200 = spy_close.rolling(200).mean()
+                if (not pd.isna(spy_sma50.iloc[-1]) and not pd.isna(spy_sma200.iloc[-1]) and
+                        spy_close.iloc[-1] > spy_sma50.iloc[-1] > spy_sma200.iloc[-1]):
+                    m_score = 90
+                elif (not pd.isna(spy_sma50.iloc[-1]) and
+                      spy_close.iloc[-1] > spy_sma50.iloc[-1]):
+                    m_score = 70
+                elif (not pd.isna(spy_sma200.iloc[-1]) and
+                      spy_close.iloc[-1] > spy_sma200.iloc[-1]):
+                    m_score = 55
+                else:
+                    m_score = 30
 
         return (
             c_score * 0.20 + a_score * 0.15 + n_score * 0.15 +
@@ -2349,14 +2885,21 @@ class OptionsEvaluator:
     MIN_VOLUME = 20
 
     @staticmethod
-    def evaluate(survivors: List[Dict]) -> List[Dict]:
+    def evaluate(survivors: List[Dict], fundamentals: Optional[Dict[str, Dict]] = None) -> List[Dict]:
         """
         For each survivor, check options chain and find the best qualifying contract.
+
+        IV-crush guard: if earnings fall *inside* the option's lifetime AND
+        within 7 calendar days of today, we skip the contract -- buying
+        long calls into earnings is a documented capital killer (post-print
+        IV typically collapses 30-60% wiping out gains from intrinsic moves).
         """
         log.info(f"STAGE 6: Options Evaluation -- {len(survivors)} survivors")
 
         for s in survivors:
-            opt = OptionsEvaluator._find_best_option(s)
+            ticker = s.get("ticker")
+            fund = (fundamentals or {}).get(ticker, {})
+            opt = OptionsEvaluator._find_best_option(s, fund)
             s.update(opt)
             s["trade_setup_score"] = round(OptionsEvaluator._trade_setup_score(s), 1)
 
@@ -2368,10 +2911,20 @@ class OptionsEvaluator:
         return survivors
 
     @staticmethod
-    def _find_best_option(candidate: Dict) -> Dict:
+    def _find_best_option(candidate: Dict, fund: Optional[Dict] = None) -> Dict:
         """Find the best qualifying long call for a validated stock setup."""
         ticker = candidate["ticker"]
         current_price = normalize_api_scalar(candidate.get("price"))
+        fund = fund or {}
+
+        # Compute earnings-window IV-crush guard
+        earnings_dt = None
+        ed_raw = fund.get("earnings_date")
+        if ed_raw:
+            try:
+                earnings_dt = pd.Timestamp(ed_raw).date()
+            except Exception:
+                earnings_dt = None
 
         result = {
             "option_candidate": "N",
@@ -2391,8 +2944,13 @@ class OptionsEvaluator:
         }
 
         try:
-            chain_data = OptionsEvaluator._fetch_chain_massive(ticker)
-            option_source = "Massive"
+            # Source priority: MBOUM (paid plan, fast, full chain w/ IV) ->
+            # Massive (snapshot tier) -> Yahoo (free, quotes only).
+            chain_data = OptionsEvaluator._fetch_chain_mboum(ticker, current_price)
+            option_source = "MBOUM"
+            if not chain_data:
+                chain_data = OptionsEvaluator._fetch_chain_massive(ticker)
+                option_source = "Massive"
             if not chain_data:
                 chain_data = OptionsEvaluator._fetch_chain_yahoo(ticker)
                 option_source = "Yahoo"
@@ -2432,6 +2990,14 @@ class OptionsEvaluator:
                 dte = (exp_date - today).days
                 if dte < OptionsEvaluator.MIN_DTE or dte > OptionsEvaluator.MAX_DTE:
                     continue
+
+                # IV-crush guard: skip contracts that span an earnings event
+                # within the next 7 days (binary risk + post-print IV collapse).
+                # Allow if earnings is >7 days out OR strictly after expiry.
+                if earnings_dt is not None:
+                    days_to_earn = (earnings_dt - today).days
+                    if 0 <= days_to_earn <= 7 and earnings_dt <= exp_date:
+                        continue
 
                 if is_missing_value(oi):
                     oi = 0
@@ -2529,6 +3095,112 @@ class OptionsEvaluator:
             log.debug(f"  Options error for {ticker}: {e}")
 
         return result
+
+    @staticmethod
+    def _fetch_chain_mboum(ticker: str, underlying_price: Optional[float] = None) -> List[Dict]:
+        """Fetch the options chain via MBOUM Pro (options-tier key).
+
+        Strategy:
+          1. One meta call returns the list of all expirationDates plus the
+             first expiration's chain and a live underlying quote.
+          2. Filter expirations to our DTE window [MIN_DTE, MAX_DTE].
+          3. Fetch the remaining qualifying expirations in parallel.
+
+        MBOUM does not expose Greeks; delta is back-solved via Black-Scholes
+        downstream using the quoted IV (which IS provided per-contract).
+        """
+        try:
+            mboum = MboumAPI()
+            meta = mboum.get_options_meta(ticker)
+            if not meta:
+                return []
+
+            quote = meta.get("quote", {}) or {}
+            quote_price = (
+                normalize_api_scalar(quote.get("regularMarketPrice"))
+                or normalize_api_scalar(quote.get("postMarketPrice"))
+                or normalize_api_scalar(quote.get("preMarketPrice"))
+            )
+            if (not underlying_price or is_missing_value(underlying_price)) and not is_missing_value(quote_price):
+                underlying_price = quote_price
+
+            today = datetime.now(ET_TZ).date()
+            min_date = today + timedelta(days=OptionsEvaluator.MIN_DTE - 2)
+            max_date = today + timedelta(days=OptionsEvaluator.MAX_DTE + 2)
+            min_epoch = int(datetime.combine(min_date, dtime.min, tzinfo=ET_TZ).timestamp())
+            max_epoch = int(datetime.combine(max_date, dtime.min, tzinfo=ET_TZ).timestamp())
+
+            exp_dates = meta.get("expirationDates", []) or []
+            qualifying_epochs = [int(e) for e in exp_dates if min_epoch <= int(e) <= max_epoch]
+
+            # Fast-path: meta itself returns the FIRST expiration's chain.
+            chain_entries: List[Dict] = []
+            initial_options = meta.get("options", []) or []
+            initial_dates = {int(o.get("expirationDate", 0)) for o in initial_options}
+            for o in initial_options:
+                ep = int(o.get("expirationDate", 0))
+                if min_epoch <= ep <= max_epoch:
+                    chain_entries.append(o)
+
+            # Fetch the other qualifying expirations in parallel.
+            remaining = [e for e in qualifying_epochs if e not in initial_dates]
+            if remaining:
+                def _fetch_options_for_expiration(expiration_epoch: int) -> Any:
+                    worker_mboum = MboumAPI()
+                    return worker_mboum.get_options_for_expiration(ticker, expiration_epoch)
+
+                with ThreadPoolExecutor(max_workers=min(8, len(remaining))) as ex:
+                    futures = {
+                        ex.submit(_fetch_options_for_expiration, e): e
+                        for e in remaining
+                    }
+                    for f in as_completed(futures):
+                        try:
+                            entry = f.result()
+                            if entry:
+                                chain_entries.append(entry)
+                        except Exception:
+                            continue
+
+            contracts: List[Dict] = []
+            for entry in chain_entries:
+                exp_epoch = int(entry.get("expirationDate", 0))
+                if exp_epoch <= 0:
+                    continue
+                exp_str = datetime.utcfromtimestamp(exp_epoch).strftime("%Y-%m-%d")
+                for call in (entry.get("calls") or []):
+                    bid = normalize_api_scalar(call.get("bid"))
+                    ask = normalize_api_scalar(call.get("ask"))
+                    last_price = normalize_api_scalar(call.get("lastPrice"))
+                    midpoint = None
+                    if not is_missing_value(bid) and not is_missing_value(ask) and (bid + ask) > 0:
+                        midpoint = (bid + ask) / 2
+                    elif not is_missing_value(last_price) and last_price > 0:
+                        midpoint = last_price
+                    strike = normalize_api_scalar(call.get("strike"))
+                    iv = normalize_api_scalar(call.get("impliedVolatility"))
+                    contracts.append({
+                        "expiry": exp_str,
+                        "strike": strike,
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": midpoint,
+                        "oi": normalize_api_scalar(call.get("openInterest")),
+                        "volume": normalize_api_scalar(call.get("volume")),
+                        "iv": iv,
+                        "delta": None,  # MBOUM does not return Greeks; BS-solved later
+                        "theta": None,
+                        "break_even": (
+                            (strike + midpoint)
+                            if not is_missing_value(strike) and not is_missing_value(midpoint)
+                            else None
+                        ),
+                        "underlying_price": underlying_price,
+                    })
+
+            return contracts
+        except Exception:
+            return []
 
     @staticmethod
     def _fetch_chain_massive(ticker: str) -> List[Dict]:
@@ -2939,6 +3611,7 @@ class OutputFormatter:
         stage_counts: Dict[str, int],
         ml_params: Dict,
         feature_importances: Dict,
+        macro: Optional["MacroRegime"] = None,
     ) -> pd.DataFrame:
         """
         Create the final ranked table, save to CSV and JSON.
@@ -2971,6 +3644,8 @@ class OutputFormatter:
         columns = [
             "rank", "ticker", "name", "sector", "price", "market_cap",
             "rsi_14", "macd_histogram", "volume_ratio",
+            "stop_loss", "target_price", "risk_per_share",
+            "reward_risk_ratio", "pct_equity_risk", "shares_per_10k_risk",
             "ml_score_xgb", "ml_score_rf", "ml_ensemble_score", "lstm_score",
             "panel_composite_score", "panel_consensus", "trade_setup_score",
             "panel_livermore", "panel_druckenmiller", "panel_lynch",
@@ -3039,11 +3714,13 @@ class OutputFormatter:
         report = {
             "scan_timestamp": now_et(),
             "attestation": (
-                "This scan used live data from Massive (universe discovery), "
-                "MBOUM Pro (OHLCV history + fundamentals), and Massive/Yahoo "
-                "(options chains). No hardcoded tickers, "
-                "no presets, no fabrication."
+                "This scan used live data only: Massive (universe discovery + "
+                "options chains + live snapshot), MBOUM Pro (5yr OHLCV + "
+                "fundamentals), Yahoo v8 (macro snapshot, options fallback). "
+                "No hardcoded tickers, no presets, no fabricated values, no "
+                "demo data. Intraday partial bars are trimmed during RTH."
             ),
+            "macro_regime": macro.to_dict() if macro is not None else None,
             "stage_counts": stage_counts,
             "ml_hyperparameters": ml_params,
             "feature_importances": {
@@ -3083,6 +3760,17 @@ class OutputFormatter:
         print(f"  STOCK UNIVERSE SCAN -- FINAL RESULTS")
         print(f"  Scan Time: {report['scan_timestamp']}")
         print("=" * 100)
+
+        # Macro regime context
+        macro_dict = report.get("macro_regime") or {}
+        if macro_dict:
+            print("\n  ┌─ MACRO REGIME ────────────────────────────────────┐")
+            print(f"  │  {('Regime: ' + str(macro_dict.get('regime_label', ''))) :<50} │")
+            print(f"  │  Score: {macro_dict.get('regime_score', '')}/100" + " " * 38 + "│")
+            for n in macro_dict.get("notes", []):
+                txt = str(n)[:48]
+                print(f"  │  - {txt:<48} │")
+            print(f"  └──────────────────────────────────────────────────┘")
 
         # Pipeline funnel
         print("\n  ┌─ PIPELINE FUNNEL ─────────────────────────────────┐")
@@ -3291,6 +3979,7 @@ def main():
     log.info("=" * 70)
     log.info("  STOCK UNIVERSE SCAN PIPELINE -- STARTING")
     log.info(f"  Time: {now_et()}")
+    log.info(f"  Market Open Now (ET RTH): {is_market_open_now()}")
     log.info("=" * 70)
 
     stage_counts = {}
@@ -3298,6 +3987,13 @@ def main():
     feature_importances = {}
 
     try:
+        # ── STAGE 0: Macro Regime Snapshot ───────────────────────────
+        # Establishes geopolitical/macro context BEFORE any equity work
+        # (the panel review's #1 demand: "consider current context").
+        macro = MacroRegime()
+        macro.load()
+        stage_counts["Stage 0: Macro regime"] = round(macro.regime_score)
+
         # ── STAGE 1: Universe Discovery ──────────────────────────────
         discovery = UniverseDiscovery(MASSIVE_API_KEY)
         tickers = discovery.discover()
@@ -3334,20 +4030,23 @@ def main():
                 "No tickers passed all 10 hard buy rules. "
                 "This may indicate a bearish market or very tight conditions."
             )
-            # Generate near-miss report
-            near_misses = HardBuyRules.near_misses(guarded_data, top_n=3)
-            OutputFormatter.format_and_save([], stage_counts, {}, {})
+            # Expanded near-miss report (top 25) for actionable insight.
+            near_misses = HardBuyRules.near_misses(guarded_data, top_n=25)
+            OutputFormatter.format_and_save([], stage_counts, {}, {}, macro=macro)
             OutputFormatter.save_near_misses(near_misses, stage_counts)
             return
 
         # ── STAGE 4: ML Ranking ──────────────────────────────────────
+        # Train on the FULL guarded universe (~50x more samples than
+        # survivors-only) for true discriminative power.
         ranker = MLRanker()
-        survivors = ranker.rank(survivors, all_data)
+        survivors = ranker.rank(survivors, all_data, training_universe=guarded_data)
         ml_params = {
             "XGBoost": "n_estimators=200, max_depth=6, lr=0.05, subsample=0.8",
             "RandomForest": "n_estimators=200, max_depth=8, min_samples_leaf=20",
             "LSTM": "Available (PyTorch)" if LSTM_AVAILABLE else "Not installed",
             "XGB_available": XGB_AVAILABLE,
+            "training_universe_size": len(guarded_data),
         }
         feature_importances = ranker.feature_importances
 
@@ -3357,18 +4056,49 @@ def main():
         fundamentals = fund_fetcher.fetch_batch(survivor_tickers)
 
         # ── STAGE 5: 5-Investor Panel ────────────────────────────────
-        panel = InvestorPanel()
+        panel = InvestorPanel(macro=macro)
+        panel.set_universe_returns(guarded_data)  # IBD-style RS percentile
         survivors = panel.score_all(survivors, all_data, fundamentals)
         stage_counts["Stage 5: Passed Panel Validation"] = len(survivors)
 
         if len(survivors) == 0:
             log.warning("No tickers passed panel validation.")
-            OutputFormatter.format_and_save([], stage_counts, ml_params, feature_importances)
+            OutputFormatter.format_and_save([], stage_counts, ml_params, feature_importances, macro=macro)
             return
 
         # ── STAGE 6: Options Evaluation ──────────────────────────────
-        survivors = OptionsEvaluator.evaluate(survivors)
+        survivors = OptionsEvaluator.evaluate(survivors, fundamentals=fundamentals)
         stage_counts["Stage 6: Final Candidates"] = len(survivors)
+
+        # Enrich with risk-management fields (ATR-stop, target, sizing).
+        for s in survivors:
+            df = all_data.get(s["ticker"])
+            if df is not None and len(df) > 0:
+                last = df.iloc[-1]
+                close = float(last.get("Close", 0.0)) or 0.0
+                atr = float(last.get("ATR_14", 0.0)) or 0.0
+                sma50 = float(last.get("SMA_50", 0.0)) or 0.0
+                # Stop = max(SMA50, close - 2.5 * ATR) -- tighter of structural
+                # support and volatility-based stop. Matches Minervini protocol.
+                vol_stop = close - 2.5 * atr
+                stop_loss = max(sma50, vol_stop, 0.0) if sma50 > 0 else vol_stop
+                if stop_loss <= 0 or stop_loss >= close:
+                    stop_loss = close * 0.92  # 8% fallback
+                # Target: 2.5x risk (asymmetric R/R Druckenmiller-style)
+                risk = max(close - stop_loss, 0.01)
+                target = close + 2.5 * risk
+                # 1% risk-of-equity sizing scaled by macro regime
+                regime_scalar = macro.position_sizing_scalar()
+                pct_of_equity = round(1.0 * regime_scalar, 2)  # % of portfolio risked
+                shares_per_10k = math.floor(
+                    (10000.0 * (pct_of_equity / 100.0)) / max(risk, 0.01)
+                )
+                s["stop_loss"] = round(stop_loss, 2)
+                s["target_price"] = round(target, 2)
+                s["risk_per_share"] = round(risk, 2)
+                s["reward_risk_ratio"] = round((target - close) / risk, 2)
+                s["pct_equity_risk"] = pct_of_equity
+                s["shares_per_10k_risk"] = int(shares_per_10k)
 
         # ── PRE-OUTPUT VERIFICATION ──────────────────────────────────
         log.info("Running pre-output verification...")
@@ -3426,7 +4156,7 @@ def main():
 
         # ── FORMAT AND SAVE OUTPUT ───────────────────────────────────
         result_df = OutputFormatter.format_and_save(
-            final, stage_counts, ml_params, feature_importances
+            final, stage_counts, ml_params, feature_importances, macro=macro
         )
 
         elapsed = time.time() - pipeline_start
