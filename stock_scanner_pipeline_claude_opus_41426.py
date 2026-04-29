@@ -357,22 +357,26 @@ class MacroRegime:
                 notes.append(f"VIX {vlast:.1f} -- panic regime")
 
         # Yield curve (10Y - 3M proxy via ^TNX - ^IRX, in percentage points)
+        # Yahoo `^TNX` is typically quoted as yield * 10 (e.g. 43.0 => 4.30%),
+        # while `^IRX` is already in percent. Normalize both to percent first.
         tnx = self.snapshot.get("tnx")
         irx = self.snapshot.get("irx")
         if tnx is not None and irx is not None:
-            spread = tnx["last"] - irx["last"]
+            tnx_pct = tnx["last"] / 10.0
+            irx_pct = irx["last"]
+            spread = tnx_pct - irx_pct
             if spread > 1.5:
                 score += 6
-                notes.append(f"Yield curve steep (+{spread:.2f}bp) -- pro-growth")
+                notes.append(f"Yield curve steep (+{spread:.2f}pp) -- pro-growth")
             elif spread > 0.25:
                 score += 2
-                notes.append(f"Yield curve positive (+{spread:.2f}bp)")
+                notes.append(f"Yield curve positive (+{spread:.2f}pp)")
             elif spread > -0.25:
                 score -= 2
-                notes.append(f"Yield curve flat ({spread:+.2f}bp)")
+                notes.append(f"Yield curve flat ({spread:+.2f}pp)")
             else:
                 score -= 8
-                notes.append(f"Yield curve INVERTED ({spread:+.2f}bp) -- recession signal")
+                notes.append(f"Yield curve INVERTED ({spread:+.2f}pp) -- recession signal")
 
         # DXY -- strong USD pressures multinationals/EM, mixed for domestics
         dxy = self.snapshot.get("dxy")
