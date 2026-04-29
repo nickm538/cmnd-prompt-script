@@ -1,0 +1,11 @@
+numpy
+pandas
+requests
+yfinance
+scikit-learn
+massive
+tzdata
+
+# Optional ML accelerators used by the scanner when available.
+xgboost
+torch
