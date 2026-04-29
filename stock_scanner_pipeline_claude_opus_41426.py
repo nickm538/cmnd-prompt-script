@@ -79,6 +79,11 @@ ALPHAVANTAGE_API_KEY = os.environ.get(
 MBOUM_API_KEY = os.environ.get(
     "MBOUM_API_KEY", "xfAMuSlx5yUmX4PKegfarmd7y8799RcxjxKiNAUh"
 )
+# Options-tier MBOUM key (different plan that includes the /v1/markets/options
+# endpoint). Set via env var or falls back to the user's options-plan key.
+MBOUM_OPTIONS_KEY = os.environ.get(
+    "MBOUM_OPTIONS_KEY", "642|Splqvb0O7fzSSI0ptlYIs4qXt4N4UaqwJHToVQ1X"
+)
 MBOUM_BASE_URL = "https://api.mboum.com"
 MASSIVE_BASE_URL = "https://api.massive.com/v2"
 
@@ -689,6 +694,58 @@ class MboumAPI:
             except Exception:
                 pass
         return result
+
+    def get_options_meta(self, symbol: str) -> Optional[Dict]:
+        """Fetch the options meta envelope for a symbol.
+        Returns the first body element which contains:
+          - expirationDates: list of unix-second epochs
+          - strikes: list of all strike prices on the chain
+          - quote: full live quote (regularMarketPrice, bid, ask, IV envelope)
+          - options: list with the FIRST expiration's chain (calls+puts)
+        Use the dedicated options-tier key.
+        """
+        url = f"{self.base}/v1/markets/options"
+        params = {"symbol": symbol}
+        headers = {"Authorization": f"Bearer {MBOUM_OPTIONS_KEY}"}
+        try:
+            resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                time.sleep(2)
+                resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            body = data.get("body")
+            if isinstance(body, list) and body:
+                return body[0]
+            if isinstance(body, dict):
+                return body
+        except Exception:
+            return None
+        return None
+
+    def get_options_for_expiration(self, symbol: str, expiration_epoch: int) -> Optional[Dict]:
+        """Fetch the calls+puts chain for ONE expiration date.
+        Returns the {'expirationDate', 'calls': [...], 'puts': [...]} entry."""
+        url = f"{self.base}/v1/markets/options"
+        params = {"symbol": symbol, "expiration": int(expiration_epoch)}
+        headers = {"Authorization": f"Bearer {MBOUM_OPTIONS_KEY}"}
+        try:
+            resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                time.sleep(2)
+                resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            body = data.get("body")
+            if isinstance(body, list) and body:
+                opts = body[0].get("options", [])
+                if opts:
+                    return opts[0]
+        except Exception:
+            return None
+        return None
 
     def get_screener(self, list_name: str = "most_actives") -> List[Dict]:
         """Fetch screener results."""
@@ -2891,8 +2948,13 @@ class OptionsEvaluator:
         }
 
         try:
-            chain_data = OptionsEvaluator._fetch_chain_massive(ticker)
-            option_source = "Massive"
+            # Source priority: MBOUM (paid plan, fast, full chain w/ IV) ->
+            # Massive (snapshot tier) -> Yahoo (free, quotes only).
+            chain_data = OptionsEvaluator._fetch_chain_mboum(ticker, current_price)
+            option_source = "MBOUM"
+            if not chain_data:
+                chain_data = OptionsEvaluator._fetch_chain_massive(ticker)
+                option_source = "Massive"
             if not chain_data:
                 chain_data = OptionsEvaluator._fetch_chain_yahoo(ticker)
                 option_source = "Yahoo"
@@ -3037,6 +3099,110 @@ class OptionsEvaluator:
             log.debug(f"  Options error for {ticker}: {e}")
 
         return result
+
+    @staticmethod
+    def _fetch_chain_mboum(ticker: str, underlying_price: Optional[float] = None) -> List[Dict]:
+        """Fetch the options chain via MBOUM Pro (options-tier key).
+
+        Strategy:
+          1. One meta call returns the list of all expirationDates plus the
+             first expiration's chain and a live underlying quote.
+          2. Filter expirations to our DTE window [MIN_DTE, MAX_DTE].
+          3. Fetch the remaining qualifying expirations in parallel.
+
+        MBOUM does not expose Greeks; delta is back-solved via Black-Scholes
+        downstream using the quoted IV (which IS provided per-contract).
+        """
+        try:
+            mboum = MboumAPI()
+            meta = mboum.get_options_meta(ticker)
+            if not meta:
+                return []
+
+            quote = meta.get("quote", {}) or {}
+            quote_price = (
+                normalize_api_scalar(quote.get("regularMarketPrice"))
+                or normalize_api_scalar(quote.get("postMarketPrice"))
+                or normalize_api_scalar(quote.get("preMarketPrice"))
+            )
+            if (not underlying_price or is_missing_value(underlying_price)) and not is_missing_value(quote_price):
+                underlying_price = quote_price
+
+            today = datetime.now(ET_TZ).date()
+            min_epoch = int(time.mktime(
+                (today + timedelta(days=OptionsEvaluator.MIN_DTE - 2)).timetuple()
+            ))
+            max_epoch = int(time.mktime(
+                (today + timedelta(days=OptionsEvaluator.MAX_DTE + 2)).timetuple()
+            ))
+
+            exp_dates = meta.get("expirationDates", []) or []
+            qualifying_epochs = [int(e) for e in exp_dates if min_epoch <= int(e) <= max_epoch]
+
+            # Fast-path: meta itself returns the FIRST expiration's chain.
+            chain_entries: List[Dict] = []
+            initial_options = meta.get("options", []) or []
+            initial_dates = {int(o.get("expirationDate", 0)) for o in initial_options}
+            for o in initial_options:
+                ep = int(o.get("expirationDate", 0))
+                if min_epoch <= ep <= max_epoch:
+                    chain_entries.append(o)
+
+            # Fetch the other qualifying expirations in parallel.
+            remaining = [e for e in qualifying_epochs if e not in initial_dates]
+            if remaining:
+                with ThreadPoolExecutor(max_workers=min(8, len(remaining))) as ex:
+                    futures = {
+                        ex.submit(mboum.get_options_for_expiration, ticker, e): e
+                        for e in remaining
+                    }
+                    for f in as_completed(futures):
+                        try:
+                            entry = f.result()
+                            if entry:
+                                chain_entries.append(entry)
+                        except Exception:
+                            continue
+
+            contracts: List[Dict] = []
+            for entry in chain_entries:
+                exp_epoch = int(entry.get("expirationDate", 0))
+                if exp_epoch <= 0:
+                    continue
+                exp_str = datetime.utcfromtimestamp(exp_epoch).strftime("%Y-%m-%d")
+                for call in (entry.get("calls") or []):
+                    bid = normalize_api_scalar(call.get("bid"))
+                    ask = normalize_api_scalar(call.get("ask"))
+                    last_price = normalize_api_scalar(call.get("lastPrice"))
+                    midpoint = None
+                    if not is_missing_value(bid) and not is_missing_value(ask) and (bid + ask) > 0:
+                        midpoint = (bid + ask) / 2
+                    elif not is_missing_value(last_price) and last_price > 0:
+                        midpoint = last_price
+                    strike = normalize_api_scalar(call.get("strike"))
+                    iv = normalize_api_scalar(call.get("impliedVolatility"))
+                    contracts.append({
+                        "expiry": exp_str,
+                        "strike": strike,
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": midpoint,
+                        "oi": normalize_api_scalar(call.get("openInterest")),
+                        "volume": normalize_api_scalar(call.get("volume")),
+                        "iv": iv,
+                        "delta": None,  # MBOUM does not return Greeks; BS-solved later
+                        "theta": None,
+                        "break_even": (
+                            (strike + midpoint)
+                            if not is_missing_value(strike) and not is_missing_value(midpoint)
+                            else None
+                        ),
+                        "underlying_price": underlying_price,
+                    })
+
+            return contracts
+        except Exception:
+            return []
 
     @staticmethod
     def _fetch_chain_massive(ticker: str) -> List[Dict]:
