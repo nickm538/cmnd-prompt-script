@@ -3151,9 +3151,13 @@ class OptionsEvaluator:
             # Fetch the other qualifying expirations in parallel.
             remaining = [e for e in qualifying_epochs if e not in initial_dates]
             if remaining:
+                def _fetch_options_for_expiration(expiration_epoch: int) -> Any:
+                    worker_mboum = MboumAPI()
+                    return worker_mboum.get_options_for_expiration(ticker, expiration_epoch)
+
                 with ThreadPoolExecutor(max_workers=min(8, len(remaining))) as ex:
                     futures = {
-                        ex.submit(mboum.get_options_for_expiration, ticker, e): e
+                        ex.submit(_fetch_options_for_expiration, e): e
                         for e in remaining
                     }
                     for f in as_completed(futures):
