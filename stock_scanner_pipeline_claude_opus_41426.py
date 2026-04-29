@@ -1088,7 +1088,10 @@ class TechnicalEngine:
         df["ADX_14"] = TechnicalEngine.adx(h, l, c, 14)
 
         # Realized volatility (20d, annualized) -- for IV/RV ratio
-        log_ret = np.log(c / c.shift(1))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = c / c.shift(1)
+            ratio = ratio.where(ratio > 0)  # drop non-positive ratios
+            log_ret = np.log(ratio)
         df["RVol_20"] = log_ret.rolling(20, min_periods=20).std() * np.sqrt(252)
 
         # Distance to 52-week high / low (fundamental break-out reference)
@@ -3989,7 +3992,7 @@ def main():
 
         # ── FORMAT AND SAVE OUTPUT ───────────────────────────────────
         result_df = OutputFormatter.format_and_save(
-            final, stage_counts, ml_params, feature_importances
+            final, stage_counts, ml_params, feature_importances, macro=macro
         )
 
         elapsed = time.time() - pipeline_start
