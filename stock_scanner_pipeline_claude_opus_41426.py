@@ -3125,12 +3125,10 @@ class OptionsEvaluator:
                 underlying_price = quote_price
 
             today = datetime.now(ET_TZ).date()
-            min_epoch = int(time.mktime(
-                (today + timedelta(days=OptionsEvaluator.MIN_DTE - 2)).timetuple()
-            ))
-            max_epoch = int(time.mktime(
-                (today + timedelta(days=OptionsEvaluator.MAX_DTE + 2)).timetuple()
-            ))
+            min_date = today + timedelta(days=OptionsEvaluator.MIN_DTE - 2)
+            max_date = today + timedelta(days=OptionsEvaluator.MAX_DTE + 2)
+            min_epoch = int(datetime.combine(min_date, dtime.min, tzinfo=ET_TZ).timestamp())
+            max_epoch = int(datetime.combine(max_date, dtime.min, tzinfo=ET_TZ).timestamp())
 
             exp_dates = meta.get("expirationDates", []) or []
             qualifying_epochs = [int(e) for e in exp_dates if min_epoch <= int(e) <= max_epoch]
