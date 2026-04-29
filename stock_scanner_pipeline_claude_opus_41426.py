@@ -156,14 +156,6 @@ def last_bar_is_partial(df: pd.DataFrame) -> bool:
         return False
 
 
-def trim_partial_last_bar(df: pd.DataFrame) -> pd.DataFrame:
-    """If the final bar is a live, incomplete session, return df without it.
-    Otherwise return df unchanged. Critical for any volume-based screening."""
-    if last_bar_is_partial(df) and len(df) > 1:
-        return df.iloc[:-1]
-    return df
-
-
 def is_missing_value(val) -> bool:
     """Safe missing check that tolerates list-like API payloads."""
     if val is None:
