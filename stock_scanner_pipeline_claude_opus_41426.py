@@ -130,11 +130,122 @@ def is_market_open_now() -> bool:
     Holiday-aware-best-effort: skips obvious weekend; intra-day partial-bar
     detection still uses last-bar timestamp comparison upstream."""
     now = now_et_dt()
-    if now.weekday() >= 5:
+    if not is_trading_day(now.date()):
         return False
     open_t = dtime(9, 30)
     close_t = dtime(16, 0)
     return open_t <= now.time() <= close_t
+
+
+def _observed_date(month: int, day: int, year: int) -> datetime.date:
+    """Observed date for fixed NYSE holidays."""
+    dt = datetime(year, month, day).date()
+    if dt.weekday() == 5:
+        return dt - timedelta(days=1)
+    if dt.weekday() == 6:
+        return dt + timedelta(days=1)
+    return dt
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime.date:
+    first = datetime(year, month, 1).date()
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> datetime.date:
+    if month == 12:
+        cur = datetime(year + 1, 1, 1).date() - timedelta(days=1)
+    else:
+        cur = datetime(year, month + 1, 1).date() - timedelta(days=1)
+    while cur.weekday() != weekday:
+        cur -= timedelta(days=1)
+    return cur
+
+
+def _easter_date(year: int) -> datetime.date:
+    """Gregorian Easter date; Good Friday is an NYSE holiday."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime(year, month, day).date()
+
+
+def nyse_holidays(year: int) -> set:
+    """Core NYSE full-day holidays used for freshness checks."""
+    holidays = {
+        _observed_date(1, 1, year),
+        _nth_weekday(year, 1, 0, 3),   # MLK Day
+        _nth_weekday(year, 2, 0, 3),   # Washington's Birthday
+        _easter_date(year) - timedelta(days=2),
+        _last_weekday(year, 5, 0),     # Memorial Day
+        _observed_date(6, 19, year),   # Juneteenth
+        _observed_date(7, 4, year),
+        _nth_weekday(year, 9, 0, 1),   # Labor Day
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _observed_date(12, 25, year),
+    }
+    return holidays
+
+
+def is_trading_day(day) -> bool:
+    """Best-effort NYSE trading-day check without external dependencies."""
+    day = pd.Timestamp(day).date()
+    return day.weekday() < 5 and day not in nyse_holidays(day.year)
+
+
+def previous_trading_day(day) -> datetime.date:
+    day = pd.Timestamp(day).date() - timedelta(days=1)
+    while not is_trading_day(day):
+        day -= timedelta(days=1)
+    return day
+
+
+def expected_last_closed_trading_day(now: Optional[datetime] = None) -> datetime.date:
+    """Latest daily bar the scanner should be willing to use.
+
+    Before 18:00 ET on a trading day, vendors may not have finalized today's
+    daily bar, so the expected closed session remains the previous session.
+    """
+    now = now or now_et_dt()
+    today = now.date()
+    if not is_trading_day(today):
+        return previous_trading_day(today + timedelta(days=1))
+    if now.time() >= dtime(18, 0):
+        return today
+    return previous_trading_day(today)
+
+
+def trading_sessions_between(start_day, end_day) -> int:
+    """Count trading sessions after start_day through end_day."""
+    start = pd.Timestamp(start_day).date()
+    end = pd.Timestamp(end_day).date()
+    if start >= end:
+        return 0
+    count = 0
+    cur = start + timedelta(days=1)
+    while cur <= end:
+        if is_trading_day(cur):
+            count += 1
+        cur += timedelta(days=1)
+    return count
+
+
+def freshness_lag_sessions(last_day, now: Optional[datetime] = None) -> int:
+    expected = expected_last_closed_trading_day(now)
+    last = pd.Timestamp(last_day).date()
+    return trading_sessions_between(last, expected)
 
 
 def last_bar_is_partial(df: pd.DataFrame) -> bool:
@@ -257,12 +368,14 @@ class MacroRegime:
         "wti": "CL=F",
         "copper": "HG=F",
     }
+    REQUIRED_SYMBOLS = {"spx", "vix", "tnx", "irx", "dxy", "wti"}
+    MIN_SNAPSHOT_COUNT = 7
 
     def __init__(self):
         self.yahoo = YahooDirectAPI()
         self.snapshot: Dict[str, Dict] = {}
-        self.regime_score: float = 60.0
-        self.regime_label: str = "NEUTRAL"
+        self.regime_score: Optional[float] = None
+        self.regime_label: str = "UNAVAILABLE"
         self.notes: List[str] = []
 
     def _series(self, symbol: str, range_: str = "2y") -> Optional[pd.DataFrame]:
@@ -282,7 +395,7 @@ class MacroRegime:
             closes = quote.get("close", []) or []
             if len(ts) < 30 or len(closes) < 30:
                 return None
-            idx = pd.to_datetime(ts, unit="s")
+            idx = pd.to_datetime(ts, unit="s").tz_localize("UTC").tz_convert(ET_TZ)
             df = pd.DataFrame({"Close": closes}, index=idx).dropna()
             return df if len(df) >= 30 else None
         except Exception:
@@ -299,9 +412,17 @@ class MacroRegime:
                 try:
                     df = f.result()
                     if df is not None:
+                        last_date = pd.Timestamp(df.index[-1]).date()
+                        lag = freshness_lag_sessions(last_date)
+                        if lag > 1:
+                            log.warning(
+                                f"  Macro {name} stale by {lag} trading sessions; excluding."
+                            )
+                            continue
                         self.snapshot[name] = {
                             "df": df,
                             "last": float(df["Close"].iloc[-1]),
+                            "last_date": last_date.isoformat(),
                             "ret_1d": float(df["Close"].pct_change().iloc[-1]) if len(df) >= 2 else 0.0,
                             "ret_5d": float(df["Close"].pct_change(5).iloc[-1]) if len(df) >= 6 else 0.0,
                             "ret_20d": float(df["Close"].pct_change(20).iloc[-1]) if len(df) >= 21 else 0.0,
@@ -309,6 +430,15 @@ class MacroRegime:
                         }
                 except Exception:
                     pass
+
+        missing_required = sorted(self.REQUIRED_SYMBOLS - set(self.snapshot))
+        if len(self.snapshot) < self.MIN_SNAPSHOT_COUNT or missing_required:
+            raise PipelineError(
+                "Macro regime unavailable or incomplete "
+                f"({len(self.snapshot)}/{len(self.SYMBOLS)} loaded; "
+                f"missing required: {', '.join(missing_required) or 'none'}). "
+                "Pipeline STOPPED rather than using a neutral fallback."
+            )
 
         self._score_regime()
 
@@ -453,6 +583,8 @@ class MacroRegime:
     def position_sizing_scalar(self) -> float:
         """Multiplier in [0.4, 1.2] for downstream position sizing.
         Used to scale the recommended dollar exposure based on regime."""
+        if self.regime_score is None:
+            raise PipelineError("Macro regime score unavailable for position sizing.")
         s = self.regime_score
         if s >= 75:
             return 1.20
@@ -467,16 +599,19 @@ class MacroRegime:
     def panel_m_score(self) -> float:
         """Use the regime score directly as O'Neil's M (Market Direction)
         score, replacing the SPX-only proxy with a real macro composite."""
+        if self.regime_score is None:
+            raise PipelineError("Macro regime score unavailable for panel scoring.")
         return float(self.regime_score)
 
     def to_dict(self) -> Dict:
-        out = {"regime_score": round(self.regime_score, 1),
+        out = {"regime_score": round(self.regime_score, 1) if self.regime_score is not None else None,
                "regime_label": self.regime_label,
                "notes": list(self.notes),
                "snapshots": {}}
         for name, snap in self.snapshot.items():
             out["snapshots"][name] = {
                 "last": round(snap["last"], 4),
+                "last_date": snap.get("last_date"),
                 "ret_1d": round(snap.get("ret_1d", 0.0), 4),
                 "ret_20d": round(snap.get("ret_20d", 0.0), 4),
                 "ret_63d": round(snap.get("ret_63d", 0.0), 4),
@@ -653,12 +788,17 @@ class MboumAPI:
                     continue
                 if "close" not in bar:
                     continue
+                close = normalize_api_scalar(bar.get("close"))
+                adj_close = normalize_api_scalar(bar.get("adjclose", close))
+                factor = safe_div(adj_close, close, default=1.0)
+                if is_missing_value(factor) or factor <= 0:
+                    factor = 1.0
                 rows.append({
                     "Date": bar.get("date"),
-                    "Open": bar.get("open"),
-                    "High": bar.get("high"),
-                    "Low": bar.get("low"),
-                    "Close": bar.get("adjclose", bar.get("close")),
+                    "Open": normalize_api_scalar(bar.get("open")) * factor,
+                    "High": normalize_api_scalar(bar.get("high")) * factor,
+                    "Low": normalize_api_scalar(bar.get("low")) * factor,
+                    "Close": adj_close,
                     "Volume": bar.get("volume"),
                 })
 
@@ -1195,7 +1335,9 @@ class ExecutionGuards:
     MIN_DOLLAR_VOLUME = 5_000_000
 
     @staticmethod
-    def _check(ticker: str, df: pd.DataFrame) -> Optional[str]:
+    def _check(
+        ticker: str, df: pd.DataFrame, now: Optional[datetime] = None
+    ) -> Optional[str]:
         """Returns rejection reason or None if passes all guards."""
         if df.empty or len(df) < MIN_TRADING_DAYS:
             return "GUARD_A: Insufficient data"
@@ -1216,10 +1358,13 @@ class ExecutionGuards:
             last_date = pd.Timestamp(df.index[-1]).date()
         except Exception:
             return "GUARD_A: Last bar timestamp invalid"
-        today_et = now_et_dt().date()
-        days_stale = (today_et - last_date).days
-        if days_stale > 5:  # Allow weekends + holidays
-            return f"GUARD_A: Stale data ({days_stale} days old)"
+        expected_day = expected_last_closed_trading_day(now)
+        lag_sessions = trading_sessions_between(last_date, expected_day)
+        if lag_sessions > 0:
+            return (
+                "GUARD_A: Stale data "
+                f"({lag_sessions} trading sessions behind expected {expected_day})"
+            )
 
         # GUARD_A: Reject zero-volume or constant-price bars (delisted/halted)
         last_30 = df.iloc[-30:] if len(df) >= 30 else df
@@ -1646,11 +1791,11 @@ class MLRanker:
 
         # Build training dataset from broad universe; score the survivors.
         train_pool = training_universe if training_universe else all_data
-        X_train, y_train, X_current, current_tickers = self._build_dataset(
+        X_train, y_train, X_current, current_tickers, train_dates = self._build_dataset(
             survivors, all_data, train_pool
         )
 
-        if X_train is None or len(X_train) < 100:
+        if X_train is None or len(X_train) < 250:
             log.warning("Insufficient training samples -- assigning uniform scores")
             for s in survivors:
                 s["ml_score_xgb"] = 0.5
@@ -1664,10 +1809,10 @@ class MLRanker:
         X_current_scaled = self.scaler.transform(X_current)
 
         # Train XGBoost
-        xgb_scores = self._train_xgboost(X_train_scaled, y_train, X_current_scaled)
+        xgb_scores = self._train_xgboost(X_train_scaled, y_train, X_current_scaled, train_dates)
 
         # Train Random Forest
-        rf_scores = self._train_rf(X_train_scaled, y_train, X_current_scaled)
+        rf_scores = self._train_rf(X_train_scaled, y_train, X_current_scaled, train_dates)
 
         # Ensemble
         ensemble_scores = (xgb_scores + rf_scores) / 2
@@ -1711,12 +1856,28 @@ class MLRanker:
         log.info("STAGE 4 COMPLETE: ML scores assigned")
         return survivors
 
+    def rank_near_misses(
+        self,
+        near_misses: List[Dict],
+        all_data: Dict[str, pd.DataFrame],
+        training_universe: Dict[str, pd.DataFrame],
+    ) -> List[Dict]:
+        """Score near misses for diagnostics without converting them to buys."""
+        shadow = [{"ticker": nm["ticker"]} for nm in near_misses]
+        scored = self.rank(shadow, all_data, training_universe=training_universe)
+        score_by_ticker = {s["ticker"]: s for s in scored}
+        for nm in near_misses:
+            scores = score_by_ticker.get(nm["ticker"], {})
+            for key in ("ml_score_xgb", "ml_score_rf", "ml_ensemble_score", "lstm_score"):
+                nm[key] = scores.get(key)
+        return near_misses
+
     def _build_dataset(
         self,
         survivors: List[Dict],
         all_data: Dict[str, pd.DataFrame],
         training_pool: Dict[str, pd.DataFrame],
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, List[str]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, List[str], Optional[np.ndarray]]:
         """
         Build training and current-day feature matrices.
 
@@ -1729,6 +1890,7 @@ class MLRanker:
         """
         train_rows = []
         train_labels = []
+        train_dates = []
         current_rows = []
         current_tickers = []
 
@@ -1763,6 +1925,7 @@ class MLRanker:
             if len(common_idx) > 0:
                 train_rows.append(valid.loc[common_idx].values)
                 train_labels.append(valid_labels.loc[common_idx].values)
+                train_dates.append(np.array(common_idx, dtype="datetime64[ns]"))
 
         # ---- CURRENT-DAY FEATURES: only the survivors we will score -----
         for s in survivors:
@@ -1780,16 +1943,22 @@ class MLRanker:
                 current_tickers.append(ticker)
 
         if not train_rows or not current_rows:
-            return None, None, np.array([]), []
+            return None, None, np.array([]), [], None
 
         X_train = np.vstack(train_rows)
         y_train = np.concatenate(train_labels)
+        train_dates_arr = np.concatenate(train_dates)
         X_current = np.array(current_rows)
 
         # Remove any remaining NaN/inf
         mask = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
         X_train = X_train[mask]
         y_train = y_train[mask]
+        train_dates_arr = train_dates_arr[mask]
+        sort_idx = np.argsort(train_dates_arr)
+        X_train = X_train[sort_idx]
+        y_train = y_train[sort_idx]
+        train_dates_arr = train_dates_arr[sort_idx]
 
         log.info(
             f"  Training set: {X_train.shape[0]} samples, "
@@ -1797,10 +1966,11 @@ class MLRanker:
             f"Current set: {X_current.shape[0]} tickers."
         )
 
-        return X_train, y_train, X_current, current_tickers
+        return X_train, y_train, X_current, current_tickers, train_dates_arr
 
     def _train_xgboost(
-        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray
+        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray,
+        train_dates: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """Train XGBoost and return predicted probabilities for current data."""
         if not XGB_AVAILABLE:
@@ -1819,8 +1989,9 @@ class MLRanker:
             verbosity=0,
         )
 
-        # Time-series cross-validation
-        tscv = TimeSeriesSplit(n_splits=5)
+        # Time-series cross-validation on date-sorted rows approximates
+        # walk-forward validation across the whole market, not ticker blocks.
+        tscv = TimeSeriesSplit(n_splits=5, gap=20)
         val_accs = []
         train_accs = []
         for train_idx, val_idx in tscv.split(X_train):
@@ -1866,7 +2037,8 @@ class MLRanker:
         return np.clip(probs, 0.0, 1.0)
 
     def _train_rf(
-        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray
+        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray,
+        train_dates: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """Train Random Forest and return predicted probabilities."""
         model = RandomForestClassifier(
@@ -1877,8 +2049,8 @@ class MLRanker:
             n_jobs=-1,
         )
 
-        # Time-series cross-validation
-        tscv = TimeSeriesSplit(n_splits=5)
+        # Match XGBoost's walk-forward validation with a 20-session label gap.
+        tscv = TimeSeriesSplit(n_splits=5, gap=20)
         val_accs = []
         for train_idx, val_idx in tscv.split(X_train):
             model.fit(X_train[train_idx], y_train[train_idx])
@@ -2093,6 +2265,10 @@ class FundamentalsFetcher:
                 stats = modules.get("default-key-statistics", {})
                 profile = modules.get("asset-profile", {})
                 cal = modules.get("calendar-events", {})
+                missing_modules = [
+                    m for m in ("financial-data", "default-key-statistics", "asset-profile")
+                    if not isinstance(modules.get(m), dict) or not modules.get(m)
+                ]
 
                 def _raw(d, key):
                     return normalize_api_scalar(d.get(key))
@@ -2112,6 +2288,7 @@ class FundamentalsFetcher:
                     ),
                     "sector": normalize_api_scalar(profile.get("sector", "Unknown")),
                     "industry": normalize_api_scalar(profile.get("industry", "Unknown")),
+                    "quote_type": normalize_api_scalar(profile.get("quoteType")),
                     "market_cap": _raw(stats, "marketCap"),
                     "pe_ratio": _raw(stats, "trailingPE"),
                     "forward_pe": _raw(stats, "forwardPE"),
@@ -2132,6 +2309,8 @@ class FundamentalsFetcher:
                     "analyst_count": _raw(fin, "numberOfAnalystOpinions"),
                     "target_price": _raw(fin, "targetMeanPrice"),
                     "earnings_date": None,
+                    "fundamentals_quality": "complete" if not missing_modules else "partial",
+                    "missing_fundamental_modules": missing_modules,
                 }
 
                 # Extract earnings date from calendar
@@ -2191,7 +2370,16 @@ class FundamentalsFetcher:
                     info["earnings_date"] = str(info["earnings_date"])
 
             except Exception as e:
-                info = {"name": ticker, "sector": "Unknown", "error": str(e)}
+                info = {
+                    "name": ticker,
+                    "sector": "Unknown",
+                    "fundamentals_quality": "failed",
+                    "missing_fundamental_modules": [
+                        "financial-data", "default-key-statistics",
+                        "asset-profile", "calendar-events"
+                    ],
+                    "error": str(e),
+                }
 
             return ticker, info
 
@@ -2548,6 +2736,9 @@ class InvestorPanel:
     # ── LYNCH: Growth At Reasonable Price ─────────────────────────────
 
     def _score_lynch(self, ticker: str, df: pd.DataFrame, fund: Dict) -> float:
+        if fund.get("fundamentals_missing") or fund.get("fundamentals_quality") == "failed":
+            return 35.0
+
         # 1. Earnings Growth (30%)
         eg_score = 50
         eg = fund.get("earnings_growth", np.nan)
@@ -2618,13 +2809,21 @@ class InvestorPanel:
             else:
                 story_score = 45
 
-        # ETF adjustment: if sector is Unknown/ETF, reduce weight of fundamentals
+        # ETF adjustment only when explicitly identified; unknown fundamentals
+        # must not receive neutral GARP credit in a real-money scan.
         sector = fund.get("sector", "Unknown")
-        if sector == "Unknown" or sector == "":
+        quote_type = str(fund.get("quote_type", "")).upper()
+        if quote_type in {"ETF", "ETP", "MUTUALFUND"}:
             # Assign neutral fundamental scores for ETFs
             eg_score = 60
             peg_score = 60
             rev_score = 60
+        elif sector in {"Unknown", ""} or fund.get("fundamentals_quality") == "failed":
+            eg_score = min(eg_score, 35)
+            peg_score = min(peg_score, 35)
+            rev_score = min(rev_score, 35)
+            bs_score = min(bs_score, 45)
+            story_score = min(story_score, 40)
 
         return (
             eg_score * 0.30 + peg_score * 0.25 +
@@ -3007,20 +3206,17 @@ class OptionsEvaluator:
                     continue
 
                 has_live_quote = (
-                    not is_missing_value(bid) and not is_missing_value(ask) and (bid + ask) > 0
+                    not is_missing_value(bid) and not is_missing_value(ask)
+                    and bid > 0 and ask > 0 and ask >= bid
                 )
+                if not has_live_quote:
+                    continue
                 if is_missing_value(mid):
-                    if has_live_quote:
-                        mid = (bid + ask) / 2
-                    else:
-                        mid = 0
+                    mid = (bid + ask) / 2
                 if mid <= 0:
                     continue
 
-                if has_live_quote:
-                    spread_pct = safe_div(ask - bid, mid, default=np.nan) * 100
-                else:
-                    spread_pct = 8.0
+                spread_pct = safe_div(ask - bid, mid, default=np.nan) * 100
                 if pd.isna(spread_pct) or spread_pct < 0 or spread_pct > OptionsEvaluator.MAX_SPREAD_PCT:
                     continue
 
