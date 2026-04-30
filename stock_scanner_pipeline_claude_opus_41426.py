@@ -28,7 +28,7 @@ import math
 import warnings
 import traceback
 from massive import RESTClient
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import datetime, date, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -137,7 +137,7 @@ def is_market_open_now() -> bool:
     return open_t <= now.time() <= close_t
 
 
-def _observed_date(month: int, day: int, year: int) -> datetime.date:
+def _observed_date(month: int, day: int, year: int) -> date:
     """Observed date for fixed NYSE holidays."""
     dt = datetime(year, month, day).date()
     if dt.weekday() == 5:
@@ -147,13 +147,13 @@ def _observed_date(month: int, day: int, year: int) -> datetime.date:
     return dt
 
 
-def _nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime.date:
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
     first = datetime(year, month, 1).date()
     offset = (weekday - first.weekday()) % 7
     return first + timedelta(days=offset + 7 * (n - 1))
 
 
-def _last_weekday(year: int, month: int, weekday: int) -> datetime.date:
+def _last_weekday(year: int, month: int, weekday: int) -> date:
     if month == 12:
         cur = datetime(year + 1, 1, 1).date() - timedelta(days=1)
     else:
@@ -163,7 +163,7 @@ def _last_weekday(year: int, month: int, weekday: int) -> datetime.date:
     return cur
 
 
-def _easter_date(year: int) -> datetime.date:
+def _easter_date(year: int) -> date:
     """Gregorian Easter date; Good Friday is an NYSE holiday."""
     a = year % 19
     b = year // 100
@@ -207,14 +207,14 @@ def is_trading_day(day) -> bool:
     return day.weekday() < 5 and day not in holidays
 
 
-def previous_trading_day(day) -> datetime.date:
+def previous_trading_day(day) -> date:
     day = pd.Timestamp(day).date() - timedelta(days=1)
     while not is_trading_day(day):
         day -= timedelta(days=1)
     return day
 
 
-def expected_last_closed_trading_day(now: Optional[datetime] = None) -> datetime.date:
+def expected_last_closed_trading_day(now: Optional[datetime] = None) -> date:
     """Latest daily bar the scanner should be willing to use.
 
     Before 18:00 ET on a trading day, vendors may not have finalized today's
