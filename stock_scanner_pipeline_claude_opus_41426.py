@@ -1793,7 +1793,7 @@ class MLRanker:
 
         # Build training dataset from broad universe; score the survivors.
         train_pool = training_universe if training_universe else all_data
-        X_train, y_train, X_current, current_tickers, train_dates = self._build_dataset(
+        X_train, y_train, X_current, current_tickers = self._build_dataset(
             survivors, all_data, train_pool
         )
 
@@ -1813,10 +1813,10 @@ class MLRanker:
         X_current_scaled = self.scaler.transform(X_current)
 
         # Train XGBoost
-        xgb_scores = self._train_xgboost(X_train_scaled, y_train, X_current_scaled, train_dates)
+        xgb_scores = self._train_xgboost(X_train_scaled, y_train, X_current_scaled)
 
         # Train Random Forest
-        rf_scores = self._train_rf(X_train_scaled, y_train, X_current_scaled, train_dates)
+        rf_scores = self._train_rf(X_train_scaled, y_train, X_current_scaled)
 
         # Ensemble
         ensemble_scores = (xgb_scores + rf_scores) / 2
@@ -1995,11 +1995,10 @@ class MLRanker:
             f"Current set: {X_current.shape[0]} tickers."
         )
 
-        return X_train, y_train, X_current, current_tickers, train_dates_arr
+        return X_train, y_train, X_current, current_tickers
 
     def _train_xgboost(
-        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray,
-        train_dates: Optional[np.ndarray] = None
+        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray
     ) -> np.ndarray:
         """Train XGBoost and return predicted probabilities for current data."""
         if not XGB_AVAILABLE:
@@ -2072,8 +2071,7 @@ class MLRanker:
         return np.clip(probs, 0.0, 1.0)
 
     def _train_rf(
-        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray,
-        train_dates: Optional[np.ndarray] = None
+        self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray
     ) -> np.ndarray:
         """Train Random Forest and return predicted probabilities."""
         model = RandomForestClassifier(
