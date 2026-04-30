@@ -1804,6 +1804,8 @@ class MLRanker:
                 s["lstm_score"] = None
             return survivors
 
+        X_train, y_train = self._cap_training_rows(X_train, y_train)
+
         # Scale features
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_current_scaled = self.scaler.transform(X_current)
@@ -1855,6 +1857,31 @@ class MLRanker:
 
         log.info("STAGE 4 COMPLETE: ML scores assigned")
         return survivors
+
+    @staticmethod
+    def _cap_training_rows(
+        X_train: np.ndarray, y_train: np.ndarray, max_rows: int = 80_000
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Keep the most recent, class-balanced rows so live scans finish."""
+        if len(X_train) <= max_rows:
+            return X_train, y_train
+        rng = np.random.default_rng(42)
+        per_class = max_rows // 2
+        keep = []
+        for cls in (0, 1):
+            idx = np.flatnonzero(y_train == cls)
+            if len(idx) > per_class:
+                idx = idx[-per_class:]
+            keep.append(idx)
+        keep_idx = np.concatenate(keep)
+        if len(keep_idx) < max_rows:
+            remaining = np.setdiff1d(np.arange(len(y_train)), keep_idx, assume_unique=False)
+            fill_n = min(max_rows - len(keep_idx), len(remaining))
+            if fill_n:
+                keep_idx = np.concatenate([keep_idx, remaining[-fill_n:]])
+        keep_idx = np.sort(keep_idx)
+        log.info(f"  Training set capped to {len(keep_idx)} most-recent balanced samples.")
+        return X_train[keep_idx], y_train[keep_idx]
 
     def rank_near_misses(
         self,
