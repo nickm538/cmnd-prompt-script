@@ -3390,7 +3390,7 @@ class OptionsEvaluator:
                 exp_epoch = int(entry.get("expirationDate", 0))
                 if exp_epoch <= 0:
                     continue
-                exp_str = datetime.utcfromtimestamp(exp_epoch).strftime("%Y-%m-%d")
+                exp_str = datetime.fromtimestamp(exp_epoch, timezone.utc).strftime("%Y-%m-%d")
                 for call in (entry.get("calls") or []):
                     bid = normalize_api_scalar(call.get("bid"))
                     ask = normalize_api_scalar(call.get("ask"))
