@@ -202,7 +202,9 @@ def nyse_holidays(year: int) -> set:
 def is_trading_day(day) -> bool:
     """Best-effort NYSE trading-day check without external dependencies."""
     day = pd.Timestamp(day).date()
-    return day.weekday() < 5 and day not in nyse_holidays(day.year)
+    holidays = set(nyse_holidays(day.year))
+    holidays.update(d for d in nyse_holidays(day.year + 1) if d.year == day.year)
+    return day.weekday() < 5 and day not in holidays
 
 
 def previous_trading_day(day) -> datetime.date:
