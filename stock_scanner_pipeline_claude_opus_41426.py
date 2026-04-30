@@ -2307,7 +2307,12 @@ class FundamentalsFetcher:
                 profile = modules.get("asset-profile", {})
                 cal = modules.get("calendar-events", {})
                 missing_modules = [
-                    m for m in ("financial-data", "default-key-statistics", "asset-profile")
+                    m for m in (
+                        "financial-data",
+                        "default-key-statistics",
+                        "asset-profile",
+                        "calendar-events",
+                    )
                     if not isinstance(modules.get(m), dict) or not modules.get(m)
                 ]
 
