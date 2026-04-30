@@ -4,6 +4,10 @@ requests
 yfinance
 scikit-learn
 massive
+# massive >=2.6 imports `websockets.asyncio`, which requires websockets >= 13.
+# Pin >=14 to match `massive`'s own constraint and avoid environments where an
+# older `websockets` (often pulled in by other packages) is already installed.
+websockets>=14.0
 tzdata
 
 # Optional ML accelerators used by the scanner when available.
