@@ -2020,10 +2020,16 @@ class MLRanker:
 
         # Time-series cross-validation on date-sorted rows approximates
         # walk-forward validation across the whole market, not ticker blocks.
-        tscv = TimeSeriesSplit(n_splits=5, gap=20)
+        gap = 20
+        tscv = TimeSeriesSplit(n_splits=5)
         val_accs = []
         train_accs = []
         for train_idx, val_idx in tscv.split(X_train):
+            if gap > 0:
+                val_start = val_idx[0]
+                train_idx = train_idx[train_idx < (val_start - gap)]
+                if train_idx.size == 0:
+                    continue
             model.fit(X_train[train_idx], y_train[train_idx])
             train_pred = model.predict(X_train[train_idx])
             val_pred = model.predict(X_train[val_idx])
