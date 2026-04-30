@@ -2077,9 +2077,21 @@ class MLRanker:
         )
 
         # Match XGBoost's walk-forward validation with a 20-session label gap.
-        tscv = TimeSeriesSplit(n_splits=5, gap=20)
+        gap = 20
+        try:
+            tscv = TimeSeriesSplit(n_splits=5, gap=gap)
+            use_manual_gap = False
+        except TypeError:
+            # Older scikit-learn versions do not support the `gap` argument.
+            tscv = TimeSeriesSplit(n_splits=5)
+            use_manual_gap = True
+
         val_accs = []
         for train_idx, val_idx in tscv.split(X_train):
+            if use_manual_gap:
+                if len(train_idx) <= gap:
+                    continue
+                train_idx = train_idx[:-gap]
             model.fit(X_train[train_idx], y_train[train_idx])
             val_pred = model.predict(X_train[val_idx])
             val_accs.append(accuracy_score(y_train[val_idx], val_pred))
