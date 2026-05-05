@@ -30,12 +30,22 @@ jobs:
             exit 0
           fi
 
-          et_hour="$(TZ=America/New_York date +%H)"
-          if [[ "$et_hour" == "08" ]]; then
+          # Use github.event.schedule (immutable – set when the job was queued)
+          # together with the current ET UTC offset to decide which cron
+          # corresponds to 08:45 ET, regardless of how late the job starts.
+          et_offset="$(TZ=America/New_York date +%z)"
+          if [[ "$et_offset" == "-0400" ]]; then
+            expected_schedule="45 12 * * 1-5"   # EDT: 08:45 ET = 12:45 UTC
+          else
+            expected_schedule="45 13 * * 1-5"   # EST: 08:45 ET = 13:45 UTC
+          fi
+
+          triggered_schedule="${{ github.event.schedule }}"
+          if [[ "$triggered_schedule" == "$expected_schedule" ]]; then
             echo "run_scan=true" >> "$GITHUB_OUTPUT"
           else
             echo "run_scan=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping duplicate UTC schedule; current ET hour is ${et_hour}."
+            echo "Skipping off-season schedule '${triggered_schedule}'; expected '${expected_schedule}' for ET offset ${et_offset}."
           fi
 
       - name: Check out repository
