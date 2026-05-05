@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-import stock_scanner_pipeline_claude_opus_41426 as scanner
+import new_stock_scanner_pipeline_claude_opus_41426 as scanner
 
 
 def _guard_ready_df(last_day, unique_prices=True):
