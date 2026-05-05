@@ -26,7 +26,7 @@ source file.
 
 ```bash
 source .venv/bin/activate
-python stock_scanner_pipeline_claude_opus_41426.py
+python new_stock_scanner_pipeline_claude_opus_41426.py
 ```
 
 The script calls live financial data APIs and can take several minutes. Runtime
