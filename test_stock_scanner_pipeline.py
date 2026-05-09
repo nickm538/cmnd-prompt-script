@@ -102,6 +102,91 @@ class ScannerRegressionTests(unittest.TestCase):
 
         self.assertEqual(result["option_candidate"], "N")
 
+    def test_rank_pool_backfills_top7_from_live_near_misses(self):
+        data = {
+            f"T{i}": _guard_ready_df(datetime(2026, 4, 29).date())
+            for i in range(10)
+        }
+        strict = [
+            scanner.HardBuyRules._candidate_record(
+                "T0",
+                data["T0"],
+                rule_result={
+                    "rules_passed": 10,
+                    "rules_failed": 0,
+                    "passed_rules": [f"BUY_{i:02d}" for i in range(1, 11)],
+                    "failed_rules": [],
+                },
+                hard_buy_pass=True,
+            )
+        ]
+        near_misses = [
+            {
+                "ticker": f"T{i}",
+                "price": 100 + i,
+                "rules_passed": 9 if i < 8 else 7,
+                "rules_failed": 1 if i < 8 else 3,
+                "passed_rules": [f"BUY_{j:02d}" for j in range(1, 10)],
+                "failed_rules": ["BUY_05:Crossover"],
+                "return_20d": 0.08,
+                "volume_ratio": 1.5,
+                "rsi_14": 55,
+            }
+            for i in range(10)
+        ]
+
+        with patch.object(scanner.HardBuyRules, "near_misses", return_value=near_misses):
+            pool, _ = scanner.HardBuyRules.build_rank_pool(
+                data, strict, target_size=7, max_pool_size=7
+            )
+
+        self.assertEqual(len(pool), 7)
+        self.assertEqual(pool[0]["ticker"], "T0")
+        self.assertTrue(pool[0]["hard_buy_pass"])
+        self.assertTrue(all(p["rules_passed"] >= scanner.MIN_NEAR_MISS_RULES for p in pool))
+        self.assertTrue(any("NEAR_MISS_9_OF_10" in p["flags"] for p in pool[1:]))
+
+    def test_panel_can_score_without_filtering_backfill_pool(self):
+        panel = scanner.InvestorPanel()
+        survivor = {"ticker": "TEST"}
+        data = {"TEST": _guard_ready_df(datetime(2026, 4, 29).date())}
+
+        with patch.object(panel, "load_benchmark", return_value=None):
+            with patch.object(panel, "_score_livermore", return_value=50.0):
+                with patch.object(panel, "_score_druckenmiller", return_value=50.0):
+                    with patch.object(panel, "_score_lynch", return_value=50.0):
+                        with patch.object(panel, "_score_minervini", return_value=50.0):
+                            with patch.object(panel, "_score_oneil", return_value=50.0):
+                                unfiltered = panel.score_all(
+                                    [survivor.copy()], data, {}, apply_filter=False
+                                )
+                                filtered = panel.score_all(
+                                    [survivor.copy()], data, {}, apply_filter=True
+                                )
+
+        self.assertEqual(len(unfiltered), 1)
+        self.assertEqual(len(filtered), 0)
+
+    def test_trade_setup_score_uses_equity_quality_without_options(self):
+        candidate = {
+            "ticker": "TEST",
+            "ml_ensemble_score": 0.65,
+            "panel_composite_score": 72,
+            "rules_passed": 9,
+            "return_20d": 0.10,
+            "close_vs_sma50": 0.07,
+            "ema20_vs_ema50": 0.04,
+            "avg_dollar_volume": 50_000_000,
+            "option_candidate": "N",
+            "option_score": 0.0,
+            "flags": [],
+        }
+
+        score = scanner.OptionsEvaluator._trade_setup_score(candidate)
+
+        self.assertGreaterEqual(score, 60.0)
+        self.assertEqual(candidate["overall_confidence_score"], round(score, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

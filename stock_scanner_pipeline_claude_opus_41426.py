@@ -94,6 +94,10 @@ MIN_UNIVERSE_SIZE = 500
 BATCH_SIZE = 100  # yfinance download batch size
 MAX_WORKERS = 8   # thread pool for fundamentals
 OUTPUT_DIR = Path("scan_results")
+TARGET_FINAL_CANDIDATES = 7
+MIN_NEAR_MISS_RULES = 8
+MAX_PANEL_CANDIDATES = 60
+MAX_OPTIONS_EVAL_CANDIDATES = 20
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -1429,22 +1433,9 @@ class HardBuyRules:
         for ticker, df in data.items():
             passed, fail_rule, flags = HardBuyRules._evaluate(ticker, df)
             if passed:
-                last = df.iloc[-1]
-                record = {
-                    "ticker": ticker,
-                    "price": last["Close"],
-                    "rsi_14": last.get("RSI_14", np.nan),
-                    "macd_histogram": last.get("MACD_histogram", np.nan),
-                    "volume_ratio": last.get("Volume_Ratio", np.nan),
-                    "return_1d": last.get("Return_1d", np.nan),
-                    "return_5d": last.get("Return_5d", np.nan),
-                    "return_20d": last.get("Return_20d", np.nan),
-                    "close_vs_sma50": last.get("Close_vs_SMA50", np.nan),
-                    "close_vs_sma200": last.get("Close_vs_SMA200", np.nan),
-                    "ema20_vs_ema50": last.get("EMA20_vs_EMA50", np.nan),
-                    "avg_dollar_volume": last.get("Avg_Dollar_Vol_20", np.nan),
-                    "flags": flags,
-                }
+                record = HardBuyRules._candidate_record(
+                    ticker, df, flags=flags, hard_buy_pass=True
+                )
                 survivors.append(record)
                 if flags:
                     flags_summary[ticker] = flags
@@ -1461,6 +1452,103 @@ class HardBuyRules:
         return survivors, rejected
 
     @staticmethod
+    def _candidate_record(
+        ticker: str,
+        df: pd.DataFrame,
+        flags: Optional[List[str]] = None,
+        rule_result: Optional[Dict] = None,
+        hard_buy_pass: bool = False,
+    ) -> Dict:
+        """Build the live candidate record used by ML, panel, options, and output."""
+        last = df.iloc[-1]
+        flags = list(flags or [])
+        if rule_result is None:
+            if hard_buy_pass:
+                rule_result = {
+                    "rules_passed": 10,
+                    "rules_failed": 0,
+                    "passed_rules": [f"RULE_{i}" for i in range(1, 11)],
+                    "failed_rules": [],
+                }
+            else:
+                rule_result = HardBuyRules._evaluate_all_rules(ticker, df) or {}
+        rules_passed = int(rule_result.get("rules_passed", 10 if hard_buy_pass else 0))
+        rules_failed = int(rule_result.get("rules_failed", 0 if hard_buy_pass else 10 - rules_passed))
+        failed_rules = list(rule_result.get("failed_rules", []))
+        if not hard_buy_pass:
+            flags.append(f"NEAR_MISS_{rules_passed}_OF_10")
+
+        return {
+            "ticker": ticker,
+            "price": last["Close"],
+            "rsi_14": last.get("RSI_14", np.nan),
+            "macd_histogram": last.get("MACD_histogram", np.nan),
+            "volume_ratio": last.get("Volume_Ratio", np.nan),
+            "return_1d": last.get("Return_1d", np.nan),
+            "return_5d": last.get("Return_5d", np.nan),
+            "return_20d": last.get("Return_20d", np.nan),
+            "return_63d": last.get("Return_63d", np.nan),
+            "close_vs_sma50": last.get("Close_vs_SMA50", np.nan),
+            "close_vs_sma200": last.get("Close_vs_SMA200", np.nan),
+            "ema20_vs_ema50": last.get("EMA20_vs_EMA50", np.nan),
+            "avg_dollar_volume": last.get("Avg_Dollar_Vol_20", np.nan),
+            "rules_passed": rules_passed,
+            "rules_failed": rules_failed,
+            "passed_rules": list(rule_result.get("passed_rules", [])),
+            "failed_rules": failed_rules,
+            "hard_buy_pass": bool(hard_buy_pass),
+            "flags": flags,
+        }
+
+    @staticmethod
+    def build_rank_pool(
+        data: Dict[str, pd.DataFrame],
+        strict_survivors: List[Dict],
+        target_size: int = TARGET_FINAL_CANDIDATES,
+        max_pool_size: int = MAX_PANEL_CANDIDATES,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Build a live candidate pool large enough to rank a top-7 output.
+        Strict passers remain first-class; best near-misses backfill scarcity.
+        """
+        pool = list(strict_survivors)
+        near_misses: List[Dict] = []
+        seen = {s["ticker"] for s in pool}
+
+        if len(pool) >= max_pool_size:
+            log.info(
+                f"STAGE 3B: Ranked candidate pool -- {len(pool[:max_pool_size])} strict passers"
+            )
+            return pool[:max_pool_size], near_misses
+
+        needed_pool = max(target_size * 3, max_pool_size - len(pool))
+        near_misses = HardBuyRules.near_misses(data, top_n=needed_pool)
+        for nm in near_misses:
+            ticker = nm["ticker"]
+            if ticker in seen or nm.get("rules_passed", 0) < MIN_NEAR_MISS_RULES:
+                continue
+            df = data.get(ticker)
+            if df is None:
+                continue
+            pool.append(
+                HardBuyRules._candidate_record(
+                    ticker,
+                    df,
+                    rule_result=nm,
+                    hard_buy_pass=False,
+                )
+            )
+            seen.add(ticker)
+            if len(pool) >= max_pool_size:
+                break
+
+        log.info(
+            f"STAGE 3B: Ranked candidate pool -- {len(pool)} total "
+            f"({len(strict_survivors)} strict passers, {len(pool) - len(strict_survivors)} near-miss backfills)"
+        )
+        return pool, near_misses
+
+    @staticmethod
     def near_misses(
         data: Dict[str, pd.DataFrame], top_n: int = 25
     ) -> List[Dict]:
@@ -1468,7 +1556,8 @@ class HardBuyRules:
         Evaluate ALL 10 rules for every ticker without short-circuiting.
         Returns the top_n tickers sorted by most rules passed (descending),
         with full per-rule pass/fail detail.
-        Called only when zero survivors emerge.
+        Called by build_rank_pool() to backfill the candidate pool when strict
+        passers are fewer than the target size; may also run when zero survivors emerge.
         """
         log.info(f"Computing near-miss rankings for {len(data)} tickers...")
         scoreboard = []
@@ -1478,9 +1567,14 @@ class HardBuyRules:
             if result:
                 scoreboard.append(result)
 
-        # Sort: most rules passed first, then by RSI closeness to midpoint (55)
+        # Sort by broad rule strength, then momentum/volume quality.
         scoreboard.sort(
-            key=lambda x: (x["rules_passed"], -x["rules_failed"]),
+            key=lambda x: (
+                x["rules_passed"],
+                x.get("return_20d", 0) if not pd.isna(x.get("return_20d", np.nan)) else -999,
+                x.get("volume_ratio", 0) if not pd.isna(x.get("volume_ratio", np.nan)) else 0,
+                -abs((x.get("rsi_14") if not pd.isna(x.get("rsi_14", np.nan)) else 55) - 55),
+            ),
             reverse=True,
         )
 
@@ -2504,6 +2598,7 @@ class InvestorPanel:
         survivors: List[Dict],
         all_data: Dict[str, pd.DataFrame],
         fundamentals: Dict[str, Dict],
+        apply_filter: bool = True,
     ) -> List[Dict]:
         """Score all survivors through the 5-investor panel."""
         log.info(f"STAGE 5: 5-Investor Panel -- scoring {len(survivors)} survivors")
@@ -2548,6 +2643,17 @@ class InvestorPanel:
             s["market_cap"] = fund.get("market_cap", np.nan)
 
             scored.append(s)
+
+        if not apply_filter:
+            qualified = sum(
+                1 for s in scored
+                if s["panel_composite_score"] >= 60 and s["panel_consensus"] >= 3
+            )
+            log.info(
+                f"STAGE 5 COMPLETE: {len(scored)} scored; {qualified} meet "
+                f"panel quality (composite >= 60, consensus >= 3)."
+            )
+            return scored
 
         # Filter: composite >= 60 AND consensus >= 3
         final = [
@@ -3737,13 +3843,31 @@ class OptionsEvaluator:
 
     @staticmethod
     def _trade_setup_score(candidate: Dict) -> float:
-        """Blend stock quality with option quality for final ranking."""
+        """Blend stock, macro-panel, ML, hard-rule breadth, and option quality."""
         ml = normalize_api_scalar(candidate.get("ml_ensemble_score"))
         panel = normalize_api_scalar(candidate.get("panel_composite_score"))
         option_score = normalize_api_scalar(candidate.get("option_score"))
+        rules_passed = normalize_api_scalar(candidate.get("rules_passed"))
+        ret_20d = normalize_api_scalar(candidate.get("return_20d"))
+        close_vs_sma50 = normalize_api_scalar(candidate.get("close_vs_sma50"))
+        ema20_vs_ema50 = normalize_api_scalar(candidate.get("ema20_vs_ema50"))
+        avg_dollar_volume = normalize_api_scalar(candidate.get("avg_dollar_volume"))
 
         ml = ml if not is_missing_value(ml) else 0.5
         panel = (panel / 100.0) if not is_missing_value(panel) else 0.60
+        rule_component = (
+            clamp(rules_passed / 10.0, 0.0, 1.0)
+            if not is_missing_value(rules_passed) else 0.0
+        )
+        momentum_component = np.mean([
+            clamp((ret_20d if not is_missing_value(ret_20d) else 0.0) / 0.15, 0.0, 1.0),
+            clamp((close_vs_sma50 if not is_missing_value(close_vs_sma50) else 0.0) / 0.12, 0.0, 1.0),
+            clamp((ema20_vs_ema50 if not is_missing_value(ema20_vs_ema50) else 0.0) / 0.08, 0.0, 1.0),
+        ])
+        liquidity_component = (
+            clamp((math.log10(max(avg_dollar_volume, 1.0)) - 6.0) / 3.0, 0.0, 1.0)
+            if not is_missing_value(avg_dollar_volume) else 0.0
+        )
         option_component = (
             (option_score / 100.0)
             if candidate.get("option_candidate") == "Y" and not is_missing_value(option_score)
@@ -3756,11 +3880,19 @@ class OptionsEvaluator:
         flag_penalty = 0.015 * len(flags)
 
         score = clamp(
-            0.40 * ml + 0.35 * panel + 0.25 * option_component - flag_penalty,
+            0.32 * panel +
+            0.28 * ml +
+            0.20 * rule_component +
+            0.10 * momentum_component +
+            0.05 * liquidity_component +
+            0.05 * option_component -
+            flag_penalty,
             0.0,
             1.0,
         )
-        return 100.0 * score
+        confidence = 100.0 * score
+        candidate["overall_confidence_score"] = round(confidence, 1)
+        return confidence
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3873,11 +4005,13 @@ class OutputFormatter:
         survivors_sorted = sorted(
             survivors,
             key=lambda x: (
+                x.get("overall_confidence_score", x.get("trade_setup_score", 0)),
+                x.get("hard_buy_pass", False),
                 1 if x.get("option_candidate") == "Y" else 0,
-                x.get("trade_setup_score", 0),
-                x.get("option_score", 0),
-                x.get("ml_ensemble_score", 0),
                 x.get("panel_composite_score", 0),
+                x.get("ml_ensemble_score", 0),
+                x.get("rules_passed", 0),
+                x.get("option_score", 0),
             ),
             reverse=True,
         )
@@ -3894,6 +4028,8 @@ class OutputFormatter:
             "reward_risk_ratio", "pct_equity_risk", "shares_per_10k_risk",
             "ml_score_xgb", "ml_score_rf", "ml_ensemble_score", "lstm_score",
             "panel_composite_score", "panel_consensus", "trade_setup_score",
+            "overall_confidence_score", "rules_passed", "rules_failed",
+            "hard_buy_pass", "failed_rules",
             "panel_livermore", "panel_druckenmiller", "panel_lynch",
             "panel_minervini", "panel_oneil",
             "recommended_action",
@@ -3916,15 +4052,17 @@ class OutputFormatter:
                 action = "BEST CALL"
             elif s.get("option_candidate") == "Y" and trade >= 68 and option_score >= 60:
                 action = "CALL BUY"
-            elif ml >= 0.70 and panel >= 75:
+            elif trade >= 75 and ml >= 0.60 and panel >= 70:
                 action = "STRONG BUY"
-            elif ml >= 0.55 and panel >= 65:
+            elif trade >= 62 and panel >= 60:
                 action = "BUY"
             else:
                 action = "WATCH"
 
             s["recommended_action"] = action
             s["flags"] = ", ".join(s.get("flags", []))
+            if isinstance(s.get("failed_rules"), list):
+                s["failed_rules"] = ", ".join(s.get("failed_rules", []))
 
             row = {col: s.get(col) for col in columns}
             rows.append(row)
@@ -3942,6 +4080,7 @@ class OutputFormatter:
             "ml_ensemble_score": "{:.4f}",
             "panel_composite_score": "{:.1f}",
             "trade_setup_score": "{:.1f}",
+            "overall_confidence_score": "{:.1f}",
             "option_score": "{:.1f}",
             "option_mid": "{:.2f}",
             "option_break_even": "{:.2f}",
@@ -3983,6 +4122,9 @@ class OutputFormatter:
                     "ml_ensemble": round(s.get("ml_ensemble_score", 0), 4),
                     "panel_composite": round(s.get("panel_composite_score", 0), 1),
                     "trade_setup_score": round(s.get("trade_setup_score", 0), 1),
+                    "overall_confidence": round(s.get("overall_confidence_score", 0), 1),
+                    "rules_passed": s.get("rules_passed"),
+                    "hard_buy_pass": s.get("hard_buy_pass"),
                     "option_score": round(s.get("option_score", 0), 1),
                     "action": s.get("recommended_action", ""),
                 }
@@ -4029,7 +4171,7 @@ class OutputFormatter:
         print("  " + "-" * 96)
         header = (
             f"  {'#':>3} {'Ticker':<7} {'Name':<25} {'Price':>8} "
-            f"{'Trade':>6} {'ML':>6} {'Panel':>6} {'OptSc':>6} {'Action':<12} {'Opt':>3}"
+            f"{'Conf':>6} {'Rules':>5} {'ML':>6} {'Panel':>6} {'Action':<12} {'Opt':>3}"
         )
         print(header)
         print("  " + "-" * 96)
@@ -4047,17 +4189,19 @@ class OutputFormatter:
 
             name = str(row.get("name", ""))[:24]
             trade = row.get("trade_setup_score", 0)
+            conf = row.get("overall_confidence_score", trade)
+            rules = row.get("rules_passed", 0)
             ml = row.get("ml_ensemble_score", 0)
             panel = row.get("panel_composite_score", 0)
-            opt_score = row.get("option_score", 0)
             action = row.get("recommended_action", "")
             opt = row.get("option_candidate", "N")
 
             print(
                 f"  {int(row['rank']):>3} {row['ticker']:<7} {name:<25} "
                 f"${float(row['price']):>7.2f} "
-                f"{float(trade):>5.1f} {float(ml):>5.3f} {float(panel):>5.1f} "
-                f"{float(opt_score):>5.1f} {action:<12} {opt:>3}"
+                f"{float(conf):>5.1f} {int(rules):>2}/10 "
+                f"{float(ml):>5.3f} {float(panel):>5.1f} "
+                f"{action:<12} {opt:>3}"
             )
 
         # Flags summary
@@ -4268,19 +4412,27 @@ def main():
             raise PipelineError("No tickers survived execution guards. Pipeline STOPPED.")
 
         # ── STAGE 3: Hard Buy Rules ──────────────────────────────────
-        survivors, buy_rejected = HardBuyRules.apply(guarded_data)
-        stage_counts["Stage 3: Passed Hard Buy Rules"] = len(survivors)
+        strict_survivors, buy_rejected = HardBuyRules.apply(guarded_data)
+        stage_counts["Stage 3: Strict Hard Buy Rules"] = len(strict_survivors)
+
+        if len(strict_survivors) < TARGET_FINAL_CANDIDATES:
+            log.warning(
+                f"Only {len(strict_survivors)} tickers passed all 10 hard buy rules; "
+                "backfilling from the strongest live near-misses to produce a top-7 ranking."
+            )
+            survivors, near_misses = HardBuyRules.build_rank_pool(
+                guarded_data,
+                strict_survivors,
+                target_size=TARGET_FINAL_CANDIDATES,
+                max_pool_size=MAX_PANEL_CANDIDATES,
+            )
+        else:
+            survivors = strict_survivors
+            near_misses = []
+        stage_counts["Stage 3B: Ranked Candidate Pool"] = len(survivors)
 
         if len(survivors) == 0:
-            log.warning(
-                "No tickers passed all 10 hard buy rules. "
-                "This may indicate a bearish market or very tight conditions."
-            )
-            # Expanded near-miss report (top 25) for actionable insight.
-            near_misses = HardBuyRules.near_misses(guarded_data, top_n=25)
-            OutputFormatter.format_and_save([], stage_counts, {}, {}, macro=macro)
-            OutputFormatter.save_near_misses(near_misses, stage_counts)
-            return
+            raise PipelineError("No rankable candidates after hard-rule scoring. Pipeline STOPPED.")
 
         # ── STAGE 4: ML Ranking ──────────────────────────────────────
         # Train on the FULL guarded universe (~50x more samples than
@@ -4304,17 +4456,55 @@ def main():
         # ── STAGE 5: 5-Investor Panel ────────────────────────────────
         panel = InvestorPanel(macro=macro)
         panel.set_universe_returns(guarded_data)  # IBD-style RS percentile
-        survivors = panel.score_all(survivors, all_data, fundamentals)
-        stage_counts["Stage 5: Passed Panel Validation"] = len(survivors)
+        survivors = panel.score_all(
+            survivors, all_data, fundamentals, apply_filter=False
+        )
+        panel_qualified = [
+            s for s in survivors
+            if s.get("panel_composite_score", 0) >= 60 and s.get("panel_consensus", 0) >= 3
+        ]
+        stage_counts["Stage 5: Panel Scored"] = len(survivors)
+        stage_counts["Stage 5: Panel Qualified"] = len(panel_qualified)
 
         if len(survivors) == 0:
-            log.warning("No tickers passed panel validation.")
+            log.warning("No tickers could be panel-scored.")
             OutputFormatter.format_and_save([], stage_counts, ml_params, feature_importances, macro=macro)
             return
 
+        for s in survivors:
+            s["trade_setup_score"] = round(OptionsEvaluator._trade_setup_score(s), 1)
+
+        pre_option_pool = sorted(
+            panel_qualified or survivors,
+            key=lambda x: (
+                x.get("trade_setup_score", 0),
+                x.get("hard_buy_pass", False),
+                x.get("panel_composite_score", 0),
+                x.get("ml_ensemble_score", 0),
+                x.get("rules_passed", 0),
+            ),
+            reverse=True,
+        )[:MAX_OPTIONS_EVAL_CANDIDATES]
+        if len(pre_option_pool) < TARGET_FINAL_CANDIDATES and len(survivors) >= TARGET_FINAL_CANDIDATES:
+            seen_pre = {s["ticker"] for s in pre_option_pool}
+            for s in sorted(
+                survivors,
+                key=lambda x: (
+                    x.get("trade_setup_score", 0),
+                    x.get("panel_composite_score", 0),
+                    x.get("rules_passed", 0),
+                ),
+                reverse=True,
+            ):
+                if s["ticker"] not in seen_pre:
+                    pre_option_pool.append(s)
+                    seen_pre.add(s["ticker"])
+                if len(pre_option_pool) >= TARGET_FINAL_CANDIDATES:
+                    break
+
         # ── STAGE 6: Options Evaluation ──────────────────────────────
-        survivors = OptionsEvaluator.evaluate(survivors, fundamentals=fundamentals)
-        stage_counts["Stage 6: Final Candidates"] = len(survivors)
+        survivors = OptionsEvaluator.evaluate(pre_option_pool, fundamentals=fundamentals)
+        stage_counts["Stage 6: Options Evaluated"] = len(survivors)
 
         # Enrich with risk-management fields (ATR-stop, target, sizing).
         for s in survivors:
@@ -4398,7 +4588,23 @@ def main():
                 seen.add(s["ticker"])
                 final.append(s)
 
+        final = sorted(
+            final,
+            key=lambda x: (
+                x.get("overall_confidence_score", x.get("trade_setup_score", 0)),
+                x.get("hard_buy_pass", False),
+                x.get("panel_composite_score", 0),
+                x.get("ml_ensemble_score", 0),
+                x.get("rules_passed", 0),
+            ),
+            reverse=True,
+        )[:TARGET_FINAL_CANDIDATES]
+
         stage_counts["Verified Final Output"] = len(final)
+        if len(final) < TARGET_FINAL_CANDIDATES:
+            log.warning(
+                f"Only {len(final)} verified candidates available for top-{TARGET_FINAL_CANDIDATES} output."
+            )
 
         # ── FORMAT AND SAVE OUTPUT ───────────────────────────────────
         result_df = OutputFormatter.format_and_save(
