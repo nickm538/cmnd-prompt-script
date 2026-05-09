@@ -1463,7 +1463,15 @@ class HardBuyRules:
         last = df.iloc[-1]
         flags = list(flags or [])
         if rule_result is None:
-            rule_result = HardBuyRules._evaluate_all_rules(ticker, df) or {}
+            if hard_buy_pass:
+                rule_result = {
+                    "rules_passed": 10,
+                    "rules_failed": 0,
+                    "passed_rules": [f"RULE_{i}" for i in range(1, 11)],
+                    "failed_rules": [],
+                }
+            else:
+                rule_result = HardBuyRules._evaluate_all_rules(ticker, df) or {}
         rules_passed = int(rule_result.get("rules_passed", 10 if hard_buy_pass else 0))
         rules_failed = int(rule_result.get("rules_failed", 0 if hard_buy_pass else 10 - rules_passed))
         failed_rules = list(rule_result.get("failed_rules", []))
