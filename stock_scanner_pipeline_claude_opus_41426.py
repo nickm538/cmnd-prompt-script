@@ -1556,7 +1556,8 @@ class HardBuyRules:
         Evaluate ALL 10 rules for every ticker without short-circuiting.
         Returns the top_n tickers sorted by most rules passed (descending),
         with full per-rule pass/fail detail.
-        Called only when zero survivors emerge.
+        Called by build_rank_pool() to backfill the candidate pool when strict
+        passers are fewer than the target size; may also run when zero survivors emerge.
         """
         log.info(f"Computing near-miss rankings for {len(data)} tickers...")
         scoreboard = []
