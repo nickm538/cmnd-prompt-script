@@ -4411,12 +4411,15 @@ def main():
                 f"Only {len(strict_survivors)} tickers passed all 10 hard buy rules; "
                 "backfilling from the strongest live near-misses to produce a top-7 ranking."
             )
-        survivors, near_misses = HardBuyRules.build_rank_pool(
-            guarded_data,
-            strict_survivors,
-            target_size=TARGET_FINAL_CANDIDATES,
-            max_pool_size=MAX_PANEL_CANDIDATES,
-        )
+            survivors, near_misses = HardBuyRules.build_rank_pool(
+                guarded_data,
+                strict_survivors,
+                target_size=TARGET_FINAL_CANDIDATES,
+                max_pool_size=MAX_PANEL_CANDIDATES,
+            )
+        else:
+            survivors = strict_survivors
+            near_misses = []
         stage_counts["Stage 3B: Ranked Candidate Pool"] = len(survivors)
 
         if len(survivors) == 0:
