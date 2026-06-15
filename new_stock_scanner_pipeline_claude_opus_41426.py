@@ -77,7 +77,7 @@ ALPHAVANTAGE_API_KEY = os.environ.get(
     "ALPHAVANTAGE_API_KEY", "Q7LVL2LCTKCF81ZA"
 )
 MBOUM_API_KEY = os.environ.get(
-    "MBOUM_API_KEY", "xfAMuSlx5yUmX4PKegfarmd7y8799RcxjxKiNAUh"
+    "MBOUM_API_KEY", "809|k2MYj78hvurdDrxTwopHIh6oyodsFLhpP824ytRK"
 )
 # Options-tier MBOUM key (different plan that includes the /v1/markets/options
 # endpoint). Set via env var or falls back to the user's options-plan key.
