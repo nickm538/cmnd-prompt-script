@@ -77,12 +77,12 @@ ALPHAVANTAGE_API_KEY = os.environ.get(
     "ALPHAVANTAGE_API_KEY", "Q7LVL2LCTKCF81ZA"
 )
 MBOUM_API_KEY = os.environ.get(
-    "MBOUM_API_KEY", "809|k2MYj78hvurdDrxTwopHIh6oyodsFLhpP824ytRK"
+    "MBOUM_API_KEY", "k2MYj78hvurdDrxTwopHIh6oyodsFLhpP824ytRK"
 )
 # Options-tier MBOUM key (different plan that includes the /v1/markets/options
-# endpoint). Set via env var or falls back to the user's options-plan key.
+# endpoint). Set via env var or falls back to the primary MBOUM key.
 MBOUM_OPTIONS_KEY = os.environ.get(
-    "MBOUM_OPTIONS_KEY", "642|Splqvb0O7fzSSI0ptlYIs4qXt4N4UaqwJHToVQ1X"
+    "MBOUM_OPTIONS_KEY", "k2MYj78hvurdDrxTwopHIh6oyodsFLhpP824ytRK"
 )
 MBOUM_BASE_URL = "https://api.mboum.com"
 MASSIVE_BASE_URL = "https://api.massive.com/v2"
