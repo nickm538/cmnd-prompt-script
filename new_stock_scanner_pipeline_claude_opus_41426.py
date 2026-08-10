@@ -107,7 +107,11 @@ MAX_OPTIONS_EVAL_CANDIDATES = 20
 # Wall-clock budget. GitHub Actions cancels the job at `timeout-minutes` and
 # discards nothing but the log, so the pipeline enforces its own earlier
 # deadline and always writes whatever it has before exiting.
-PIPELINE_BUDGET_MINUTES = float(os.environ.get("SCAN_BUDGET_MINUTES", "100"))
+_PIPELINE_BUDGET_RAW = os.environ.get("SCAN_BUDGET_MINUTES", "100")
+try:
+    PIPELINE_BUDGET_MINUTES = float(_PIPELINE_BUDGET_RAW)
+except ValueError:
+    PIPELINE_BUDGET_MINUTES = 100.0
 
 # ── Strategy configuration ────────────────────────────────────────────────────
 # Objective: maximum profit with accepted risk, short-to-mid-term holds,
