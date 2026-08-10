@@ -27,7 +27,6 @@ import logging
 import math
 import warnings
 import traceback
-from massive import RESTClient
 from datetime import datetime, date, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Any
@@ -64,28 +63,34 @@ except ImportError:
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-client = RESTClient("hTRjnsG45cxV1K4GpLeGxpZp7rgPu6tU")
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENGINE IDENTITY -- surfaced in logs, JSON report and the Actions job summary so
+# a manual "Run workflow" from the Actions tab proves which engine executed.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ENGINE_NAME = "Claude Opus 5 Live Scanner Engine"
+ENGINE_VERSION = "5.0.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION -- API keys default from Nick's SKILL file; env vars override
+# CONFIGURATION -- API credentials come from the environment ONLY.
+# No key is ever embedded in source: in GitHub Actions these map to repository
+# secrets, locally they map to shell environment variables. A missing required
+# key fails the run loudly instead of silently degrading to partial data.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MASSIVE_API_KEY = os.environ.get(
-    "MASSIVE_API_KEY", "hTRjnsG45cxV1K4GpLeGxpZp7rgPu6tU"
-)
-ALPHAVANTAGE_API_KEY = os.environ.get(
-    "ALPHAVANTAGE_API_KEY", "Q7LVL2LCTKCF81ZA"
-)
-MBOUM_API_KEY = os.environ.get(
-    "MBOUM_API_KEY", "xfAMuSlx5yUmX4PKegfarmd7y8799RcxjxKiNAUh"
-)
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
+ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
+MBOUM_API_KEY = os.environ.get("MBOUM_API_KEY", "")
 # Options-tier MBOUM key (different plan that includes the /v1/markets/options
-# endpoint). Set via env var or falls back to the user's options-plan key.
-MBOUM_OPTIONS_KEY = os.environ.get(
-    "MBOUM_OPTIONS_KEY", "642|Splqvb0O7fzSSI0ptlYIs4qXt4N4UaqwJHToVQ1X"
-)
+# endpoint), kept separate from the standard MBOUM key.
+MBOUM_OPTIONS_KEY = os.environ.get("MBOUM_OPTIONS_KEY", "")
 MBOUM_BASE_URL = "https://api.mboum.com"
 MASSIVE_BASE_URL = "https://api.massive.com/v2"
+
+# Keys the pipeline cannot run without. MBOUM_OPTIONS_KEY is optional: without
+# it the scan still produces equity candidates, just no option contracts.
+REQUIRED_API_KEYS = ("MASSIVE_API_KEY", "MBOUM_API_KEY")
+OPTIONAL_API_KEYS = ("MBOUM_OPTIONS_KEY",)
 
 # Pipeline parameters
 LOOKBACK_DAYS = 380  # calendar days to request (~252 trading days)
@@ -98,6 +103,22 @@ TARGET_FINAL_CANDIDATES = 7
 MIN_NEAR_MISS_RULES = 8
 MAX_PANEL_CANDIDATES = 60
 MAX_OPTIONS_EVAL_CANDIDATES = 20
+
+# Wall-clock budget. GitHub Actions cancels the job at `timeout-minutes` and
+# discards nothing but the log, so the pipeline enforces its own earlier
+# deadline and always writes whatever it has before exiting.
+PIPELINE_BUDGET_MINUTES = float(os.environ.get("SCAN_BUDGET_MINUTES", "100"))
+
+# ── Strategy configuration ────────────────────────────────────────────────────
+# Objective: maximum profit with accepted risk, short-to-mid-term holds,
+# following insider buying and genuine hype/momentum, while refusing to chase
+# names that have already gone parabolic and are statistically due to unwind.
+HOLDING_HORIZON_DAYS = 20          # short-to-mid term; also the ML label horizon
+ML_TARGET_RETURN = 0.05            # a "win" is +5% over the holding horizon
+MAX_EXTENSION_ABOVE_SMA50 = 0.35   # >35% above the 50DMA = climax-extended
+MAX_EXHAUSTION_RSI = 82.0          # blow-off territory
+MAX_SPIKE_RETURN_5D = 0.40         # +40% in a week = vertical, do not chase
+MAX_SPIKE_RETURN_20D = 1.00        # doubled in a month = late to the party
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -335,6 +356,76 @@ def clamp(val, lo, hi):
 class PipelineError(Exception):
     """Fatal pipeline error -- stop immediately per SKILL policy."""
     pass
+
+
+class PipelineBudgetExceeded(PipelineError):
+    """Raised when the wall-clock budget is exhausted mid-pipeline."""
+    pass
+
+
+def verify_api_credentials() -> Dict[str, str]:
+    """
+    Confirm every required API credential is supplied by the environment.
+
+    Real capital is at stake, so an unset repository secret must abort the run
+    with an explicit message rather than let the scan proceed against a
+    partially-authenticated data set.
+    """
+    missing = [name for name in REQUIRED_API_KEYS if not os.environ.get(name, "").strip()]
+    if missing:
+        raise PipelineError(
+            "Missing required API credentials: "
+            f"{', '.join(missing)}. Set them as environment variables locally, "
+            "or as repository secrets for the GitHub Actions workflow. "
+            "No key is embedded in source and no fallback data is fabricated."
+        )
+
+    status = {name: "env" for name in REQUIRED_API_KEYS}
+    for name in OPTIONAL_API_KEYS:
+        supplied = bool(os.environ.get(name, "").strip())
+        status[name] = "env" if supplied else "absent"
+        if not supplied:
+            log.warning(
+                f"{name} is not set -- options evaluation will be skipped and "
+                "candidates will be reported equity-only."
+            )
+    return status
+
+
+class PipelineClock:
+    """
+    Wall-clock budget for the whole scan.
+
+    GitHub Actions kills the job at `timeout-minutes` with no result artifact.
+    The clock lets the pipeline notice it is running out of time at a stage
+    boundary and unwind cleanly so the log, near-miss report and any partial
+    results are still written and uploaded.
+    """
+
+    def __init__(self, budget_minutes: float = PIPELINE_BUDGET_MINUTES):
+        self.start = time.time()
+        self.budget_seconds = max(float(budget_minutes), 1.0) * 60.0
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.start
+
+    @property
+    def remaining(self) -> float:
+        return self.budget_seconds - self.elapsed
+
+    def check(self, stage: str) -> None:
+        """Abort the run if the budget is exhausted at a stage boundary."""
+        if self.remaining <= 0:
+            raise PipelineBudgetExceeded(
+                f"Wall-clock budget of {self.budget_seconds / 60:.0f} minutes "
+                f"exhausted before {stage}. Writing partial output instead of "
+                "letting the CI job be killed with no artifacts."
+            )
+        log.info(
+            f"  [clock] {self.elapsed / 60:.1f} min elapsed, "
+            f"{self.remaining / 60:.1f} min left -- entering {stage}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -633,7 +724,13 @@ class UniverseDiscovery:
     """Dynamically discovers the live U.S. equity universe from MASSIVE."""
 
     MASSIVE_BASE = "https://api.massive.com/v3"
-    MASSIVE_API_KEY = "hTRjnsG45cxV1K4GpLeGxpZp7rgPu6tU"
+
+    # Connect/read timeout for a single page. A 10-minute read timeout let a
+    # slow-drip endpoint stall each page and burn the whole CI budget before
+    # any equity work started.
+    REQUEST_TIMEOUT = (10, 30)
+    # Hard ceiling on pagination so a malformed `next_url` cannot loop forever.
+    MAX_PAGES = 100
 
     # Common stock types to include
     VALID_TYPES = {"Common Stock", "EQS", ""}
@@ -666,12 +763,27 @@ class UniverseDiscovery:
             "apiKey": self.api_key,
         }
 
+        pages = 0
+        seen_urls = set()
         while url:
+            pages += 1
+            if pages > self.MAX_PAGES:
+                log.warning(
+                    f"Universe discovery stopped at the {self.MAX_PAGES}-page ceiling."
+                )
+                break
+            if url in seen_urls:
+                log.warning("Universe discovery pagination looped -- stopping.")
+                break
+            seen_urls.add(url)
+
             retries = 0
             backoff = 1
             while retries < 3:
                 try:
-                    resp = self.session.get(url, params=params, timeout=600)
+                    resp = self.session.get(
+                        url, params=params, timeout=self.REQUEST_TIMEOUT
+                    )
                     resp.raise_for_status()
                     payload = resp.json()
                     break
@@ -1033,7 +1145,13 @@ class DataFetcher:
                         f"  Quick screen: {checked}/{len(tickers)} checked, "
                         f"{len(promising)} promising"
                     )
-                result = future.result()
+                # A single malformed payload must never abort the screen of a
+                # 10,000-name universe.
+                try:
+                    result = future.result()
+                except Exception as e:
+                    log.debug(f"  Quick screen failed for {futures[future]}: {e}")
+                    continue
                 if result:
                     promising.append(result)
 
@@ -1058,7 +1176,12 @@ class DataFetcher:
             completed = 0
             for future in as_completed(futures):
                 completed += 1
-                ticker, df = future.result()
+                try:
+                    ticker, df = future.result()
+                except Exception as e:
+                    log.debug(f"  MBOUM history failed for {futures[future]}: {e}")
+                    failed += 1
+                    continue
                 if df is not None:
                     all_data[ticker] = df
                 else:
@@ -1142,7 +1265,12 @@ class TechnicalEngine:
         avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
         rs = avg_gain / avg_loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + rs))
+        # Wilder's convention: with no average loss in the window RSI is 100,
+        # not undefined. Returning NaN here silently disqualified the strongest
+        # uninterrupted uptrends from every RSI-based rule and panel score.
+        no_loss = (avg_loss == 0) & avg_gain.notna()
+        return rsi.mask(no_loss, 100.0)
 
     @staticmethod
     def macd(series: pd.Series, fast=12, slow=26, signal=9):
@@ -1299,7 +1427,176 @@ class TechnicalEngine:
         df["Pct_From_52w_High"] = (c - roll_high_252) / roll_high_252.replace(0, np.nan)
         df["Pct_Above_52w_Low"] = (c - roll_low_252) / roll_low_252.replace(0, np.nan)
 
+        # ── Exhaustion / "already peaked" diagnostics ────────────────────────
+        # Objective is to ride short-to-mid-term momentum, not to buy the last
+        # tick of a vertical move. These columns quantify how stretched a name
+        # is versus its own trend so blow-off tops can be excluded downstream.
+        df["Ext_Above_SMA20"] = (c - df["SMA_20"]) / df["SMA_20"].replace(0, np.nan)
+        # Distance from the 20-day mean measured in ATRs: regime-independent
+        # and directly comparable across a $9 name and a $900 name.
+        df["Stretch_ATR"] = (c - df["SMA_20"]) / df["ATR_14"].replace(0, np.nan)
+        # Upper-Bollinger penetration: >1 means trading beyond the 2-sigma band.
+        bb_width = (df["BB_upper"] - df["BB_middle"]).replace(0, np.nan)
+        df["BB_Penetration"] = (c - df["BB_middle"]) / bb_width
+
+        # ── Hype / crowd-participation diagnostics ───────────────────────────
+        # Relative volume over a full week captures sustained crowding rather
+        # than a single headline print.
+        df["RVOL_5"] = (
+            v.rolling(window=5, min_periods=5).mean()
+            / df["Vol_SMA_20"].replace(0, np.nan)
+        )
+        # Rising OBV confirms the crowd is accumulating, not distributing.
+        obv_sma20 = df["OBV"].rolling(window=20, min_periods=20).mean()
+        df["OBV_Trend"] = df["OBV"] - obv_sma20
+
         return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MOMENTUM QUALITY -- hype, exhaustion and insider conviction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MomentumQuality:
+    """
+    Quantifies the three things that decide whether a strong chart is worth
+    real capital over a short-to-mid-term hold:
+
+      * hype_score       -- is the crowd actually participating (volume,
+                            relative strength, squeeze fuel)?
+      * exhaustion_score -- has the move already gone too far, too fast?
+      * insider_score    -- are the people who know the business buying it?
+
+    All three are 0-100 and computed strictly from live data. Missing inputs
+    return a neutral 50 rather than a flattering default, so an absent data
+    source can never manufacture conviction.
+    """
+
+    NEUTRAL = 50.0
+
+    @staticmethod
+    def hype_score(last: pd.Series) -> float:
+        """
+        0-100 measure of genuine crowd participation behind the move.
+
+        Blends sustained relative volume, single-day volume surge, 20-day
+        return and on-balance-volume accumulation. High values mean money is
+        actively rotating in -- the momentum/hype the strategy wants to ride.
+        """
+        components: List[float] = []
+
+        rvol5 = last.get("RVOL_5", np.nan)
+        if not pd.isna(rvol5):
+            # 1.0x = market-neutral participation, 2.5x = genuinely crowded.
+            components.append(100.0 * clamp((float(rvol5) - 0.8) / 1.7, 0.0, 1.0))
+
+        vol_ratio = last.get("Volume_Ratio", np.nan)
+        if not pd.isna(vol_ratio):
+            components.append(100.0 * clamp((float(vol_ratio) - 0.9) / 2.1, 0.0, 1.0))
+
+        ret_20d = last.get("Return_20d", np.nan)
+        if not pd.isna(ret_20d):
+            components.append(100.0 * clamp(float(ret_20d) / 0.20, 0.0, 1.0))
+
+        obv_trend = last.get("OBV_Trend", np.nan)
+        if not pd.isna(obv_trend):
+            # Direction matters more than magnitude; magnitude is unbounded.
+            components.append(70.0 if float(obv_trend) > 0 else 30.0)
+
+        if not components:
+            return MomentumQuality.NEUTRAL
+        return float(clamp(np.mean(components), 0.0, 100.0))
+
+    @staticmethod
+    def exhaustion_score(last: pd.Series) -> float:
+        """
+        0-100 measure of how stretched the move already is.
+
+        100 means "this has gone vertical and is statistically due to unwind";
+        0 means "the trend has room". Used to penalise, and at the extreme to
+        reject, names that are already peaking.
+        """
+        components: List[float] = []
+
+        ext_sma50 = last.get("Close_vs_SMA50", np.nan)
+        if not pd.isna(ext_sma50):
+            components.append(
+                100.0 * clamp(float(ext_sma50) / MAX_EXTENSION_ABOVE_SMA50, 0.0, 1.0)
+            )
+
+        stretch = last.get("Stretch_ATR", np.nan)
+        if not pd.isna(stretch):
+            # Beyond ~4 ATR above the 20-day mean is classic climax territory.
+            components.append(100.0 * clamp(float(stretch) / 4.0, 0.0, 1.0))
+
+        rsi = last.get("RSI_14", np.nan)
+        if not pd.isna(rsi):
+            # Below 65 is unremarkable; 65 -> MAX_EXHAUSTION_RSI ramps to 100.
+            span = max(MAX_EXHAUSTION_RSI - 65.0, 1.0)
+            components.append(100.0 * clamp((float(rsi) - 65.0) / span, 0.0, 1.0))
+
+        ret_5d = last.get("Return_5d", np.nan)
+        if not pd.isna(ret_5d):
+            components.append(
+                100.0 * clamp(float(ret_5d) / MAX_SPIKE_RETURN_5D, 0.0, 1.0)
+            )
+
+        bb_pen = last.get("BB_Penetration", np.nan)
+        if not pd.isna(bb_pen):
+            # >1 is outside the upper 2-sigma band; 2.0 is a true blow-off.
+            components.append(100.0 * clamp((float(bb_pen) - 0.5) / 1.5, 0.0, 1.0))
+
+        if not components:
+            return MomentumQuality.NEUTRAL
+        return float(clamp(np.mean(components), 0.0, 100.0))
+
+    @staticmethod
+    def insider_score(fund: Optional[Dict]) -> float:
+        """
+        0-100 conviction score from live insider transaction data.
+
+        Insider *buying* is the highest-signal fundamental input available on a
+        short horizon: officers and directors sell for many reasons but buy for
+        exactly one. Returns a neutral 50 when the provider has no insider
+        record so a data gap neither rewards nor punishes a name.
+        """
+        fund = fund or {}
+        net_pct = normalize_api_scalar(fund.get("insider_net_purchase_pct"))
+        buys = normalize_api_scalar(fund.get("insider_buy_transactions"))
+        sells = normalize_api_scalar(fund.get("insider_sell_transactions"))
+
+        components: List[float] = []
+
+        if not is_missing_value(net_pct):
+            # Net shares purchased as a fraction of insider holdings. +2% is a
+            # strong accumulation signal, -2% is meaningful distribution.
+            components.append(50.0 + 50.0 * clamp(float(net_pct) / 0.02, -1.0, 1.0))
+
+        if not is_missing_value(buys) and not is_missing_value(sells):
+            total = float(buys) + float(sells)
+            if total > 0:
+                buy_ratio = float(buys) / total
+                components.append(100.0 * clamp(buy_ratio, 0.0, 1.0))
+
+        if not components:
+            return MomentumQuality.NEUTRAL
+        return float(clamp(np.mean(components), 0.0, 100.0))
+
+    @staticmethod
+    def squeeze_score(fund: Optional[Dict]) -> float:
+        """
+        0-100 short-squeeze fuel from live short interest.
+
+        Elevated short interest on a name that is already trending is the
+        classic accelerant behind the sharp short-to-mid-term moves this
+        strategy targets.
+        """
+        fund = fund or {}
+        short_pct = normalize_api_scalar(fund.get("short_pct_float"))
+        if is_missing_value(short_pct):
+            return MomentumQuality.NEUTRAL
+        # 0% float short -> 0, 20%+ short -> 100.
+        return float(100.0 * clamp(float(short_pct) / 0.20, 0.0, 1.0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1350,12 +1647,22 @@ class ExecutionGuards:
 
         last = df.iloc[-1]
 
-        # GUARD_A: Data Integrity -- check for missing bars
-        total_expected = MIN_TRADING_DAYS
-        actual_bars = df["Close"].dropna().shape[0]
-        missing_pct = 1 - (actual_bars / total_expected)
-        if missing_pct > 0.05:
-            return f"GUARD_A: {missing_pct:.1%} bars missing (> 5%)"
+        # GUARD_A: Data Integrity -- check for holes in the recent history.
+        # The window must be measured against the ticker's OWN span: comparing
+        # a full multi-year MBOUM history against a fixed 252 made this ratio
+        # permanently negative, so the check never fired.
+        recent = df.tail(MIN_TRADING_DAYS)
+        actual_bars = recent["Close"].dropna().shape[0]
+        try:
+            span_start = pd.Timestamp(recent.index[0]).date()
+            span_end = pd.Timestamp(recent.index[-1]).date()
+            expected_bars = trading_sessions_between(span_start, span_end) + 1
+        except Exception:
+            expected_bars = 0
+        if expected_bars > 0:
+            missing_pct = 1 - (actual_bars / expected_bars)
+            if missing_pct > 0.05:
+                return f"GUARD_A: {missing_pct:.1%} bars missing (> 5%)"
 
         # GUARD_A: Check for stale data (last bar should be recent in ET).
         # Uses ET timezone -- prevents false stale flags when run on a UTC
@@ -1402,7 +1709,55 @@ class ExecutionGuards:
         if pd.isna(close) or close < 5.0:
             return f"GUARD_C: Penny stock (${close:.2f} < $5)"
 
+        # GUARD_D: Exhaustion / "already peaked" filter.
+        # The strategy rides short-to-mid-term momentum but explicitly refuses
+        # to chase a move that has already gone vertical. A name trading far
+        # above its own 50DMA, printing blow-off RSI, or that has spiked
+        # violently in the last week/month has, statistically, spent most of
+        # its upside and carries mean-reversion risk that a 20-day hold cannot
+        # absorb. Rejecting these is what keeps the top-7 out of the names that
+        # tank the day after they are discovered.
+        exhaustion = ExecutionGuards._exhaustion_reason(last)
+        if exhaustion:
+            return f"GUARD_D: {exhaustion}"
+
         return None  # All guards passed
+
+    @staticmethod
+    def _exhaustion_reason(last: pd.Series) -> Optional[str]:
+        """
+        Return a human-readable reason when the latest bar shows a parabolic,
+        already-peaking move, otherwise None.
+
+        Kept as a separate helper so the same definition drives the guard, the
+        candidate flags and the final confidence penalty -- one rule, one place.
+        """
+        ext_sma50 = last.get("Close_vs_SMA50", np.nan)
+        if not pd.isna(ext_sma50) and ext_sma50 > MAX_EXTENSION_ABOVE_SMA50:
+            return (
+                f"Over-extended ({ext_sma50:.0%} above 50DMA "
+                f"> {MAX_EXTENSION_ABOVE_SMA50:.0%})"
+            )
+
+        rsi = last.get("RSI_14", np.nan)
+        if not pd.isna(rsi) and rsi >= MAX_EXHAUSTION_RSI:
+            return f"Blow-off RSI ({rsi:.0f} >= {MAX_EXHAUSTION_RSI:.0f})"
+
+        ret_5d = last.get("Return_5d", np.nan)
+        if not pd.isna(ret_5d) and ret_5d > MAX_SPIKE_RETURN_5D:
+            return (
+                f"Vertical 5-day spike ({ret_5d:.0%} > "
+                f"{MAX_SPIKE_RETURN_5D:.0%})"
+            )
+
+        ret_20d = last.get("Return_20d", np.nan)
+        if not pd.isna(ret_20d) and ret_20d > MAX_SPIKE_RETURN_20D:
+            return (
+                f"Parabolic 20-day run ({ret_20d:.0%} > "
+                f"{MAX_SPIKE_RETURN_20D:.0%})"
+            )
+
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1470,6 +1825,16 @@ class HardBuyRules:
         if not hard_buy_pass:
             flags.append(f"NEAR_MISS_{rules_passed}_OF_10")
 
+        # Momentum-quality overlays: how crowded the move is (hype) and how
+        # stretched it already is (exhaustion). Both are needed to buy strength
+        # without buying the top.
+        hype = MomentumQuality.hype_score(last)
+        exhaustion = MomentumQuality.exhaustion_score(last)
+        if exhaustion >= 70:
+            flags.append("EXTENDED_MOVE")
+        if hype >= 70:
+            flags.append("HIGH_CROWD_INTEREST")
+
         return {
             "ticker": ticker,
             "price": last["Close"],
@@ -1484,6 +1849,11 @@ class HardBuyRules:
             "close_vs_sma200": last.get("Close_vs_SMA200", np.nan),
             "ema20_vs_ema50": last.get("EMA20_vs_EMA50", np.nan),
             "avg_dollar_volume": last.get("Avg_Dollar_Vol_20", np.nan),
+            "rvol_5": last.get("RVOL_5", np.nan),
+            "stretch_atr": last.get("Stretch_ATR", np.nan),
+            "pct_from_52w_high": last.get("Pct_From_52w_High", np.nan),
+            "hype_score": round(hype, 1),
+            "exhaustion_score": round(exhaustion, 1),
             "rules_passed": rules_passed,
             "rules_failed": rules_failed,
             "passed_rules": list(rule_result.get("passed_rules", [])),
@@ -1857,6 +2227,25 @@ class MLRanker:
         self.rf_model = None
         self.lstm_model = None
         self.feature_importances = {}
+        # Per-model importances, averaged once at the end. Folding them in
+        # pairwise as they arrived made the blend depend on training order and
+        # silently halved the first model's contribution.
+        self._importances_by_model: Dict[str, Dict[str, float]] = {}
+
+    def _finalize_feature_importances(self) -> None:
+        """Average the per-model importances into the reported blend."""
+        if not self._importances_by_model:
+            return
+        blended: Dict[str, float] = {}
+        for name in self.FEATURE_COLS:
+            values = [
+                model_imp[name]
+                for model_imp in self._importances_by_model.values()
+                if name in model_imp
+            ]
+            if values:
+                blended[name] = float(np.mean(values))
+        self.feature_importances = blended
 
     def rank(
         self,
@@ -1915,7 +2304,7 @@ class MLRanker:
                 f"model may lack discriminative power"
             )
 
-        # Optional LSTM
+        # Optional LSTM -- keyed by ticker, not by the XGB/RF row index.
         lstm_scores = self._train_lstm(survivors, all_data)
 
         # Assign scores back to survivors
@@ -1926,17 +2315,16 @@ class MLRanker:
                 s["ml_score_xgb"] = float(xgb_scores[idx])
                 s["ml_score_rf"] = float(rf_scores[idx])
                 s["ml_ensemble_score"] = float(ensemble_scores[idx])
-                s["lstm_score"] = (
-                    float(lstm_scores[idx]) if lstm_scores is not None and idx < len(lstm_scores)
-                    else None
-                )
             else:
                 s["ml_score_xgb"] = 0.5
                 s["ml_score_rf"] = 0.5
                 s["ml_ensemble_score"] = 0.5
-                s["lstm_score"] = None
+            s["lstm_score"] = (
+                lstm_scores.get(s["ticker"]) if lstm_scores else None
+            )
 
         # Log feature importances
+        self._finalize_feature_importances()
         log.info("  ML Feature Importances (top 5):")
         for name, imp in sorted(
             self.feature_importances.items(), key=lambda x: -x[1]
@@ -1992,14 +2380,14 @@ class MLRanker:
         survivors: List[Dict],
         all_data: Dict[str, pd.DataFrame],
         training_pool: Dict[str, pd.DataFrame],
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, List[str], Optional[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray, List[str]]:
         """
         Build training and current-day feature matrices.
 
         training_pool: broader universe used to fit the model. The forward
-        20-day return label is generated identically across the pool. This
-        prevents survivor-only training (heavy positive class bias) that
-        previously made the classifier near-uniform.
+        HOLDING_HORIZON_DAYS return label is generated identically across the
+        pool. This prevents survivor-only training (heavy positive class bias)
+        that previously made the classifier near-uniform.
 
         Current: most recent day's features for scoring (survivors only).
         """
@@ -2022,12 +2410,17 @@ class MLRanker:
                 continue
             close = df["Close"]
 
-            # Forward 20-day return label
-            fwd_ret = close.shift(-20) / close - 1
-            label = (fwd_ret > 0).astype(int)
+            # Forward-return label over the strategy's actual holding horizon.
+            # The target is a *meaningful* move, not merely "up": training on
+            # `fwd_ret > 0` rewards drifters, which is the opposite of a
+            # max-profit objective. Requiring ML_TARGET_RETURN teaches the
+            # model to separate real movers from noise.
+            horizon = HOLDING_HORIZON_DAYS
+            fwd_ret = close.shift(-horizon) / close - 1
+            label = (fwd_ret > ML_TARGET_RETURN).astype(int)
 
-            train_section = feat_df.iloc[:-20]
-            label_section = label.iloc[:-20]
+            train_section = feat_df.iloc[:-horizon]
+            label_section = label.iloc[:-horizon]
 
             valid = train_section.dropna()
             valid_labels = label_section.loc[valid.index].dropna()
@@ -2058,7 +2451,7 @@ class MLRanker:
                 current_tickers.append(ticker)
 
         if not train_rows or not current_rows:
-            return None, None, np.array([]), [], None
+            return None, None, np.array([]), []
 
         X_train = np.vstack(train_rows)
         y_train = np.concatenate(train_labels)
@@ -2080,6 +2473,12 @@ class MLRanker:
             f"{X_train.shape[1]} features. "
             f"Current set: {X_current.shape[0]} tickers."
         )
+        if y_train.size:
+            log.info(
+                f"  Label: forward {HOLDING_HORIZON_DAYS}-session return > "
+                f"{ML_TARGET_RETURN:.0%} -- positive class "
+                f"{float(y_train.mean()):.1%} of samples."
+            )
 
         return X_train, y_train, X_current, current_tickers
 
@@ -2098,7 +2497,6 @@ class MLRanker:
             subsample=0.8,
             colsample_bytree=0.8,
             eval_metric="logloss",
-            use_label_encoder=False,
             random_state=42,
             verbosity=0,
         )
@@ -2138,7 +2536,6 @@ class MLRanker:
                 reg_alpha=1.0,
                 reg_lambda=2.0,
                 eval_metric="logloss",
-                use_label_encoder=False,
                 random_state=42,
                 verbosity=0,
             )
@@ -2148,10 +2545,10 @@ class MLRanker:
         self.xgb_model = model
 
         # Feature importances
-        for name, imp in zip(self.FEATURE_COLS, model.feature_importances_):
-            self.feature_importances[name] = (
-                self.feature_importances.get(name, 0) + imp
-            ) / 2
+        self._importances_by_model["xgboost"] = {
+            name: float(imp)
+            for name, imp in zip(self.FEATURE_COLS, model.feature_importances_)
+        }
 
         probs = model.predict_proba(X_current)[:, 1]
         return np.clip(probs, 0.0, 1.0)
@@ -2195,10 +2592,10 @@ class MLRanker:
         self.rf_model = model
 
         # Merge feature importances
-        for name, imp in zip(self.FEATURE_COLS, model.feature_importances_):
-            self.feature_importances[name] = (
-                self.feature_importances.get(name, 0) + imp
-            ) / 2
+        self._importances_by_model["random_forest"] = {
+            name: float(imp)
+            for name, imp in zip(self.FEATURE_COLS, model.feature_importances_)
+        }
 
         probs = model.predict_proba(X_current)[:, 1]
         return np.clip(probs, 0.0, 1.0)
@@ -2207,11 +2604,16 @@ class MLRanker:
         self,
         survivors: List[Dict],
         all_data: Dict[str, pd.DataFrame],
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[Dict[str, float]]:
         """
         Optional LSTM sequence scoring layer (PyTorch implementation).
         Architecture: LSTM(64) -> Dropout(0.3) -> Dense(32,ReLU) -> Dropout(0.2) -> Dense(1,Sigmoid)
-        Returns array of scores or None if unavailable.
+        Returns a {ticker: score} mapping or None if unavailable.
+
+        The mapping is keyed by ticker rather than positional index: the LSTM
+        admits a different subset of tickers than the XGB/RF matrix (it needs a
+        full clean 20-day sequence), so indexing LSTM output by the XGB index
+        attributed one ticker's sequence score to a different ticker.
         """
         if not LSTM_AVAILABLE:
             log.info("  LSTM dependencies unavailable -- continuing with XGBoost + RF only.")
@@ -2244,12 +2646,13 @@ class MLRanker:
             feat_norm = feat_norm.fillna(0)
             values = feat_norm.values
 
-            # Forward return labels
-            fwd_ret = close.shift(-20) / close - 1
-            labels = (fwd_ret > 0).astype(int)
+            # Forward return labels on the same horizon/threshold as the
+            # tree ensemble so all three models optimise the same objective.
+            fwd_ret = close.shift(-HOLDING_HORIZON_DAYS) / close - 1
+            labels = (fwd_ret > ML_TARGET_RETURN).astype(int)
 
             # Build sequences for training
-            for i in range(SEQ_LEN, len(values) - 20):
+            for i in range(SEQ_LEN, len(values) - HOLDING_HORIZON_DAYS):
                 seq = values[i - SEQ_LEN : i]
                 if not np.any(np.isnan(seq)) and not pd.isna(labels.iloc[i]):
                     train_X.append(seq)
@@ -2352,7 +2755,8 @@ class MLRanker:
 
             log.info(f"  LSTM scores computed for {len(scores)} tickers (PyTorch, loss={best_loss:.4f})")
             self.lstm_model = model
-            return np.clip(scores, 0.0, 1.0)
+            scores = np.clip(scores, 0.0, 1.0)
+            return {t: float(v) for t, v in zip(current_tickers, scores)}
 
         except Exception as e:
             log.warning(f"  LSTM training failed: {e}")
@@ -2366,17 +2770,31 @@ class MLRanker:
 class FundamentalsFetcher:
     """
     Fetch fundamental data via MBOUM Pro modules.
-    Uses: financial-data, default-key-statistics, asset-profile, calendar-events.
+    Uses: financial-data, default-key-statistics, asset-profile,
+    calendar-events, net-share-purchase-activity, insider-transactions.
     """
 
+    # Modules whose absence degrades a score but must not fail the run.
+    CORE_MODULES = (
+        "financial-data",
+        "default-key-statistics",
+        "asset-profile",
+        "calendar-events",
+    )
+    # Insider conviction modules -- "follow the insiders" needs live filings.
+    INSIDER_MODULES = (
+        "net-share-purchase-activity",
+        "insider-transactions",
+    )
+
     def __init__(self, massive_key: str):
-        self.massive_key = MASSIVE_API_KEY
+        self.massive_key = massive_key or MASSIVE_API_KEY
         self.mboum = MboumAPI()
         self.massive_session = requests.Session()
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
         self.massive_session.mount("https://", adapter)
         self.massive_session.mount("http://", adapter)
-        self.massive_session.headers.update({"X-massive-Token": MASSIVE_API_KEY})
+        self.massive_session.headers.update({"X-massive-Token": self.massive_key})
 
     def fetch_batch(self, tickers: List[str]) -> Dict[str, Dict]:
         """Fetch fundamentals for a list of tickers. Returns dict of info dicts."""
@@ -2388,8 +2806,7 @@ class FundamentalsFetcher:
             try:
                 modules = self.mboum.get_modules(
                     ticker,
-                    ["financial-data", "default-key-statistics",
-                     "asset-profile", "calendar-events"],
+                    list(self.CORE_MODULES) + list(self.INSIDER_MODULES),
                 )
 
                 fin = modules.get("financial-data", {})
@@ -2397,12 +2814,7 @@ class FundamentalsFetcher:
                 profile = modules.get("asset-profile", {})
                 cal = modules.get("calendar-events", {})
                 missing_modules = [
-                    m for m in (
-                        "financial-data",
-                        "default-key-statistics",
-                        "asset-profile",
-                        "calendar-events",
-                    )
+                    m for m in self.CORE_MODULES
                     if not isinstance(modules.get(m), dict) or not modules.get(m)
                 ]
 
@@ -2415,7 +2827,9 @@ class FundamentalsFetcher:
                     "debt_to_equity", "free_cash_flow", "return_on_equity",
                     "52w_high", "52w_low", "avg_volume", "shares_float",
                     "shares_outstanding", "inst_ownership_pct", "analyst_count",
-                    "target_price",
+                    "target_price", "short_pct_float", "short_ratio",
+                    "insider_net_purchase_pct", "insider_buy_transactions",
+                    "insider_sell_transactions", "insider_net_shares",
                 )
 
                 info = {
@@ -2444,10 +2858,21 @@ class FundamentalsFetcher:
                     "inst_ownership_pct": _raw(stats, "heldPercentInstitutions"),
                     "analyst_count": _raw(fin, "numberOfAnalystOpinions"),
                     "target_price": _raw(fin, "targetMeanPrice"),
+                    # Squeeze fuel -- elevated short interest accelerates the
+                    # short-to-mid-term moves this strategy targets.
+                    "short_pct_float": _raw(stats, "shortPercentOfFloat"),
+                    "short_ratio": _raw(stats, "shortRatio"),
                     "earnings_date": None,
                     "fundamentals_quality": "complete" if not missing_modules else "partial",
                     "missing_fundamental_modules": missing_modules,
                 }
+
+                # Live insider activity. Officers and directors sell for many
+                # reasons but buy for exactly one, so net insider purchasing is
+                # the highest-signal fundamental input on a short horizon.
+                info.update(
+                    FundamentalsFetcher._extract_insider_activity(modules)
+                )
 
                 # Extract earnings date from calendar
                 earnings = cal.get("earnings", {})
@@ -2522,11 +2947,83 @@ class FundamentalsFetcher:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(_fetch_one, t): t for t in tickers}
             for future in as_completed(futures):
-                ticker, info = future.result()
+                ticker = futures[future]
+                try:
+                    ticker, info = future.result()
+                except Exception as e:
+                    log.debug(f"  Fundamentals failed for {ticker}: {e}")
+                    info = {
+                        "name": ticker,
+                        "sector": "Unknown",
+                        "fundamentals_quality": "failed",
+                        "error": str(e),
+                    }
                 results[ticker] = info
 
         log.info(f"Fundamentals fetched for {len(results)} tickers")
+        with_insider = sum(
+            1 for info in results.values()
+            if not is_missing_value(info.get("insider_net_purchase_pct"))
+            or not is_missing_value(info.get("insider_buy_transactions"))
+        )
+        log.info(f"  Live insider activity available for {with_insider} tickers")
         return results
+
+    @staticmethod
+    def _extract_insider_activity(modules: Dict) -> Dict:
+        """
+        Normalise MBOUM insider modules into flat, comparable fields.
+
+        `net-share-purchase-activity` gives an aggregated six-month view;
+        `insider-transactions` gives the individual filings. Both are optional:
+        when neither is present every field stays missing so downstream
+        scoring falls back to neutral instead of inventing conviction.
+        """
+        out: Dict[str, Any] = {
+            "insider_net_purchase_pct": np.nan,
+            "insider_net_shares": np.nan,
+            "insider_buy_transactions": np.nan,
+            "insider_sell_transactions": np.nan,
+            "insider_period": None,
+        }
+
+        net = modules.get("net-share-purchase-activity")
+        if isinstance(net, dict) and net:
+            out["insider_net_purchase_pct"] = normalize_api_scalar(
+                net.get("netPercentInsiderShares")
+            )
+            out["insider_net_shares"] = normalize_api_scalar(
+                net.get("netInfoShares")
+            )
+            buy_count = normalize_api_scalar(net.get("buyInfoCount"))
+            sell_count = normalize_api_scalar(net.get("sellInfoCount"))
+            if not is_missing_value(buy_count):
+                out["insider_buy_transactions"] = buy_count
+            if not is_missing_value(sell_count):
+                out["insider_sell_transactions"] = sell_count
+            period = net.get("period")
+            if isinstance(period, str) and period:
+                out["insider_period"] = period
+
+        # Fall back to counting the raw filings when the aggregate is absent.
+        if is_missing_value(out["insider_buy_transactions"]):
+            txns = modules.get("insider-transactions")
+            rows = txns.get("transactions") if isinstance(txns, dict) else None
+            if isinstance(rows, list) and rows:
+                buys = sells = 0
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    text = str(row.get("transactionText", "")).lower()
+                    if "purchase" in text or "buy" in text:
+                        buys += 1
+                    elif "sale" in text or "sold" in text or "sell" in text:
+                        sells += 1
+                if buys or sells:
+                    out["insider_buy_transactions"] = float(buys)
+                    out["insider_sell_transactions"] = float(sells)
+
+        return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
