@@ -124,8 +124,12 @@ MAX_SPIKE_RETURN_20D = 1.00        # doubled in a month = late to the party
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    LOG_LEVEL = "INFO"
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL),
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
@@ -148,6 +152,15 @@ def now_et() -> str:
 def now_et_dt() -> datetime:
     """Current timezone-aware ET datetime."""
     return datetime.now(ET_TZ)
+
+
+def today_et() -> date:
+    """Current ET calendar date -- the reference for every DTE calculation.
+
+    The runner's clock is UTC, so a naive local date rolls over to
+    tomorrow at 20:00 ET and silently shifts every days-to-expiry by one.
+    """
+    return now_et_dt().date()
 
 
 def is_market_open_now() -> bool:
@@ -3126,6 +3139,25 @@ class InvestorPanel:
             s["panel_composite_score"] = round(composite, 1)
             s["panel_consensus"] = consensus_count
 
+            # Live conviction overlays -- who is buying, and is there fuel.
+            insider = MomentumQuality.insider_score(fund)
+            squeeze = MomentumQuality.squeeze_score(fund)
+            s["insider_score"] = round(insider, 1)
+            s["squeeze_score"] = round(squeeze, 1)
+            s["insider_net_purchase_pct"] = fund.get("insider_net_purchase_pct", np.nan)
+            s["insider_buy_transactions"] = fund.get("insider_buy_transactions", np.nan)
+            s["insider_sell_transactions"] = fund.get("insider_sell_transactions", np.nan)
+            s["short_pct_float"] = fund.get("short_pct_float", np.nan)
+
+            flags = s.get("flags")
+            if isinstance(flags, list):
+                if insider >= 70:
+                    flags.append("INSIDER_BUYING")
+                elif insider <= 30:
+                    flags.append("INSIDER_SELLING")
+                if squeeze >= 70:
+                    flags.append("HIGH_SHORT_INTEREST")
+
             # Merge fundamentals into record
             s["name"] = fund.get("name", ticker)
             s["sector"] = fund.get("sector", "Unknown")
@@ -3720,8 +3752,10 @@ class OptionsEvaluator:
     Prioritizes better call-trade structure, not just closest-to-ATM heuristics.
     """
 
+    #: Short-to-mid-term horizon: contracts must outlive the ~20-session
+    #: equity thesis with buffer, without paying for LEAP-style time value.
     MIN_DTE = 21
-    MAX_DTE = 75
+    MAX_DTE = 60
     MIN_DELTA = 0.40
     MAX_DELTA = 0.70
     MAX_SPREAD_PCT = 12.0
@@ -3803,7 +3837,7 @@ class OptionsEvaluator:
                 return result
 
             profile = OptionsEvaluator._target_profile(candidate)
-            today = datetime.now().date()
+            today = today_et()
             best_contract = None
             best_score = -1.0
 
@@ -4048,7 +4082,7 @@ class OptionsEvaluator:
         """Fetch options chain from Massive."""
         try:
             url = f"https://api.massive.com/v3/snapshot/options/{ticker}"
-            today = datetime.now().date()
+            today = today_et()
             params = {
                 "contract_type": "call",
                 "expiration_date.gte": (
@@ -4147,7 +4181,7 @@ class OptionsEvaluator:
                     exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
                 except ValueError:
                     continue
-                dte = (exp_date - datetime.now().date()).days
+                dte = (exp_date - today_et()).days
                 if dte < OptionsEvaluator.MIN_DTE or dte > OptionsEvaluator.MAX_DTE:
                     continue
 
@@ -4246,7 +4280,7 @@ class OptionsEvaluator:
             }
         return {
             "target_delta": 0.60,
-            "target_dte": 56,
+            "target_dte": 52,
             "target_moneyness": -0.05,
             "target_premium_pct": 0.12,
             "max_break_even_pct": 0.15,
@@ -4330,9 +4364,23 @@ class OptionsEvaluator:
         )
         return 100.0 * clamp(raw_score, 0.0, 1.0)
 
+    #: Flags that describe opportunity rather than risk -- they must not be
+    #: subtracted from the confidence score.
+    INFORMATIONAL_FLAGS = frozenset({
+        "HIGH_CROWD_INTEREST",
+        "INSIDER_BUYING",
+        "HIGH_SHORT_INTEREST",
+    })
+
     @staticmethod
     def _trade_setup_score(candidate: Dict) -> float:
-        """Blend stock, macro-panel, ML, hard-rule breadth, and option quality."""
+        """
+        Blend stock, macro-panel, ML, hard-rule breadth, and option quality.
+
+        Strategy bias: reward live insider buying and genuine crowd/momentum
+        interest, but penalise names that have already gone vertical so the
+        book is not built on runners that are peaking.
+        """
         ml = normalize_api_scalar(candidate.get("ml_ensemble_score"))
         panel = normalize_api_scalar(candidate.get("panel_composite_score"))
         option_score = normalize_api_scalar(candidate.get("option_score"))
@@ -4341,6 +4389,10 @@ class OptionsEvaluator:
         close_vs_sma50 = normalize_api_scalar(candidate.get("close_vs_sma50"))
         ema20_vs_ema50 = normalize_api_scalar(candidate.get("ema20_vs_ema50"))
         avg_dollar_volume = normalize_api_scalar(candidate.get("avg_dollar_volume"))
+        hype = normalize_api_scalar(candidate.get("hype_score"))
+        insider = normalize_api_scalar(candidate.get("insider_score"))
+        squeeze = normalize_api_scalar(candidate.get("squeeze_score"))
+        exhaustion = normalize_api_scalar(candidate.get("exhaustion_score"))
 
         ml = ml if not is_missing_value(ml) else 0.5
         panel = (panel / 100.0) if not is_missing_value(panel) else 0.60
@@ -4363,24 +4415,57 @@ class OptionsEvaluator:
             else 0.0
         )
 
+        hype_component = (
+            clamp(hype / 100.0, 0.0, 1.0)
+            if not is_missing_value(hype) else MomentumQuality.NEUTRAL / 100.0
+        )
+        squeeze_component = (
+            clamp(squeeze / 100.0, 0.0, 1.0)
+            if not is_missing_value(squeeze) else MomentumQuality.NEUTRAL / 100.0
+        )
+        # Insider conviction dominates, with short-interest fuel as a kicker.
+        insider_component = (
+            clamp(insider / 100.0, 0.0, 1.0)
+            if not is_missing_value(insider) else MomentumQuality.NEUTRAL / 100.0
+        )
+        conviction_component = 0.75 * insider_component + 0.25 * squeeze_component
+
+        # Anti-chase: nothing is subtracted at or below the neutral reading,
+        # then the penalty ramps up to 18 points for fully parabolic names.
+        exhaustion_penalty = 0.0
+        if not is_missing_value(exhaustion):
+            exhaustion_penalty = 0.18 * clamp(
+                (exhaustion - MomentumQuality.NEUTRAL) / (100.0 - MomentumQuality.NEUTRAL),
+                0.0,
+                1.0,
+            )
+
         flags = candidate.get("flags", [])
         if isinstance(flags, str):
             flags = [f for f in flags.split(", ") if f]
-        flag_penalty = 0.015 * len(flags)
+        risk_flags = [
+            f for f in flags
+            if f not in OptionsEvaluator.INFORMATIONAL_FLAGS
+        ]
+        flag_penalty = 0.015 * len(risk_flags)
 
         score = clamp(
-            0.32 * panel +
-            0.28 * ml +
-            0.20 * rule_component +
-            0.10 * momentum_component +
-            0.05 * liquidity_component +
-            0.05 * option_component -
+            0.24 * panel +
+            0.24 * ml +
+            0.14 * rule_component +
+            0.08 * momentum_component +
+            0.10 * hype_component +
+            0.10 * conviction_component +
+            0.04 * liquidity_component +
+            0.06 * option_component -
+            exhaustion_penalty -
             flag_penalty,
             0.0,
             1.0,
         )
         confidence = 100.0 * score
         candidate["overall_confidence_score"] = round(confidence, 1)
+        candidate["holding_horizon_days"] = HOLDING_HORIZON_DAYS
         return confidence
 
 
@@ -4521,6 +4606,11 @@ class OutputFormatter:
             "hard_buy_pass", "failed_rules",
             "panel_livermore", "panel_druckenmiller", "panel_lynch",
             "panel_minervini", "panel_oneil",
+            "hype_score", "exhaustion_score", "insider_score", "squeeze_score",
+            "insider_net_purchase_pct", "insider_buy_transactions",
+            "insider_sell_transactions", "short_pct_float",
+            "rvol_5", "stretch_atr", "pct_from_52w_high",
+            "holding_horizon_days",
             "recommended_action",
             "option_candidate", "option_strike", "option_expiry",
             "option_delta", "option_dte", "option_bid_ask_spread",
@@ -4552,6 +4642,7 @@ class OutputFormatter:
             s["flags"] = ", ".join(s.get("flags", []))
             if isinstance(s.get("failed_rules"), list):
                 s["failed_rules"] = ", ".join(s.get("failed_rules", []))
+            s.setdefault("holding_horizon_days", HOLDING_HORIZON_DAYS)
 
             row = {col: s.get(col) for col in columns}
             rows.append(row)
@@ -4586,7 +4677,22 @@ class OutputFormatter:
 
         # Save JSON report
         report = {
+            "engine": ENGINE_NAME,
+            "engine_version": ENGINE_VERSION,
             "scan_timestamp": now_et(),
+            "strategy": {
+                "objective": "maximum risk-adjusted profit over a short-to-mid-term hold",
+                "holding_horizon_days": HOLDING_HORIZON_DAYS,
+                "ml_target_return": ML_TARGET_RETURN,
+                "option_dte_window": [OptionsEvaluator.MIN_DTE, OptionsEvaluator.MAX_DTE],
+                "follows": ["insider buying", "short interest fuel", "crowd/volume momentum"],
+                "avoids": [
+                    f"extension > {MAX_EXTENSION_ABOVE_SMA50:.0%} above the 50DMA",
+                    f"blow-off RSI > {MAX_EXHAUSTION_RSI:.0f}",
+                    f"5-day vertical spikes > {MAX_SPIKE_RETURN_5D:.0%}",
+                    f"20-day parabolic runs > {MAX_SPIKE_RETURN_20D:.0%}",
+                ],
+            },
             "attestation": (
                 "This scan used live data only: Massive (universe discovery + "
                 "options chains + live snapshot), MBOUM Pro (5yr OHLCV + "
@@ -4612,6 +4718,11 @@ class OutputFormatter:
                     "panel_composite": round(s.get("panel_composite_score", 0), 1),
                     "trade_setup_score": round(s.get("trade_setup_score", 0), 1),
                     "overall_confidence": round(s.get("overall_confidence_score", 0), 1),
+                    "hype_score": s.get("hype_score"),
+                    "exhaustion_score": s.get("exhaustion_score"),
+                    "insider_score": s.get("insider_score"),
+                    "squeeze_score": s.get("squeeze_score"),
+                    "holding_horizon_days": s.get("holding_horizon_days", HOLDING_HORIZON_DAYS),
                     "rules_passed": s.get("rules_passed"),
                     "hard_buy_pass": s.get("hard_buy_pass"),
                     "option_score": round(s.get("option_score", 0), 1),
@@ -4635,6 +4746,7 @@ class OutputFormatter:
         """Pretty-print results to console."""
         print("\n" + "=" * 100)
         print(f"  STOCK UNIVERSE SCAN -- FINAL RESULTS")
+        print(f"  Engine: {report.get('engine', ENGINE_NAME)} v{report.get('engine_version', ENGINE_VERSION)}")
         print(f"  Scan Time: {report['scan_timestamp']}")
         print("=" * 100)
 
@@ -4657,13 +4769,14 @@ class OutputFormatter:
 
         # Top 25 ranked table
         print(f"\n  TOP {min(25, len(df))} CANDIDATES:")
-        print("  " + "-" * 96)
+        print("  " + "-" * 110)
         header = (
-            f"  {'#':>3} {'Ticker':<7} {'Name':<25} {'Price':>8} "
-            f"{'Conf':>6} {'Rules':>5} {'ML':>6} {'Panel':>6} {'Action':<12} {'Opt':>3}"
+            f"  {'#':>3} {'Ticker':<7} {'Name':<22} {'Price':>8} "
+            f"{'Conf':>6} {'Rules':>5} {'ML':>6} {'Panel':>6} "
+            f"{'Hype':>5} {'Exh':>5} {'Insdr':>6} {'Action':<12} {'Opt':>3}"
         )
         print(header)
-        print("  " + "-" * 96)
+        print("  " + "-" * 110)
 
         for _, row in df.head(25).iterrows():
             mc = row.get("market_cap")
@@ -4676,7 +4789,7 @@ class OutputFormatter:
                 elif mc >= 1e6:
                     mc_str = f"${mc/1e6:.0f}M"
 
-            name = str(row.get("name", ""))[:24]
+            name = str(row.get("name", ""))[:21]
             trade = row.get("trade_setup_score", 0)
             conf = row.get("overall_confidence_score", trade)
             rules = row.get("rules_passed", 0)
@@ -4684,12 +4797,19 @@ class OutputFormatter:
             panel = row.get("panel_composite_score", 0)
             action = row.get("recommended_action", "")
             opt = row.get("option_candidate", "N")
+            hype = row.get("hype_score")
+            exh = row.get("exhaustion_score")
+            insdr = row.get("insider_score")
+
+            def _sig(value) -> str:
+                return "  --" if is_missing_value(value) else f"{float(value):4.0f}"
 
             print(
-                f"  {int(row['rank']):>3} {row['ticker']:<7} {name:<25} "
+                f"  {int(row['rank']):>3} {row['ticker']:<7} {name:<22} "
                 f"${float(row['price']):>7.2f} "
                 f"{float(conf):>5.1f} {int(rules):>2}/10 "
                 f"{float(ml):>5.3f} {float(panel):>5.1f} "
+                f"{_sig(hype):>5} {_sig(exh):>5} {_sig(insdr):>6} "
                 f"{action:<12} {opt:>3}"
             )
 
@@ -4855,17 +4975,27 @@ class OutputFormatter:
 def main():
     """Execute the full 6-stage scanning pipeline."""
     pipeline_start = time.time()
+    clock = PipelineClock(PIPELINE_BUDGET_MINUTES)
     log.info("=" * 70)
     log.info("  STOCK UNIVERSE SCAN PIPELINE -- STARTING")
+    log.info(f"  Engine: {ENGINE_NAME} v{ENGINE_VERSION}")
     log.info(f"  Time: {now_et()}")
     log.info(f"  Market Open Now (ET RTH): {is_market_open_now()}")
+    log.info(f"  Wall-clock budget: {PIPELINE_BUDGET_MINUTES:.0f} min")
+    log.info(
+        f"  Strategy: {HOLDING_HORIZON_DAYS}-session horizon, target "
+        f"+{ML_TARGET_RETURN:.0%}, insider/hype weighted, anti-chase guard on"
+    )
     log.info("=" * 70)
 
     stage_counts = {}
     ml_params = {}
     feature_importances = {}
+    near_misses: List[Dict] = []
 
     try:
+        verify_api_credentials()
+
         # ── STAGE 0: Macro Regime Snapshot ───────────────────────────
         # Establishes geopolitical/macro context BEFORE any equity work
         # (the panel review's #1 demand: "consider current context").
@@ -4874,11 +5004,13 @@ def main():
         stage_counts["Stage 0: Macro regime"] = round(macro.regime_score)
 
         # ── STAGE 1: Universe Discovery ──────────────────────────────
+        clock.check("Stage 1: Universe Discovery")
         discovery = UniverseDiscovery(MASSIVE_API_KEY)
         tickers = discovery.discover()
         stage_counts["Stage 1: Universe Discovered"] = len(tickers)
 
         # ── DATA FETCH: OHLCV via yfinance ───────────────────────────
+        clock.check("Data Fetch")
         fetcher = DataFetcher()
         all_data = fetcher.fetch_ohlcv(tickers)
         stage_counts["Data Fetch: Tickers with OHLCV"] = len(all_data)
@@ -4894,6 +5026,7 @@ def main():
         stage_counts["Technicals Computed"] = len(all_data)
 
         # ── STAGE 2: Execution Guards ────────────────────────────────
+        clock.check("Stage 2: Execution Guards")
         guarded_data, guard_rejected = ExecutionGuards.apply(all_data)
         stage_counts["Stage 2: Passed Guards"] = len(guarded_data)
 
@@ -4901,6 +5034,7 @@ def main():
             raise PipelineError("No tickers survived execution guards. Pipeline STOPPED.")
 
         # ── STAGE 3: Hard Buy Rules ──────────────────────────────────
+        clock.check("Stage 3: Hard Buy Rules")
         strict_survivors, buy_rejected = HardBuyRules.apply(guarded_data)
         stage_counts["Stage 3: Strict Hard Buy Rules"] = len(strict_survivors)
 
@@ -4921,11 +5055,15 @@ def main():
         stage_counts["Stage 3B: Ranked Candidate Pool"] = len(survivors)
 
         if len(survivors) == 0:
+            # The near-miss report is the only diagnostic artifact when the
+            # rule set is too tight for the current regime -- always write it.
+            OutputFormatter.save_near_misses(near_misses, stage_counts)
             raise PipelineError("No rankable candidates after hard-rule scoring. Pipeline STOPPED.")
 
         # ── STAGE 4: ML Ranking ──────────────────────────────────────
         # Train on the FULL guarded universe (~50x more samples than
         # survivors-only) for true discriminative power.
+        clock.check("Stage 4: ML Ranking")
         ranker = MLRanker()
         survivors = ranker.rank(survivors, all_data, training_universe=guarded_data)
         ml_params = {
@@ -4938,11 +5076,13 @@ def main():
         feature_importances = ranker.feature_importances
 
         # ── FUNDAMENTALS FETCH (survivors only) ──────────────────────
+        clock.check("Fundamentals + insider fetch")
         survivor_tickers = [s["ticker"] for s in survivors]
         fund_fetcher = FundamentalsFetcher(MASSIVE_API_KEY)
         fundamentals = fund_fetcher.fetch_batch(survivor_tickers)
 
         # ── STAGE 5: 5-Investor Panel ────────────────────────────────
+        clock.check("Stage 5: Investor Panel")
         panel = InvestorPanel(macro=macro)
         panel.set_universe_returns(guarded_data)  # IBD-style RS percentile
         survivors = panel.score_all(
@@ -4957,6 +5097,7 @@ def main():
 
         if len(survivors) == 0:
             log.warning("No tickers could be panel-scored.")
+            OutputFormatter.save_near_misses(near_misses, stage_counts)
             OutputFormatter.format_and_save([], stage_counts, ml_params, feature_importances, macro=macro)
             return
 
@@ -4992,6 +5133,7 @@ def main():
                     break
 
         # ── STAGE 6: Options Evaluation ──────────────────────────────
+        clock.check("Stage 6: Options Evaluation")
         survivors = OptionsEvaluator.evaluate(pre_option_pool, fundamentals=fundamentals)
         stage_counts["Stage 6: Options Evaluated"] = len(survivors)
 
@@ -5103,6 +5245,18 @@ def main():
         elapsed = time.time() - pipeline_start
         log.info(f"Pipeline completed in {elapsed:.1f} seconds")
         log.info(f"Final candidates: {len(final)}")
+        log.info(f"Engine: {ENGINE_NAME} v{ENGINE_VERSION}")
+
+    except PipelineBudgetExceeded as e:
+        # Out of wall-clock time: emit whatever diagnostics exist rather than
+        # letting the Actions runner kill the job with no artifacts at all.
+        log.error(f"PIPELINE BUDGET EXCEEDED: {e}")
+        try:
+            OutputFormatter.save_near_misses(near_misses, stage_counts)
+        except Exception as inner:
+            log.error(f"  Could not save near-miss diagnostics: {inner}")
+        print(f"\n*** PIPELINE BUDGET EXCEEDED ***\n{e}\n")
+        sys.exit(1)
 
     except PipelineError as e:
         log.error(f"PIPELINE STOPPED: {e}")

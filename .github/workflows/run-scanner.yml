@@ -7,6 +7,22 @@ on:
     - cron: "45 12 * * 1-5"
     - cron: "45 13 * * 1-5"
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "Run the regression tests before scanning"
+        type: boolean
+        default: true
+      scan_budget_minutes:
+        description: "Wall-clock budget for the scan (minutes, must be < job timeout)"
+        type: string
+        default: "100"
+      log_level:
+        description: "Log verbosity"
+        type: choice
+        default: "INFO"
+        options:
+          - INFO
+          - DEBUG
 
 permissions:
   contents: read
@@ -26,6 +42,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            # Manual (workflow_dispatch) runs always execute immediately.
             echo "run_scan=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -65,8 +82,49 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run scanner regression tests
+      - name: Report engine version
+        id: engine
         if: steps.schedule_window.outputs.run_scan == 'true'
+        shell: bash
+        run: |
+          # Read the identity straight out of the scanner so a manual run can
+          # never silently execute an older engine than the checked-out code.
+          engine="$(python -c 'import new_stock_scanner_pipeline_claude_opus_41426 as s; print(f"{s.ENGINE_NAME} v{s.ENGINE_VERSION}")')"
+          echo "Engine: ${engine}"
+          {
+            echo "## ${engine}"
+            echo ""
+            echo "- Trigger: \`${{ github.event_name }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Ref: \`${{ github.ref_name }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify API credentials
+        if: steps.schedule_window.outputs.run_scan == 'true'
+        shell: bash
+        env:
+          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+          MBOUM_API_KEY: ${{ secrets.MBOUM_API_KEY }}
+          MBOUM_OPTIONS_KEY: ${{ secrets.MBOUM_OPTIONS_KEY }}
+        run: |
+          # Fail in seconds with an actionable message instead of burning the
+          # whole job on requests that are all going to be rejected.
+          missing=()
+          [[ -z "$MASSIVE_API_KEY" ]] && missing+=("MASSIVE_API_KEY")
+          [[ -z "$MBOUM_API_KEY" ]] && missing+=("MBOUM_API_KEY")
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required repository secrets: ${missing[*]}. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [[ -z "$MBOUM_OPTIONS_KEY" ]]; then
+            echo "::warning::MBOUM_OPTIONS_KEY is not set; options chains will fall back to Massive/Yahoo."
+          fi
+          echo "All required secrets are present."
+
+      - name: Run scanner regression tests
+        if: >-
+          steps.schedule_window.outputs.run_scan == 'true' &&
+          (github.event_name != 'workflow_dispatch' || inputs.run_tests)
         run: python -m unittest -v
 
       - name: Run live stock scanner
@@ -76,7 +134,20 @@ jobs:
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
           MBOUM_API_KEY: ${{ secrets.MBOUM_API_KEY }}
           MBOUM_OPTIONS_KEY: ${{ secrets.MBOUM_OPTIONS_KEY }}
+          SCAN_BUDGET_MINUTES: ${{ inputs.scan_budget_minutes || '100' }}
+          LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
         run: python new_stock_scanner_pipeline_claude_opus_41426.py
+
+      - name: Publish results summary
+        if: always() && steps.schedule_window.outputs.run_scan == 'true'
+        shell: bash
+        run: |
+          latest="$(ls -1t scan_results/scan_*.json 2>/dev/null | head -n 1 || true)"
+          if [[ -z "$latest" ]]; then
+            echo "No scan report was produced -- see the uploaded log artifact." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python .github/scripts/summarize_scan.py "$latest" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload scan outputs
         if: always() && steps.schedule_window.outputs.run_scan == 'true'
