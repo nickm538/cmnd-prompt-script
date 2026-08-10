@@ -403,8 +403,7 @@ def verify_api_credentials() -> Dict[str, str]:
         status[name] = "env" if supplied else "absent"
         if not supplied:
             log.warning(
-                f"{name} is not set -- options evaluation will be skipped and "
-                "candidates will be reported equity-only."
+                f"{name} is not set -- MBOUM options-tier data disabled; options will fall back to Massive/Yahoo."
             )
     return status
 
