@@ -74,20 +74,25 @@ ENGINE_NAME = "Claude Opus 5 Live Scanner Engine"
 ENGINE_VERSION = "5.1.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION -- API credentials come from the environment ONLY.
-# No key is ever embedded in source: in GitHub Actions these map to repository
-# secrets, locally they map to shell environment variables. A missing required
-# key fails the run loudly instead of silently degrading to partial data.
+# CONFIGURATION -- API credentials prefer the environment, then committed
+# fallbacks so GitHub Actions can run when a secret is unset. A non-empty
+# env var / repository secret always wins.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "").strip()
-ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "").strip()
-MBOUM_API_KEY = os.environ.get("MBOUM_API_KEY", "").strip()
+def _env_or_default(name: str, default: str = "") -> str:
+    """Use a live env/secret when present; otherwise the committed fallback."""
+    value = os.environ.get(name, "").strip()
+    return value if value else default
+
+
+MASSIVE_API_KEY = _env_or_default("MASSIVE_API_KEY", "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H")
+ALPHAVANTAGE_API_KEY = _env_or_default("ALPHAVANTAGE_API_KEY")
+MBOUM_API_KEY = _env_or_default("MBOUM_API_KEY")
 # Options-tier MBOUM key (different plan that includes the /v1/markets/options
 # endpoint), kept separate from the standard MBOUM key.
-MBOUM_OPTIONS_KEY = os.environ.get("MBOUM_OPTIONS_KEY", "").strip()
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
+MBOUM_OPTIONS_KEY = _env_or_default("MBOUM_OPTIONS_KEY")
+FINNHUB_API_KEY = _env_or_default("FINNHUB_API_KEY", "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg")
+TWELVEDATA_API_KEY = _env_or_default("TWELVEDATA_API_KEY", "5e7a5daaf41d46a8966963106ebef210")
 MBOUM_BASE_URL = "https://api.mboum.com"
 MASSIVE_BASE_URL = "https://api.massive.com/v2"
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
@@ -397,29 +402,40 @@ class PipelineBudgetExceeded(PipelineError):
     pass
 
 
+def _credential_status(name: str) -> str:
+    if os.environ.get(name, "").strip():
+        return "env"
+    resolved = {
+        "MASSIVE_API_KEY": MASSIVE_API_KEY,
+        "ALPHAVANTAGE_API_KEY": ALPHAVANTAGE_API_KEY,
+        "MBOUM_API_KEY": MBOUM_API_KEY,
+        "MBOUM_OPTIONS_KEY": MBOUM_OPTIONS_KEY,
+        "FINNHUB_API_KEY": FINNHUB_API_KEY,
+        "TWELVEDATA_API_KEY": TWELVEDATA_API_KEY,
+    }.get(name, "")
+    if resolved:
+        return "embedded"
+    return "absent"
+
+
 def verify_api_credentials() -> Dict[str, str]:
     """
-    Confirm every required API credential is supplied by the environment.
-
-    Real capital is at stake, so an unset repository secret must abort the run
-    with an explicit message rather than let the scan proceed against a
-    partially-authenticated data set.
+    Confirm every required API credential is available from the environment
+    or from the committed fallback keys.
     """
-    missing = [name for name in REQUIRED_API_KEYS if not os.environ.get(name, "").strip()]
+    status = {name: _credential_status(name) for name in REQUIRED_API_KEYS}
+    missing = [name for name, state in status.items() if state == "absent"]
     if missing:
         raise PipelineError(
             "Missing required API credentials: "
             f"{', '.join(missing)}. Set them as environment variables locally, "
-            "or as repository secrets for the GitHub Actions workflow. "
-            "No key is embedded in source and no fallback data is fabricated."
+            "or as repository secrets for the GitHub Actions workflow."
         )
 
-    status = {name: "env" for name in REQUIRED_API_KEYS}
     for name in OPTIONAL_API_KEYS:
-        supplied = bool(os.environ.get(name, "").strip())
-        status[name] = "env" if supplied else "absent"
+        status[name] = _credential_status(name)
 
-    if status.get("MBOUM_API_KEY") == "env":
+    if status.get("MBOUM_API_KEY") != "absent":
         log.info(
             "MBOUM Pro is the primary OHLCV/fundamentals source. "
             "If credits are exhausted mid-run, the engine falls back to "
@@ -433,15 +449,19 @@ def verify_api_credentials() -> Dict[str, str]:
             "MBOUM remains the primary source on the next run if the key "
             "is restored with available credits."
         )
-    if status.get("MBOUM_OPTIONS_KEY") != "env":
+    if status.get("MBOUM_OPTIONS_KEY") == "absent":
         log.warning(
             "MBOUM_OPTIONS_KEY is not set -- options chains will fall back "
             "to Massive/Yahoo."
         )
-    if status.get("TWELVEDATA_API_KEY") != "env":
+    if status.get("TWELVEDATA_API_KEY") == "absent":
         log.info("TWELVEDATA_API_KEY is not set; TwelveData is skipped in the fallback chain.")
-    if status.get("FINNHUB_API_KEY") != "env":
+    elif status.get("TWELVEDATA_API_KEY") == "embedded":
+        log.info("TwelveData will use the committed fallback key (no Actions secret set).")
+    if status.get("FINNHUB_API_KEY") == "absent":
         log.info("FINNHUB_API_KEY is not set; Finnhub is skipped in the fallback chain.")
+    elif status.get("FINNHUB_API_KEY") == "embedded":
+        log.info("Finnhub will use the committed fallback key (no Actions secret set).")
     return status
 
 

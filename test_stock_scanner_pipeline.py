@@ -215,6 +215,27 @@ class ScannerRegressionTests(unittest.TestCase):
             status = scanner.verify_api_credentials()
         self.assertEqual(status["MASSIVE_API_KEY"], "env")
         self.assertEqual(status["MBOUM_API_KEY"], "absent")
+        self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
+        self.assertEqual(status["FINNHUB_API_KEY"], "embedded")
+
+    def test_committed_fallback_keys_are_used_when_secrets_are_empty(self):
+        with patch.dict(os.environ, {}, clear=True):
+            status = scanner.verify_api_credentials()
+            massive = scanner._env_or_default(
+                "MASSIVE_API_KEY", "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H"
+            )
+            twelve = scanner._env_or_default(
+                "TWELVEDATA_API_KEY", "5e7a5daaf41d46a8966963106ebef210"
+            )
+            finnhub = scanner._env_or_default(
+                "FINNHUB_API_KEY", "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg"
+            )
+        self.assertEqual(status["MASSIVE_API_KEY"], "embedded")
+        self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
+        self.assertEqual(status["FINNHUB_API_KEY"], "embedded")
+        self.assertTrue(massive)
+        self.assertTrue(twelve)
+        self.assertTrue(finnhub)
 
     def test_ohlcv_router_keeps_mboum_primary_when_it_returns_history(self):
         history = _guard_ready_df(datetime(2026, 4, 29).date())

@@ -111,11 +111,8 @@ jobs:
         run: |
           # Fail in seconds with an actionable message instead of burning the
           # whole job on requests that are all going to be rejected.
-          missing=()
-          [[ -z "$MASSIVE_API_KEY" ]] && missing+=("MASSIVE_API_KEY")
-          if (( ${#missing[@]} > 0 )); then
-            echo "::error::Missing required repository secrets: ${missing[*]}. Add them under Settings > Secrets and variables > Actions."
-            exit 1
+          if [[ -z "$MASSIVE_API_KEY" ]]; then
+            echo "::notice::MASSIVE_API_KEY secret is empty; the engine will use its committed fallback key."
           fi
           if [[ -z "$MBOUM_API_KEY" ]]; then
             echo "::warning::MBOUM_API_KEY is not set; OHLCV/fundamentals will fall back to Massive/TwelveData/Finnhub/Yahoo. MBOUM remains primary when the key and credits are available."
@@ -124,12 +121,12 @@ jobs:
             echo "::warning::MBOUM_OPTIONS_KEY is not set; options chains will fall back to Massive/Yahoo."
           fi
           if [[ -z "$TWELVEDATA_API_KEY" ]]; then
-            echo "::warning::TWELVEDATA_API_KEY is not set; TwelveData will be skipped in the fallback chain."
+            echo "::notice::TWELVEDATA_API_KEY secret is empty; the engine will use its committed fallback key."
           fi
           if [[ -z "$FINNHUB_API_KEY" ]]; then
-            echo "::warning::FINNHUB_API_KEY is not set; Finnhub will be skipped in the fallback chain."
+            echo "::notice::FINNHUB_API_KEY secret is empty; the engine will use its committed fallback key."
           fi
-          echo "Required secrets are present. MBOUM is primary when credits remain."
+          echo "Credential check complete. MBOUM is primary when credits remain."
 
       - name: Run scanner regression tests
         if: >-

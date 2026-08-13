@@ -40,9 +40,10 @@ process-local circuit and continues the same scan through Massive, then
 TwelveData, then Finnhub, then Yahoo v8 / yfinance. Restored MBOUM credits
 are used first again on the next run. No bars or fundamentals are fabricated.
 
-If they are not set, the corresponding provider is skipped. For GitHub
-Actions, configure these as repository secrets so scheduled runs do not
-depend on local machine state.
+Environment variables and GitHub Actions secrets override the committed
+fallback keys for Massive, TwelveData, and Finnhub. If those secrets are
+empty, the engine uses the keys checked in on this branch so the scan can
+still run. MBOUM keys are not committed and still come from secrets.
 
 ## Run locally
 
