@@ -27,14 +27,22 @@ python -m pip install -r requirements.txt
 
 The script supports these environment variable overrides:
 
-- `MASSIVE_API_KEY`
+- `MASSIVE_API_KEY` (required for universe discovery)
+- `MBOUM_API_KEY` (primary OHLCV and fundamentals source when credits remain)
+- `MBOUM_OPTIONS_KEY` (primary options chains when present)
+- `TWELVEDATA_API_KEY` (fallback OHLCV and fundamentals)
+- `FINNHUB_API_KEY` (fallback fundamentals; OHLCV if the plan includes candles)
 - `ALPHAVANTAGE_API_KEY`
-- `MBOUM_API_KEY`
-- `MBOUM_OPTIONS_KEY`
 
-If they are not set, the scanner falls back to the keys embedded in the source
-file. For GitHub Actions, configure these as repository secrets so scheduled
-runs do not depend on local machine state.
+MBOUM stays the primary market-data source. If the MBOUM plan is out of
+credits, unauthorized, or returning empty history, the engine trips a
+process-local circuit and continues the same scan through Massive, then
+TwelveData, then Finnhub, then Yahoo v8 / yfinance. Restored MBOUM credits
+are used first again on the next run. No bars or fundamentals are fabricated.
+
+If they are not set, the corresponding provider is skipped. For GitHub
+Actions, configure these as repository secrets so scheduled runs do not
+depend on local machine state.
 
 ## Run locally
 

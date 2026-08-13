@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import os
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +27,9 @@ def _guard_ready_df(last_day, unique_prices=True):
 
 
 class ScannerRegressionTests(unittest.TestCase):
+    def setUp(self):
+        scanner.reset_market_router()
+
     def test_macro_regime_requires_live_required_symbols(self):
         macro = scanner.MacroRegime()
         with patch.object(macro, "_series", return_value=None):
@@ -186,6 +190,72 @@ class ScannerRegressionTests(unittest.TestCase):
 
         self.assertGreaterEqual(score, 60.0)
         self.assertEqual(candidate["overall_confidence_score"], round(score, 1))
+
+    def test_credit_errors_trip_mboum_but_minute_limits_do_not(self):
+        self.assertEqual(scanner.classify_http_error(402, ""), "credit")
+        self.assertEqual(
+            scanner.classify_http_error(429, "You have run out of API credits for the current month"),
+            "credit",
+        )
+        self.assertEqual(
+            scanner.classify_http_error(429, "You have run out of API credits for the current minute"),
+            "rate",
+        )
+        self.assertEqual(scanner.classify_http_error(403, "You don't have access"), "auth")
+
+        circuit = scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4)
+        self.assertTrue(circuit.available())
+        circuit.record_failure("credits exhausted", credit=True)
+        self.assertFalse(circuit.available())
+        scanner.ProviderCircuit.reset_all()
+        self.assertTrue(scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4).available())
+
+    def test_missing_mboum_key_is_optional_when_massive_is_present(self):
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "massive-test-key"}, clear=True):
+            status = scanner.verify_api_credentials()
+        self.assertEqual(status["MASSIVE_API_KEY"], "env")
+        self.assertEqual(status["MBOUM_API_KEY"], "absent")
+
+    def test_ohlcv_router_keeps_mboum_primary_when_it_returns_history(self):
+        history = _guard_ready_df(datetime(2026, 4, 29).date())
+        router = scanner.MarketDataRouter()
+        with patch.object(router, "_provider_enabled", return_value=True):
+            with patch.object(router, "_history_mboum", return_value=history) as mboum:
+                with patch.object(router, "_history_massive") as massive:
+                    df, source = router.get_history("AAPL")
+        self.assertEqual(source, "MBOUM")
+        self.assertIs(df, history)
+        mboum.assert_called_once_with("AAPL")
+        massive.assert_not_called()
+
+    def test_ohlcv_router_falls_back_to_massive_when_mboum_is_out_of_credit(self):
+        history = _guard_ready_df(datetime(2026, 4, 29).date())
+        router = scanner.MarketDataRouter()
+        with patch.object(router, "_provider_enabled", return_value=True):
+            with patch.object(
+                router,
+                "_history_mboum",
+                side_effect=scanner.ProviderExhausted("MBOUM", "credits exhausted"),
+            ):
+                with patch.object(router, "_history_massive", return_value=history) as massive:
+                    with patch.object(router, "_history_twelvedata") as twelve:
+                        df, source = router.get_history("AAPL")
+        self.assertEqual(source, "Massive")
+        self.assertIs(df, history)
+        massive.assert_called_once_with("AAPL")
+        twelve.assert_not_called()
+
+    def test_ohlcv_router_skips_tripped_mboum_circuit_on_later_tickers(self):
+        history = _guard_ready_df(datetime(2026, 4, 29).date())
+        router = scanner.MarketDataRouter()
+        scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4).trip("credits exhausted")
+        with patch.object(router, "_provider_enabled", return_value=True):
+            with patch.object(router, "_history_mboum") as mboum:
+                with patch.object(router, "_history_massive", return_value=history):
+                    df, source = router.get_history("MSFT")
+        self.assertEqual(source, "Massive")
+        self.assertIsNotNone(df)
+        mboum.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -106,20 +106,30 @@ jobs:
           MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
           MBOUM_API_KEY: ${{ secrets.MBOUM_API_KEY }}
           MBOUM_OPTIONS_KEY: ${{ secrets.MBOUM_OPTIONS_KEY }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: |
           # Fail in seconds with an actionable message instead of burning the
           # whole job on requests that are all going to be rejected.
           missing=()
           [[ -z "$MASSIVE_API_KEY" ]] && missing+=("MASSIVE_API_KEY")
-          [[ -z "$MBOUM_API_KEY" ]] && missing+=("MBOUM_API_KEY")
           if (( ${#missing[@]} > 0 )); then
             echo "::error::Missing required repository secrets: ${missing[*]}. Add them under Settings > Secrets and variables > Actions."
             exit 1
           fi
+          if [[ -z "$MBOUM_API_KEY" ]]; then
+            echo "::warning::MBOUM_API_KEY is not set; OHLCV/fundamentals will fall back to Massive/TwelveData/Finnhub/Yahoo. MBOUM remains primary when the key and credits are available."
+          fi
           if [[ -z "$MBOUM_OPTIONS_KEY" ]]; then
             echo "::warning::MBOUM_OPTIONS_KEY is not set; options chains will fall back to Massive/Yahoo."
           fi
-          echo "All required secrets are present."
+          if [[ -z "$TWELVEDATA_API_KEY" ]]; then
+            echo "::warning::TWELVEDATA_API_KEY is not set; TwelveData will be skipped in the fallback chain."
+          fi
+          if [[ -z "$FINNHUB_API_KEY" ]]; then
+            echo "::warning::FINNHUB_API_KEY is not set; Finnhub will be skipped in the fallback chain."
+          fi
+          echo "Required secrets are present. MBOUM is primary when credits remain."
 
       - name: Run scanner regression tests
         if: >-
@@ -134,6 +144,8 @@ jobs:
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
           MBOUM_API_KEY: ${{ secrets.MBOUM_API_KEY }}
           MBOUM_OPTIONS_KEY: ${{ secrets.MBOUM_OPTIONS_KEY }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           SCAN_BUDGET_MINUTES: ${{ inputs.scan_budget_minutes || '100' }}
           LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
         run: python new_stock_scanner_pipeline_claude_opus_41426.py

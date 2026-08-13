@@ -27,6 +27,8 @@ import logging
 import math
 import warnings
 import traceback
+import threading
+from collections import Counter
 from datetime import datetime, date, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Any
@@ -69,7 +71,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ENGINE_NAME = "Claude Opus 5 Live Scanner Engine"
-ENGINE_VERSION = "5.0.0"
+ENGINE_VERSION = "5.1.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION -- API credentials come from the environment ONLY.
@@ -78,22 +80,37 @@ ENGINE_VERSION = "5.0.0"
 # key fails the run loudly instead of silently degrading to partial data.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
-ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "")
-MBOUM_API_KEY = os.environ.get("MBOUM_API_KEY", "")
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "").strip()
+ALPHAVANTAGE_API_KEY = os.environ.get("ALPHAVANTAGE_API_KEY", "").strip()
+MBOUM_API_KEY = os.environ.get("MBOUM_API_KEY", "").strip()
 # Options-tier MBOUM key (different plan that includes the /v1/markets/options
 # endpoint), kept separate from the standard MBOUM key.
-MBOUM_OPTIONS_KEY = os.environ.get("MBOUM_OPTIONS_KEY", "")
+MBOUM_OPTIONS_KEY = os.environ.get("MBOUM_OPTIONS_KEY", "").strip()
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "").strip()
 MBOUM_BASE_URL = "https://api.mboum.com"
 MASSIVE_BASE_URL = "https://api.massive.com/v2"
+TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
-# Keys the pipeline cannot run without. MBOUM_OPTIONS_KEY is optional: without
-# it the scan still produces equity candidates, just no option contracts.
-REQUIRED_API_KEYS = ("MASSIVE_API_KEY", "MBOUM_API_KEY")
-OPTIONAL_API_KEYS = ("MBOUM_OPTIONS_KEY",)
+# Universe discovery still needs Massive. MBOUM is the primary OHLCV /
+# fundamentals / options source when credits remain, but it is no longer
+# required: an exhausted MBOUM plan falls through Massive -> TwelveData ->
+# Finnhub -> Yahoo/yfinance without fabricating data.
+REQUIRED_API_KEYS = ("MASSIVE_API_KEY",)
+OPTIONAL_API_KEYS = (
+    "MBOUM_API_KEY",
+    "MBOUM_OPTIONS_KEY",
+    "TWELVEDATA_API_KEY",
+    "FINNHUB_API_KEY",
+    "ALPHAVANTAGE_API_KEY",
+)
 
 # Pipeline parameters
 LOOKBACK_DAYS = 380  # calendar days to request (~252 trading days)
+# Fallbacks request the same ~5y depth MBOUM Pro returns so SMA-200, RS and
+# ML labels do not silently shrink when MBOUM is skipped.
+HISTORY_CALENDAR_DAYS = 5 * 365 + 21
 MIN_TRADING_DAYS = 252
 MIN_UNIVERSE_SIZE = 500
 BATCH_SIZE = 100  # yfinance download batch size
@@ -401,11 +418,182 @@ def verify_api_credentials() -> Dict[str, str]:
     for name in OPTIONAL_API_KEYS:
         supplied = bool(os.environ.get(name, "").strip())
         status[name] = "env" if supplied else "absent"
-        if not supplied:
-            log.warning(
-                f"{name} is not set -- MBOUM options-tier data disabled; options will fall back to Massive/Yahoo."
-            )
+
+    if status.get("MBOUM_API_KEY") == "env":
+        log.info(
+            "MBOUM Pro is the primary OHLCV/fundamentals source. "
+            "If credits are exhausted mid-run, the engine falls back to "
+            "Massive -> TwelveData -> Finnhub -> Yahoo/yfinance without "
+            "fabricating bars."
+        )
+    else:
+        log.warning(
+            "MBOUM_API_KEY is not set -- OHLCV/fundamentals will use "
+            "Massive -> TwelveData -> Finnhub -> Yahoo/yfinance. "
+            "MBOUM remains the primary source on the next run if the key "
+            "is restored with available credits."
+        )
+    if status.get("MBOUM_OPTIONS_KEY") != "env":
+        log.warning(
+            "MBOUM_OPTIONS_KEY is not set -- options chains will fall back "
+            "to Massive/Yahoo."
+        )
+    if status.get("TWELVEDATA_API_KEY") != "env":
+        log.info("TWELVEDATA_API_KEY is not set; TwelveData is skipped in the fallback chain.")
+    if status.get("FINNHUB_API_KEY") != "env":
+        log.info("FINNHUB_API_KEY is not set; Finnhub is skipped in the fallback chain.")
     return status
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PROVIDER CIRCUIT BREAKER -- keep MBOUM primary, fail over live
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ProviderExhausted(Exception):
+    """Provider is out of credits, unauthorized, or unusable for the rest of this run."""
+
+    def __init__(self, provider: str, reason: str):
+        self.provider = provider
+        self.reason = reason
+        super().__init__(f"{provider}: {reason}")
+
+
+_CREDIT_HINTS = (
+    "out of credit", "out of api credits", "insufficient credit",
+    "no credits", "credit limit", "not enough credit", "credits exhausted",
+    "quota", "payment required", "upgrade your plan", "exceeded your",
+    "monthly limit", "api call credits", "usage limit", "plan limit",
+    "you have run out", "limit reached", "not entitled",
+)
+_MINUTE_HINTS = ("per minute", "current minute", "too many requests")
+
+
+def classify_http_error(status_code: int, body: str = "") -> str:
+    """Classify a provider error as credit, rate, auth, or other."""
+    text = (body or "").lower()
+    minute = any(hint in text for hint in _MINUTE_HINTS)
+    monthly = any(hint in text for hint in ("month", "daily limit", "per day", "current day"))
+    credit = any(hint in text for hint in _CREDIT_HINTS)
+    if minute and not monthly:
+        return "rate"
+    if status_code == 402 or monthly or (credit and not minute):
+        return "credit"
+    if status_code in (401, 403):
+        return "auth"
+    if status_code == 429:
+        return "rate"
+    return "other"
+
+
+class ProviderCircuit:
+    """
+    Process-wide circuit breaker.
+
+    MBOUM is tried first on every run. Once credits/auth fail (or a short
+    burst of empty responses proves the plan is dead), remaining calls skip
+    MBOUM and use the next live provider. Circuits do not persist across
+    runs, so restored MBOUM credits automatically become primary again.
+    """
+
+    _registry: Dict[str, "ProviderCircuit"] = {}
+    _reg_lock = threading.Lock()
+
+    def __init__(self, name: str, fail_limit: int = 6):
+        self.name = name
+        self.fail_limit = fail_limit
+        self._lock = threading.Lock()
+        self.disabled = False
+        self.reason = ""
+        self.consecutive_failures = 0
+        self.successes = 0
+        self._logged_trip = False
+
+    @classmethod
+    def get(cls, name: str, fail_limit: int = 6) -> "ProviderCircuit":
+        with cls._reg_lock:
+            inst = cls._registry.get(name)
+            if inst is None:
+                inst = cls(name, fail_limit)
+                cls._registry[name] = inst
+            return inst
+
+    @classmethod
+    def reset_all(cls) -> None:
+        with cls._reg_lock:
+            cls._registry.clear()
+
+    def available(self) -> bool:
+        return not self.disabled
+
+    def trip(self, reason: str) -> None:
+        with self._lock:
+            self.disabled = True
+            self.reason = reason or "unavailable"
+            if not self._logged_trip:
+                self._logged_trip = True
+                if "MBOUM" in self.name:
+                    log.warning(
+                        f"{self.name} disabled for this run: {self.reason}. "
+                        "Falling back to Massive -> TwelveData -> Finnhub -> "
+                        "Yahoo/yfinance. MBOUM stays primary on the next run "
+                        "if credits are restored."
+                    )
+                else:
+                    log.warning(
+                        f"{self.name} disabled for this run: {self.reason}. "
+                        "Trying the next live provider."
+                    )
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.consecutive_failures = 0
+            self.successes += 1
+
+    def record_failure(self, reason: str = "error", credit: bool = False) -> None:
+        with self._lock:
+            self.consecutive_failures += 1
+            should_trip = credit or self.consecutive_failures >= self.fail_limit
+            fail_reason = reason
+        if should_trip:
+            self.trip(fail_reason)
+
+
+DATA_SOURCE_USAGE: Dict[str, Counter] = {
+    "ohlcv": Counter(),
+    "fundamentals": Counter(),
+    "options": Counter(),
+}
+
+
+def reset_data_source_usage() -> None:
+    for bucket in DATA_SOURCE_USAGE.values():
+        bucket.clear()
+
+
+def _normalize_ohlcv_frame(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Force every provider onto the same OHLCV schema MBOUM returns."""
+    if df is None or df.empty:
+        return None
+    required = ("Open", "High", "Low", "Close", "Volume")
+    if any(col not in df.columns for col in required):
+        return None
+    out = df.loc[:, list(required)].copy()
+    out.index = pd.to_datetime(out.index)
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_convert(ET_TZ).tz_localize(None)
+    out = out.sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["Close"])
+    out = out[out["Volume"] > 0]
+    return out if len(out) > 0 else None
+
+
+def _history_window() -> Tuple[date, date]:
+    end = today_et()
+    start = end - timedelta(days=HISTORY_CALENDAR_DAYS)
+    return start, end
 
 
 class PipelineClock:
@@ -877,13 +1065,15 @@ class UniverseDiscovery:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DATA FETCHING -- MBOUM Pro (primary) + Yahoo Direct API (fallback/options)
+# DATA FETCHING -- MBOUM Pro (primary) + live provider cascade
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MboumAPI:
     """
-    MBOUM Pro API client -- primary data source.
-    Provides: OHLCV history (5yr), fundamentals, screener.
+    MBOUM Pro API client -- primary data source when credits remain.
+    Provides: OHLCV history (5yr), fundamentals, screener, options.
+    Credit/quota failures trip a process-wide circuit so the rest of the
+    scan falls through to Massive / TwelveData / Finnhub / Yahoo.
     """
 
     def __init__(self, api_key: str = MBOUM_API_KEY):
@@ -893,27 +1083,77 @@ class MboumAPI:
         adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+        if api_key:
+            self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+
+    def _decode_payload(self, resp, circuit: ProviderCircuit, what: str) -> Optional[Dict]:
+        """Parse an MBOUM response, tripping the circuit on credit/auth failure."""
+        body_text = resp.text or ""
+        kind = classify_http_error(resp.status_code, body_text)
+        if kind == "rate":
+            return None
+        if kind in ("credit", "auth"):
+            snippet = body_text.replace("\n", " ")[:180]
+            circuit.trip(f"{what} HTTP {resp.status_code}: {snippet}")
+            raise ProviderExhausted("MBOUM", f"{what} {kind}: HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            circuit.record_failure(f"{what} HTTP {resp.status_code}")
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            circuit.record_failure(f"{what} invalid JSON")
+            return None
+        if not isinstance(data, dict):
+            circuit.record_failure(f"{what} unexpected payload")
+            return None
+
+        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        body = data.get("body")
+        meta_msg = str(meta.get("message") or meta.get("error") or "")
+        meta_status = meta.get("status")
+        inspect_text = " ".join(
+            part for part in (meta_msg, body if isinstance(body, str) else "") if part
+        )
+        nested_status = meta_status if isinstance(meta_status, int) else resp.status_code
+        nested_kind = classify_http_error(nested_status, inspect_text)
+        if nested_kind in ("credit", "auth") or (
+            isinstance(body, str) and nested_kind == "credit"
+        ):
+            circuit.trip(f"{what}: {inspect_text[:180] or nested_kind}")
+            raise ProviderExhausted("MBOUM", f"{what} {nested_kind}")
+        if isinstance(body, str):
+            circuit.record_failure(f"{what}: {body[:160]}")
+            return None
+        if isinstance(meta_status, int) and meta_status >= 400:
+            circuit.record_failure(f"{what} meta.status={meta_status}")
+            return None
+        return data
 
     def get_history(self, symbol: str) -> Optional[pd.DataFrame]:
         """
         Fetch full OHLCV history for a ticker.
         Returns up to ~1257 daily bars (5 years) with adjusted close.
         """
+        circuit = ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4)
+        if not self.api_key or not circuit.available():
+            return None
+
         url = f"{self.base}/v1/markets/stock/history"
         params = {"symbol": symbol, "interval": "1d", "diffandsplits": "true"}
 
         try:
             resp = self.session.get(url, params=params, timeout=20)
-            if resp.status_code == 429:
+            if classify_http_error(resp.status_code, resp.text or "") == "rate":
                 time.sleep(3)
                 resp = self.session.get(url, params=params, timeout=20)
-            if resp.status_code != 200:
+            data = self._decode_payload(resp, circuit, f"history {symbol}")
+            if not data:
                 return None
 
-            data = resp.json()
             body = data.get("body", {})
             if not isinstance(body, dict) or len(body) < 50:
+                circuit.record_failure(f"history {symbol}: empty/short body")
                 return None
 
             rows = []
@@ -937,32 +1177,53 @@ class MboumAPI:
                 })
 
             if not rows:
+                circuit.record_failure(f"history {symbol}: no bars")
                 return None
 
             df = pd.DataFrame(rows)
             df["Date"] = pd.to_datetime(df["Date"])
             df = df.set_index("Date").sort_index()
-            df = df.dropna(subset=["Close"])
-            df = df[df["Volume"] > 0]
+            df = _normalize_ohlcv_frame(df)
+            if df is None:
+                circuit.record_failure(f"history {symbol}: unusable bars")
+                return None
+            circuit.record_success()
+            return df
 
-            return df if len(df) > 0 else None
-
-        except Exception:
+        except ProviderExhausted:
+            raise
+        except Exception as e:
+            circuit.record_failure(str(e))
             return None
 
     def get_modules(self, symbol: str, modules: List[str]) -> Dict:
         """Fetch fundamental modules for a ticker."""
+        circuit = ProviderCircuit.get("MBOUM-fundamentals", fail_limit=3)
+        if not self.api_key or not circuit.available():
+            return {}
         result = {}
         for mod in modules:
             try:
                 url = f"{self.base}/v1/markets/stock/modules"
                 params = {"symbol": symbol, "module": mod}
                 resp = self.session.get(url, params=params, timeout=15)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    result[mod] = data.get("body", {})
+                if classify_http_error(resp.status_code, resp.text or "") == "rate":
+                    time.sleep(2)
+                    resp = self.session.get(url, params=params, timeout=15)
+                data = self._decode_payload(resp, circuit, f"module {mod} {symbol}")
+                if not data:
+                    continue
+                body = data.get("body", {})
+                if isinstance(body, dict) and body:
+                    result[mod] = body
+            except ProviderExhausted:
+                raise
             except Exception:
                 pass
+        if result:
+            circuit.record_success()
+        else:
+            circuit.record_failure(f"modules {symbol}: empty")
         return result
 
     def get_options_meta(self, symbol: str) -> Optional[Dict]:
@@ -974,45 +1235,60 @@ class MboumAPI:
           - options: list with the FIRST expiration's chain (calls+puts)
         Use the dedicated options-tier key.
         """
+        circuit = ProviderCircuit.get("MBOUM-options", fail_limit=3)
+        if not MBOUM_OPTIONS_KEY or not circuit.available():
+            return None
         url = f"{self.base}/v1/markets/options"
         params = {"symbol": symbol}
         headers = {"Authorization": f"Bearer {MBOUM_OPTIONS_KEY}"}
         try:
             resp = self.session.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code == 429:
+            if classify_http_error(resp.status_code, resp.text or "") == "rate":
                 time.sleep(2)
                 resp = self.session.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code != 200:
+            data = self._decode_payload(resp, circuit, f"options meta {symbol}")
+            if not data:
                 return None
-            data = resp.json()
             body = data.get("body")
             if isinstance(body, list) and body:
+                circuit.record_success()
                 return body[0]
-            if isinstance(body, dict):
+            if isinstance(body, dict) and body:
+                circuit.record_success()
                 return body
+            circuit.record_failure(f"options meta {symbol}: empty")
+        except ProviderExhausted:
+            raise
         except Exception:
+            circuit.record_failure(f"options meta {symbol}: error")
             return None
         return None
 
     def get_options_for_expiration(self, symbol: str, expiration_epoch: int) -> Optional[Dict]:
         """Fetch the calls+puts chain for ONE expiration date.
         Returns the {'expirationDate', 'calls': [...], 'puts': [...]} entry."""
+        circuit = ProviderCircuit.get("MBOUM-options", fail_limit=3)
+        if not MBOUM_OPTIONS_KEY or not circuit.available():
+            return None
         url = f"{self.base}/v1/markets/options"
         params = {"symbol": symbol, "expiration": int(expiration_epoch)}
         headers = {"Authorization": f"Bearer {MBOUM_OPTIONS_KEY}"}
         try:
             resp = self.session.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code == 429:
+            if classify_http_error(resp.status_code, resp.text or "") == "rate":
                 time.sleep(2)
                 resp = self.session.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code != 200:
+            data = self._decode_payload(resp, circuit, f"options exp {symbol}")
+            if not data:
                 return None
-            data = resp.json()
             body = data.get("body")
             if isinstance(body, list) and body:
                 opts = body[0].get("options", [])
                 if opts:
+                    circuit.record_success()
                     return opts[0]
+        except ProviderExhausted:
+            raise
         except Exception:
             return None
         return None
@@ -1087,24 +1363,410 @@ class YahooDirectAPI:
         except Exception:
             return None
 
+    def get_history(self, symbol: str, range_: str = "5y") -> Optional[pd.DataFrame]:
+        """Full daily OHLCV via Yahoo v8 chart -- last-resort public source."""
+        circuit = ProviderCircuit.get("Yahoo-OHLCV", fail_limit=40)
+        if not circuit.available():
+            return None
+        url = f"{self.BASE_URL}/{symbol}"
+        params = {
+            "range": range_,
+            "interval": "1d",
+            "includePrePost": "false",
+            "events": "div,splits",
+        }
+        try:
+            resp = self.session.get(url, params=params, timeout=15)
+            kind = classify_http_error(resp.status_code, resp.text or "")
+            if kind == "rate":
+                time.sleep(1.5)
+                resp = self.session.get(url, params=params, timeout=15)
+                kind = classify_http_error(resp.status_code, resp.text or "")
+            if kind in ("credit", "auth") or resp.status_code in (401, 403):
+                circuit.trip(f"Yahoo chart HTTP {resp.status_code}")
+                raise ProviderExhausted("Yahoo", f"HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                return None
+            payload = resp.json() or {}
+            result = (payload.get("chart") or {}).get("result")
+            if not result:
+                return None
+            chart = result[0]
+            ts = chart.get("timestamp") or []
+            quote = (chart.get("indicators") or {}).get("quote", [{}])[0]
+            adj_list = ((chart.get("indicators") or {}).get("adjclose") or [{}])
+            adjclose = (adj_list[0] or {}).get("adjclose") if adj_list else None
+            rows = []
+            for i, epoch in enumerate(ts):
+                closes = quote.get("close") or []
+                close = closes[i] if i < len(closes) else None
+                adj = adjclose[i] if adjclose and i < len(adjclose) else None
+                if close is None and adj is None:
+                    continue
+                close = normalize_api_scalar(close)
+                adj = normalize_api_scalar(adj if adj is not None else close)
+                factor = safe_div(adj, close, default=1.0)
+                if is_missing_value(factor) or factor <= 0:
+                    factor = 1.0
+                opens = quote.get("open") or []
+                highs = quote.get("high") or []
+                lows = quote.get("low") or []
+                vols = quote.get("volume") or []
+                rows.append({
+                    "Date": pd.to_datetime(epoch, unit="s", utc=True),
+                    "Open": normalize_api_scalar(opens[i] if i < len(opens) else None) * factor,
+                    "High": normalize_api_scalar(highs[i] if i < len(highs) else None) * factor,
+                    "Low": normalize_api_scalar(lows[i] if i < len(lows) else None) * factor,
+                    "Close": adj,
+                    "Volume": vols[i] if i < len(vols) else None,
+                })
+            if not rows:
+                return None
+            df = pd.DataFrame(rows).set_index("Date")
+            return _normalize_ohlcv_frame(df)
+        except ProviderExhausted:
+            raise
+        except Exception:
+            return None
+
+
+class MarketDataRouter:
+    """
+    Ordered live-data cascade.
+
+    MBOUM is always attempted first when a key is present and the circuit is
+    closed. Restored credits on a later Actions run automatically put MBOUM
+    back in front -- circuits are process-local.
+    """
+
+    OHLCV_CHAIN = (
+        ("MBOUM", "MBOUM-OHLCV", 4),
+        ("Massive", "Massive-OHLCV", 10),
+        ("TwelveData", "TwelveData-OHLCV", 8),
+        ("Finnhub", "Finnhub-OHLCV", 3),
+        ("Yahoo", "Yahoo-OHLCV", 40),
+    )
+
+    def __init__(self):
+        self.mboum = MboumAPI() if MBOUM_API_KEY else None
+        self.yahoo = YahooDirectAPI()
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def _provider_enabled(self, label: str) -> bool:
+        if label == "MBOUM":
+            return bool(MBOUM_API_KEY) and self.mboum is not None
+        if label == "Massive":
+            return bool(MASSIVE_API_KEY)
+        if label == "TwelveData":
+            return bool(TWELVEDATA_API_KEY)
+        if label == "Finnhub":
+            return bool(FINNHUB_API_KEY)
+        return True
+
+    def get_history(self, symbol: str) -> Tuple[Optional[pd.DataFrame], str]:
+        fetchers = {
+            "MBOUM": self._history_mboum,
+            "Massive": self._history_massive,
+            "TwelveData": self._history_twelvedata,
+            "Finnhub": self._history_finnhub,
+            "Yahoo": self._history_yahoo,
+        }
+        for label, circuit_name, fail_limit in self.OHLCV_CHAIN:
+            if not self._provider_enabled(label):
+                continue
+            circuit = ProviderCircuit.get(circuit_name, fail_limit=fail_limit)
+            if not circuit.available():
+                continue
+            try:
+                df = fetchers[label](symbol)
+            except ProviderExhausted as exc:
+                log.warning(
+                    f"  {label} unavailable for OHLCV ({exc.reason}); "
+                    "continuing down the fallback chain"
+                )
+                continue
+            except Exception as exc:
+                if label != "Yahoo":
+                    circuit.record_failure(str(exc))
+                log.debug(f"  {label} history failed for {symbol}: {exc}")
+                continue
+            if df is not None and len(df) >= MIN_TRADING_DAYS:
+                circuit.record_success()
+                DATA_SOURCE_USAGE["ohlcv"][label] += 1
+                df.attrs["source"] = label
+                return df, label
+            if df is not None and len(df) > 0:
+                circuit.record_success()
+                continue
+            if label != "Yahoo":
+                circuit.record_failure(f"{symbol}: empty history")
+        return None, ""
+
+    def _history_mboum(self, symbol: str) -> Optional[pd.DataFrame]:
+        return self.mboum.get_history(symbol) if self.mboum else None
+
+    def _history_massive(self, symbol: str) -> Optional[pd.DataFrame]:
+        circuit = ProviderCircuit.get("Massive-OHLCV", fail_limit=10)
+        start, end = _history_window()
+        url = (
+            f"{MASSIVE_BASE_URL}/aggs/ticker/{symbol}/range/1/day/"
+            f"{start.isoformat()}/{end.isoformat()}"
+        )
+        params = {
+            "adjusted": "true",
+            "sort": "asc",
+            "limit": 50000,
+            "apiKey": MASSIVE_API_KEY,
+        }
+        resp = None
+        for attempt in range(3):
+            resp = self.session.get(url, params=params, timeout=20)
+            kind = classify_http_error(resp.status_code, resp.text or "")
+            if kind == "rate":
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if kind in ("credit", "auth"):
+                circuit.trip(f"Massive aggs HTTP {resp.status_code}")
+                raise ProviderExhausted("Massive", f"HTTP {resp.status_code}")
+            break
+        if resp is None or resp.status_code != 200:
+            return None
+        payload = resp.json() or {}
+        results = payload.get("results") or []
+        if not isinstance(results, list) or not results:
+            return None
+        rows = []
+        for bar in results:
+            ts = bar.get("t")
+            if ts is None:
+                continue
+            rows.append({
+                "Date": pd.to_datetime(ts, unit="ms", utc=True),
+                "Open": bar.get("o"),
+                "High": bar.get("h"),
+                "Low": bar.get("l"),
+                "Close": bar.get("c"),
+                "Volume": bar.get("v"),
+            })
+        if not rows:
+            return None
+        return _normalize_ohlcv_frame(pd.DataFrame(rows).set_index("Date"))
+
+    def _history_twelvedata(self, symbol: str) -> Optional[pd.DataFrame]:
+        circuit = ProviderCircuit.get("TwelveData-OHLCV", fail_limit=8)
+        start, end = _history_window()
+        params = {
+            "symbol": symbol,
+            "interval": "1day",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "outputsize": 5000,
+            "order": "asc",
+            "adjust": "all",
+            "apikey": TWELVEDATA_API_KEY,
+        }
+        resp = None
+        for attempt in range(3):
+            resp = self.session.get(
+                f"{TWELVEDATA_BASE_URL}/time_series", params=params, timeout=20
+            )
+            body_text = resp.text or ""
+            payload = {}
+            try:
+                payload = resp.json() if body_text else {}
+            except Exception:
+                payload = {}
+            msg = str(payload.get("message") or "")
+            code = payload.get("code") if isinstance(payload.get("code"), int) else resp.status_code
+            kind = classify_http_error(code, msg or body_text)
+            if payload.get("status") == "error" or kind != "other":
+                if kind == "rate":
+                    time.sleep(8 * (attempt + 1))
+                    continue
+                if kind in ("credit", "auth"):
+                    circuit.trip(msg or f"TwelveData HTTP {code}")
+                    raise ProviderExhausted("TwelveData", msg or str(code))
+                if payload.get("status") == "error":
+                    return None
+            if resp.status_code == 200:
+                break
+        if resp is None or resp.status_code != 200:
+            return None
+        payload = resp.json() or {}
+        values = payload.get("values") or []
+        if not isinstance(values, list) or not values:
+            return None
+        rows = []
+        for bar in values:
+            if not isinstance(bar, dict):
+                continue
+            rows.append({
+                "Date": bar.get("datetime"),
+                "Open": bar.get("open"),
+                "High": bar.get("high"),
+                "Low": bar.get("low"),
+                "Close": bar.get("close"),
+                "Volume": bar.get("volume"),
+            })
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        df["Date"] = pd.to_datetime(df["Date"])
+        return _normalize_ohlcv_frame(df.set_index("Date"))
+
+    def _history_finnhub(self, symbol: str) -> Optional[pd.DataFrame]:
+        circuit = ProviderCircuit.get("Finnhub-OHLCV", fail_limit=3)
+        start, end = _history_window()
+        start_ts = int(datetime.combine(start, dtime.min, tzinfo=ET_TZ).timestamp())
+        end_ts = int(datetime.combine(end, dtime(23, 59), tzinfo=ET_TZ).timestamp())
+        params = {
+            "symbol": symbol,
+            "resolution": "D",
+            "from": start_ts,
+            "to": end_ts,
+            "token": FINNHUB_API_KEY,
+        }
+        resp = self.session.get(f"{FINNHUB_BASE_URL}/stock/candle", params=params, timeout=20)
+        kind = classify_http_error(resp.status_code, resp.text or "")
+        if kind == "rate":
+            time.sleep(2)
+            resp = self.session.get(f"{FINNHUB_BASE_URL}/stock/candle", params=params, timeout=20)
+            kind = classify_http_error(resp.status_code, resp.text or "")
+        if kind in ("credit", "auth") or resp.status_code in (401, 403):
+            circuit.trip(f"Finnhub candles HTTP {resp.status_code}")
+            raise ProviderExhausted("Finnhub", f"HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            return None
+        payload = resp.json() or {}
+        if payload.get("s") != "ok":
+            return None
+        closes = payload.get("c") or []
+        times = payload.get("t") or []
+        if len(closes) < 50 or not times:
+            return None
+        rows = []
+        for i, epoch in enumerate(times):
+            rows.append({
+                "Date": pd.to_datetime(epoch, unit="s", utc=True),
+                "Open": (payload.get("o") or [None])[i] if i < len(payload.get("o") or []) else None,
+                "High": (payload.get("h") or [None])[i] if i < len(payload.get("h") or []) else None,
+                "Low": (payload.get("l") or [None])[i] if i < len(payload.get("l") or []) else None,
+                "Close": closes[i] if i < len(closes) else None,
+                "Volume": (payload.get("v") or [None])[i] if i < len(payload.get("v") or []) else None,
+            })
+        if not rows:
+            return None
+        return _normalize_ohlcv_frame(pd.DataFrame(rows).set_index("Date"))
+
+    def _history_yahoo(self, symbol: str) -> Optional[pd.DataFrame]:
+        return self.yahoo.get_history(symbol, range_="5y")
+
+    def yfinance_batch(self, tickers: List[str]) -> Dict[str, pd.DataFrame]:
+        """Last-resort public batch download via yfinance."""
+        loaded: Dict[str, pd.DataFrame] = {}
+        if not tickers:
+            return loaded
+        log.info(f"  yfinance last-resort batch for {len(tickers)} remaining tickers")
+        for i in range(0, len(tickers), BATCH_SIZE):
+            batch = tickers[i:i + BATCH_SIZE]
+            raw = None
+            try:
+                raw = yf.download(
+                    batch,
+                    period="5y",
+                    interval="1d",
+                    auto_adjust=True,
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                )
+            except Exception as exc:
+                log.debug(f"  yfinance batch failed: {exc}")
+            for ticker in batch:
+                df = _frame_from_yfinance(raw, ticker) if raw is not None else None
+                if df is None:
+                    df = self._history_yfinance_one(ticker)
+                if df is not None and len(df) >= MIN_TRADING_DAYS:
+                    DATA_SOURCE_USAGE["ohlcv"]["yfinance"] += 1
+                    df.attrs["source"] = "yfinance"
+                    loaded[ticker] = df
+        return loaded
+
+    def _history_yfinance_one(self, symbol: str) -> Optional[pd.DataFrame]:
+        try:
+            raw = yf.download(
+                symbol,
+                period="5y",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            return _frame_from_yfinance(raw, symbol)
+        except Exception:
+            return None
+
+
+def _frame_from_yfinance(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+    if raw is None or getattr(raw, "empty", True):
+        return None
+    df = raw
+    if isinstance(df.columns, pd.MultiIndex):
+        level0 = set(df.columns.get_level_values(0))
+        if ticker in level0:
+            df = df[ticker]
+        elif "Close" in level0:
+            df = df.copy()
+            df.columns = df.columns.get_level_values(0)
+        else:
+            return None
+    df = df.rename(columns={c: str(c).title() for c in df.columns})
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df["Close"] = df["Adj Close"]
+    return _normalize_ohlcv_frame(df)
+
+
+_MARKET_ROUTER: Optional[MarketDataRouter] = None
+_MARKET_ROUTER_LOCK = threading.Lock()
+
+
+def get_market_router() -> MarketDataRouter:
+    global _MARKET_ROUTER
+    with _MARKET_ROUTER_LOCK:
+        if _MARKET_ROUTER is None:
+            _MARKET_ROUTER = MarketDataRouter()
+        return _MARKET_ROUTER
+
+
+def reset_market_router() -> None:
+    global _MARKET_ROUTER
+    with _MARKET_ROUTER_LOCK:
+        _MARKET_ROUTER = None
+    ProviderCircuit.reset_all()
+    reset_data_source_usage()
+
 
 class DataFetcher:
     """
     Two-phase data fetcher:
       Phase 1: Yahoo Direct API quick 3-month screen (fast, free, parallel)
-      Phase 2: MBOUM Pro full history download (reliable, 5yr bars)
+      Phase 2: MBOUM Pro full history, then Massive / TwelveData / Finnhub /
+               Yahoo / yfinance if MBOUM is out of credits.
     """
 
     def __init__(self, lookback_days: int = LOOKBACK_DAYS):
         self.lookback_days = lookback_days
         self.yahoo = YahooDirectAPI()
-        self.mboum = MboumAPI()
+        self.router = get_market_router()
 
     def fetch_ohlcv(self, tickers: List[str]) -> Dict[str, pd.DataFrame]:
         """
         Two-phase download:
           1. Yahoo Direct quick 3mo screen (parallel, fast)
-          2. MBOUM full history for promising tickers (reliable, 5yr bars)
+          2. Full 5y OHLCV with MBOUM primary and live fallbacks
         """
         log.info(f"PHASE 1: Quick 3-month pre-screen for {len(tickers)} tickers")
         promising = self._quick_screen(tickers)
@@ -1117,8 +1779,8 @@ class DataFetcher:
             raise PipelineError("No tickers passed quick screen. Pipeline STOPPED.")
 
         log.info(
-            f"PHASE 2: Full OHLCV download via MBOUM Pro "
-            f"for {len(promising)} tickers"
+            f"PHASE 2: Full OHLCV download for {len(promising)} tickers "
+            "(MBOUM primary; Massive/TwelveData/Finnhub/Yahoo fallbacks)"
         )
         all_data = self._full_download(promising)
         return all_data
@@ -1174,15 +1836,16 @@ class DataFetcher:
         return promising
 
     def _full_download(self, tickers: List[str]) -> Dict[str, pd.DataFrame]:
-        """Download full history via MBOUM Pro for the promising tickers."""
+        """Download full history with MBOUM primary and live provider fallbacks."""
         all_data: Dict[str, pd.DataFrame] = {}
         failed = 0
+        missing: List[str] = []
 
-        def _download_one(ticker: str) -> Tuple[str, Optional[pd.DataFrame]]:
-            df = self.mboum.get_history(ticker)
+        def _download_one(ticker: str) -> Tuple[str, Optional[pd.DataFrame], str]:
+            df, source = self.router.get_history(ticker)
             if df is not None and len(df) >= MIN_TRADING_DAYS:
-                return ticker, df
-            return ticker, None
+                return ticker, df, source
+            return ticker, None, source
 
         with ThreadPoolExecutor(max_workers=12) as executor:
             futures = {
@@ -1192,27 +1855,45 @@ class DataFetcher:
             completed = 0
             for future in as_completed(futures):
                 completed += 1
+                ticker = futures[future]
                 try:
-                    ticker, df = future.result()
+                    ticker, df, _source = future.result()
                 except Exception as e:
-                    log.debug(f"  MBOUM history failed for {futures[future]}: {e}")
+                    log.debug(f"  OHLCV history failed for {ticker}: {e}")
                     failed += 1
+                    missing.append(ticker)
                     continue
                 if df is not None:
                     all_data[ticker] = df
                 else:
                     failed += 1
+                    missing.append(ticker)
 
                 if completed % 100 == 0 or completed == len(tickers):
+                    sources = ", ".join(
+                        f"{name}={count}"
+                        for name, count in DATA_SOURCE_USAGE["ohlcv"].most_common()
+                    ) or "none yet"
                     log.info(
-                        f"  MBOUM download: {completed}/{len(tickers)} done, "
-                        f"{len(all_data)} loaded, {failed} failed"
+                        f"  OHLCV download: {completed}/{len(tickers)} done, "
+                        f"{len(all_data)} loaded, {failed} pending/failed "
+                        f"[{sources}]"
                     )
 
+        if missing:
+            recovered = self.router.yfinance_batch(missing)
+            for ticker, df in recovered.items():
+                all_data[ticker] = df
+            failed = max(0, len(tickers) - len(all_data))
+
+        sources = ", ".join(
+            f"{name}={count}"
+            for name, count in DATA_SOURCE_USAGE["ohlcv"].most_common()
+        ) or "none"
         log.info(
             f"Full OHLCV fetch complete: {len(all_data)} tickers with "
             f">= {MIN_TRADING_DAYS} trading days. "
-            f"{failed} excluded (insufficient history)."
+            f"{failed} excluded (insufficient history). Sources: {sources}"
         )
 
         # CRITICAL FIX: drop intraday partial-bars when market is currently
@@ -2814,16 +3495,24 @@ class FundamentalsFetcher:
 
     def fetch_batch(self, tickers: List[str]) -> Dict[str, Dict]:
         """Fetch fundamentals for a list of tickers. Returns dict of info dicts."""
-        log.info(f"Fetching fundamentals for {len(tickers)} survivors via MBOUM...")
+        log.info(
+            f"Fetching fundamentals for {len(tickers)} survivors "
+            "(MBOUM primary; Massive/TwelveData/Finnhub/Yahoo fallbacks)"
+        )
         results = {}
 
         def _fetch_one(ticker: str) -> Tuple[str, Dict]:
             info = {"name": ticker, "sector": "Unknown"}
             try:
-                modules = self.mboum.get_modules(
-                    ticker,
-                    list(self.CORE_MODULES) + list(self.INSIDER_MODULES),
-                )
+                modules = {}
+                try:
+                    if MBOUM_API_KEY and ProviderCircuit.get("MBOUM-fundamentals").available():
+                        modules = self.mboum.get_modules(
+                            ticker,
+                            list(self.CORE_MODULES) + list(self.INSIDER_MODULES),
+                        )
+                except ProviderExhausted:
+                    modules = {}
 
                 fin = modules.get("financial-data", {})
                 stats = modules.get("default-key-statistics", {})
@@ -2946,6 +3635,8 @@ class FundamentalsFetcher:
                 else:
                     info["earnings_date"] = str(info["earnings_date"])
 
+                info = self._enrich_fundamentals(ticker, info)
+
             except Exception as e:
                 info = {
                     "name": ticker,
@@ -2957,6 +3648,10 @@ class FundamentalsFetcher:
                     ],
                     "error": str(e),
                 }
+                try:
+                    info = self._enrich_fundamentals(ticker, info)
+                except Exception:
+                    pass
 
             return ticker, info
 
@@ -2982,8 +3677,366 @@ class FundamentalsFetcher:
             if not is_missing_value(info.get("insider_net_purchase_pct"))
             or not is_missing_value(info.get("insider_buy_transactions"))
         )
+        sources = ", ".join(
+            f"{name}={count}"
+            for name, count in DATA_SOURCE_USAGE["fundamentals"].most_common()
+        ) or "none"
         log.info(f"  Live insider activity available for {with_insider} tickers")
+        log.info(f"  Fundamentals sources: {sources}")
         return results
+
+    def _needs_fundamental_enrichment(self, info: Dict) -> bool:
+        if info.get("fundamentals_quality") in {"failed", "partial"}:
+            return True
+        if not isinstance(info.get("sector"), str) or info.get("sector") in {"", "Unknown"}:
+            return True
+        if is_missing_value(info.get("market_cap")):
+            return True
+        return False
+
+    def _fill_missing_fundamentals(self, dst: Dict, src: Dict) -> Dict:
+        for key, value in src.items():
+            if key in {
+                "fundamentals_quality", "missing_fundamental_modules",
+                "fundamentals_sources", "error",
+            }:
+                continue
+            current = dst.get(key)
+            if key in {"name", "sector", "industry"}:
+                if not isinstance(current, str) or current in {"", "Unknown"} or is_missing_value(current):
+                    if isinstance(value, str) and value and value != "Unknown":
+                        dst[key] = value
+                continue
+            if is_missing_value(current) and not is_missing_value(value):
+                dst[key] = value
+        return dst
+
+    def _enrich_fundamentals(self, ticker: str, info: Dict) -> Dict:
+        """Fill missing MBOUM fields from Massive / TwelveData / Finnhub / yfinance."""
+        sources = list(info.get("fundamentals_sources") or [])
+        mboum_complete = (
+            info.get("fundamentals_quality") == "complete"
+            and not self._needs_fundamental_enrichment(info)
+        )
+        if mboum_complete:
+            DATA_SOURCE_USAGE["fundamentals"]["MBOUM"] += 1
+            info["fundamentals_sources"] = ["MBOUM"]
+            return info
+        if MBOUM_API_KEY and info.get("fundamentals_quality") in {"complete", "partial"}:
+            sources.append("MBOUM")
+            DATA_SOURCE_USAGE["fundamentals"]["MBOUM"] += 1
+
+        enrichers = (
+            ("Massive", self._fundamentals_massive),
+            ("TwelveData", self._fundamentals_twelvedata),
+            ("Finnhub", self._fundamentals_finnhub),
+            ("yfinance", self._fundamentals_yfinance),
+        )
+        for label, fn in enrichers:
+            if not self._needs_fundamental_enrichment(info) and not is_missing_value(
+                info.get("insider_buy_transactions")
+            ):
+                break
+            try:
+                extra = fn(ticker)
+            except ProviderExhausted:
+                continue
+            except Exception as exc:
+                log.debug(f"  {label} fundamentals failed for {ticker}: {exc}")
+                continue
+            if not extra:
+                continue
+            filled = False
+            before_keys = {k: dst for k, dst in info.items() if k not in {"missing_fundamental_modules"}}
+            info = self._fill_missing_fundamentals(info, extra)
+            for key, value in extra.items():
+                if key in info and not is_missing_value(info.get(key)) and (
+                    key not in before_keys or is_missing_value(before_keys.get(key))
+                ):
+                    filled = True
+                    break
+            if filled or extra.get("insider_buy_transactions") is not None:
+                sources.append(label)
+                DATA_SOURCE_USAGE["fundamentals"][label] += 1
+
+        if sources:
+            info["fundamentals_sources"] = sources
+        if not self._needs_fundamental_enrichment(info):
+            info["fundamentals_quality"] = "complete"
+            info["missing_fundamental_modules"] = []
+        elif info.get("fundamentals_quality") == "failed" and sources:
+            info["fundamentals_quality"] = "partial"
+        return info
+
+    def _fundamentals_massive(self, ticker: str) -> Dict:
+        if not MASSIVE_API_KEY:
+            return {}
+        url = f"https://api.massive.com/v3/reference/tickers/{ticker}"
+        r = self.massive_session.get(url, params={"apiKey": MASSIVE_API_KEY}, timeout=15)
+        kind = classify_http_error(r.status_code, r.text or "")
+        if kind in ("credit", "auth"):
+            ProviderCircuit.get("Massive-fundamentals").trip(f"HTTP {r.status_code}")
+            raise ProviderExhausted("Massive", f"HTTP {r.status_code}")
+        if r.status_code != 200:
+            return {}
+        results = (r.json() or {}).get("results") or {}
+        if not isinstance(results, dict):
+            return {}
+        return {
+            "name": results.get("name") or ticker,
+            "industry": results.get("sic_description") or "Unknown",
+            "market_cap": normalize_api_scalar(results.get("market_cap")),
+            "shares_outstanding": normalize_api_scalar(
+                results.get("share_class_shares_outstanding")
+                or results.get("weighted_shares_outstanding")
+            ),
+        }
+
+    def _fundamentals_twelvedata(self, ticker: str) -> Dict:
+        circuit = ProviderCircuit.get("TwelveData-fundamentals", fail_limit=4)
+        if not TWELVEDATA_API_KEY or not circuit.available():
+            return {}
+        session = get_market_router().session
+        out: Dict[str, Any] = {}
+        try:
+            prof = session.get(
+                f"{TWELVEDATA_BASE_URL}/profile",
+                params={"symbol": ticker, "apikey": TWELVEDATA_API_KEY},
+                timeout=15,
+            )
+            payload = prof.json() if prof.status_code == 200 else {}
+            if payload.get("status") == "error":
+                kind = classify_http_error(
+                    payload.get("code") or prof.status_code,
+                    str(payload.get("message") or ""),
+                )
+                if kind in ("credit", "auth"):
+                    circuit.trip(str(payload.get("message") or ""))
+                    raise ProviderExhausted("TwelveData", str(payload.get("message") or ""))
+            else:
+                out["name"] = payload.get("name") or ticker
+                out["sector"] = payload.get("sector") or "Unknown"
+                out["industry"] = payload.get("industry") or "Unknown"
+
+            stats_resp = session.get(
+                f"{TWELVEDATA_BASE_URL}/statistics",
+                params={"symbol": ticker, "apikey": TWELVEDATA_API_KEY},
+                timeout=15,
+            )
+            stats_payload = stats_resp.json() if stats_resp.status_code == 200 else {}
+            if stats_payload.get("status") == "error":
+                kind = classify_http_error(
+                    stats_payload.get("code") or stats_resp.status_code,
+                    str(stats_payload.get("message") or ""),
+                )
+                if kind in ("credit", "auth"):
+                    circuit.trip(str(stats_payload.get("message") or ""))
+                    raise ProviderExhausted("TwelveData", str(stats_payload.get("message") or ""))
+            statistics = stats_payload.get("statistics") or {}
+            val = statistics.get("valuations_metrics") or {}
+            fin = statistics.get("financials") or {}
+            stock = statistics.get("stock_statistics") or {}
+            px = statistics.get("stock_price_summary") or {}
+            inc = fin.get("income_statement") if isinstance(fin.get("income_statement"), dict) else {}
+            cf = fin.get("cash_flow") if isinstance(fin.get("cash_flow"), dict) else {}
+            bs = fin.get("balance_sheet") if isinstance(fin.get("balance_sheet"), dict) else {}
+            out.update({
+                "market_cap": normalize_api_scalar(val.get("market_capitalization")),
+                "pe_ratio": normalize_api_scalar(val.get("trailing_pe")),
+                "forward_pe": normalize_api_scalar(val.get("forward_pe")),
+                "peg_ratio": normalize_api_scalar(val.get("peg_ratio")),
+                "profit_margin": normalize_api_scalar(fin.get("profit_margin")),
+                "return_on_equity": normalize_api_scalar(fin.get("return_on_equity_ttm")),
+                "revenue_growth": normalize_api_scalar(
+                    inc.get("quarterly_revenue_growth") or inc.get("revenue_growth")
+                ),
+                "earnings_growth": normalize_api_scalar(
+                    inc.get("quarterly_earnings_growth") or inc.get("earnings_growth")
+                ),
+                "free_cash_flow": normalize_api_scalar(
+                    cf.get("free_cash_flow") or cf.get("levered_free_cash_flow")
+                ),
+                "debt_to_equity": normalize_api_scalar(bs.get("debt_to_equity")),
+                "shares_outstanding": normalize_api_scalar(stock.get("shares_outstanding")),
+                "shares_float": normalize_api_scalar(stock.get("float_shares")),
+                "avg_volume": normalize_api_scalar(
+                    stock.get("avg_90_volume") or stock.get("avg_10_volume")
+                ),
+                "short_ratio": normalize_api_scalar(stock.get("short_ratio")),
+                "short_pct_float": normalize_api_scalar(
+                    stock.get("short_percent_of_shares_outstanding")
+                ),
+                "inst_ownership_pct": normalize_api_scalar(
+                    stock.get("percent_held_by_institutions")
+                ),
+                "52w_high": normalize_api_scalar(px.get("fifty_two_week_high")),
+                "52w_low": normalize_api_scalar(px.get("fifty_two_week_low")),
+                "beta": normalize_api_scalar(px.get("beta")),
+            })
+            if out:
+                circuit.record_success()
+        except ProviderExhausted:
+            raise
+        except Exception:
+            circuit.record_failure(f"statistics {ticker}")
+        return out
+
+    def _fundamentals_finnhub(self, ticker: str) -> Dict:
+        circuit = ProviderCircuit.get("Finnhub-fundamentals", fail_limit=4)
+        if not FINNHUB_API_KEY or not circuit.available():
+            return {}
+        session = get_market_router().session
+        out: Dict[str, Any] = {}
+
+        def _get(path: str, extra: Optional[Dict] = None) -> Dict:
+            params = {"symbol": ticker, "token": FINNHUB_API_KEY}
+            if extra:
+                params.update(extra)
+            resp = session.get(f"{FINNHUB_BASE_URL}{path}", params=params, timeout=15)
+            kind = classify_http_error(resp.status_code, resp.text or "")
+            if kind in ("credit", "auth"):
+                circuit.trip(f"{path} HTTP {resp.status_code}")
+                raise ProviderExhausted("Finnhub", f"HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                return {}
+            payload = resp.json()
+            return payload if isinstance(payload, dict) else {}
+
+        def _pct(val):
+            num = normalize_api_scalar(val)
+            if is_missing_value(num):
+                return num
+            try:
+                num = float(num)
+            except (TypeError, ValueError):
+                return num
+            if abs(num) > 1.5:
+                return num / 100.0
+            return num
+
+        profile = _get("/stock/profile2")
+        if profile:
+            mc = normalize_api_scalar(profile.get("marketCapitalization"))
+            if not is_missing_value(mc):
+                mc = float(mc) * 1_000_000.0
+            shares = normalize_api_scalar(profile.get("shareOutstanding"))
+            if not is_missing_value(shares):
+                shares = float(shares) * 1_000_000.0
+            out.update({
+                "name": profile.get("name") or ticker,
+                "sector": profile.get("finnhubIndustry") or "Unknown",
+                "market_cap": mc,
+                "shares_outstanding": shares,
+            })
+
+        metric_payload = _get("/stock/metric", {"metric": "all"})
+        metric = metric_payload.get("metric") or {}
+        if metric:
+            out.update({
+                "pe_ratio": normalize_api_scalar(metric.get("peTTM") or metric.get("peNormalizedAnnual")),
+                "forward_pe": normalize_api_scalar(metric.get("forwardPE")),
+                "peg_ratio": normalize_api_scalar(metric.get("pegRatio")),
+                "beta": normalize_api_scalar(metric.get("beta")),
+                "52w_high": normalize_api_scalar(metric.get("52WeekHigh")),
+                "52w_low": normalize_api_scalar(metric.get("52WeekLow")),
+                "profit_margin": _pct(metric.get("netProfitMarginTTM")),
+                "revenue_growth": _pct(metric.get("revenueGrowthTTMYoy")),
+                "earnings_growth": _pct(metric.get("epsGrowthTTMYoy")),
+                "return_on_equity": _pct(metric.get("roeTTM")),
+                "free_cash_flow": normalize_api_scalar(
+                    metric.get("freeCashFlowTTM") or metric.get("freeCashFlowAnnual")
+                ),
+                "short_pct_float": _pct(
+                    metric.get("shortInterestPercentFloat") or metric.get("shortPercentOutstanding")
+                ),
+                "short_ratio": normalize_api_scalar(metric.get("shortRatio")),
+            })
+
+        insider = _get("/stock/insider-transactions")
+        rows = insider.get("data") if isinstance(insider, dict) else None
+        if isinstance(rows, list) and rows:
+            buys = sells = 0
+            net_shares = 0.0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("transactionCode") or "").upper()
+                change = normalize_api_scalar(row.get("change"))
+                if code == "P":
+                    buys += 1
+                    if not is_missing_value(change):
+                        net_shares += float(change)
+                elif code == "S":
+                    sells += 1
+                    if not is_missing_value(change):
+                        net_shares += float(change)
+            if buys or sells:
+                out["insider_buy_transactions"] = float(buys)
+                out["insider_sell_transactions"] = float(sells)
+                out["insider_net_shares"] = net_shares
+        if out:
+            circuit.record_success()
+        return out
+
+    def _fundamentals_yfinance(self, ticker: str) -> Dict:
+        try:
+            tk = yf.Ticker(ticker)
+            raw = tk.info or {}
+        except Exception:
+            return {}
+        if not isinstance(raw, dict) or not raw:
+            return {}
+        out = {
+            "name": raw.get("longName") or raw.get("shortName") or ticker,
+            "sector": raw.get("sector") or "Unknown",
+            "industry": raw.get("industry") or "Unknown",
+            "market_cap": normalize_api_scalar(raw.get("marketCap")),
+            "pe_ratio": normalize_api_scalar(raw.get("trailingPE")),
+            "forward_pe": normalize_api_scalar(raw.get("forwardPE")),
+            "peg_ratio": normalize_api_scalar(raw.get("pegRatio")),
+            "beta": normalize_api_scalar(raw.get("beta")),
+            "profit_margin": normalize_api_scalar(raw.get("profitMargins")),
+            "revenue_growth": normalize_api_scalar(raw.get("revenueGrowth")),
+            "earnings_growth": normalize_api_scalar(raw.get("earningsGrowth")),
+            "debt_to_equity": normalize_api_scalar(raw.get("debtToEquity")),
+            "free_cash_flow": normalize_api_scalar(raw.get("freeCashflow")),
+            "return_on_equity": normalize_api_scalar(raw.get("returnOnEquity")),
+            "52w_high": normalize_api_scalar(raw.get("fiftyTwoWeekHigh")),
+            "52w_low": normalize_api_scalar(raw.get("fiftyTwoWeekLow")),
+            "avg_volume": normalize_api_scalar(raw.get("averageVolume")),
+            "shares_float": normalize_api_scalar(raw.get("floatShares")),
+            "shares_outstanding": normalize_api_scalar(raw.get("sharesOutstanding")),
+            "inst_ownership_pct": normalize_api_scalar(raw.get("heldPercentInstitutions")),
+            "analyst_count": normalize_api_scalar(raw.get("numberOfAnalystOpinions")),
+            "target_price": normalize_api_scalar(raw.get("targetMeanPrice")),
+            "short_pct_float": normalize_api_scalar(raw.get("shortPercentOfFloat")),
+            "short_ratio": normalize_api_scalar(raw.get("shortRatio")),
+        }
+        try:
+            cal = tk.calendar
+            if isinstance(cal, dict):
+                ed = cal.get("Earnings Date") or cal.get("earningsDate")
+                if ed is not None:
+                    out["earnings_date"] = str(ed)
+        except Exception:
+            pass
+        try:
+            txns = tk.insider_transactions
+            if txns is not None and len(txns) > 0:
+                text_col = "Text" if "Text" in txns.columns else None
+                buys = sells = 0
+                if text_col:
+                    for text in txns[text_col].astype(str).str.lower():
+                        if "purchase" in text or "buy" in text:
+                            buys += 1
+                        elif "sale" in text or "sold" in text:
+                            sells += 1
+                if buys or sells:
+                    out["insider_buy_transactions"] = float(buys)
+                    out["insider_sell_transactions"] = float(sells)
+        except Exception:
+            pass
+        return out
 
     @staticmethod
     def _extract_insider_activity(modules: Dict) -> Dict:
@@ -3086,15 +4139,17 @@ class InvestorPanel:
         return float((self._rs_universe_returns < ret_63d).mean() * 100.0)
 
     def load_benchmark(self):
-        """Load SPY data for relative strength calculations via MBOUM."""
+        """Load SPY data for relative strength via MBOUM first, then fallbacks."""
         try:
-            mboum = MboumAPI()
-            spy = mboum.get_history("SPY")
+            spy, source = get_market_router().get_history("SPY")
             if spy is not None and len(spy) > 100:
                 self.spy_data = spy
-                log.info(f"  SPY benchmark loaded ({len(spy)} bars) for relative strength")
+                log.info(
+                    f"  SPY benchmark loaded ({len(spy)} bars via {source or 'fallback'}) "
+                    "for relative strength"
+                )
             else:
-                log.warning("  Could not load SPY benchmark from MBOUM")
+                log.warning("  Could not load SPY benchmark from live providers")
         except Exception as e:
             log.warning(f"  Could not load SPY benchmark: {e}")
 
@@ -3825,19 +4880,28 @@ class OptionsEvaluator:
         }
 
         try:
-            # Source priority: MBOUM (paid plan, fast, full chain w/ IV) ->
-            # Massive (snapshot tier) -> Yahoo (free, quotes only).
-            chain_data = OptionsEvaluator._fetch_chain_mboum(ticker, current_price)
-            option_source = "MBOUM"
+            # Source priority: MBOUM (primary when credits remain) ->
+            # Massive -> Yahoo (free, quotes only).
+            chain_data = []
+            option_source = None
+            if MBOUM_OPTIONS_KEY and ProviderCircuit.get("MBOUM-options").available():
+                try:
+                    chain_data = OptionsEvaluator._fetch_chain_mboum(ticker, current_price)
+                    if chain_data:
+                        option_source = "MBOUM"
+                except ProviderExhausted:
+                    chain_data = []
             if not chain_data:
                 chain_data = OptionsEvaluator._fetch_chain_massive(ticker)
-                option_source = "Massive"
+                option_source = "Massive" if chain_data else option_source
             if not chain_data:
                 chain_data = OptionsEvaluator._fetch_chain_yahoo(ticker)
-                option_source = "Yahoo"
+                option_source = "Yahoo" if chain_data else option_source
 
             if not chain_data:
                 return result
+            if option_source:
+                DATA_SOURCE_USAGE["options"][option_source] += 1
 
             profile = OptionsEvaluator._target_profile(candidate)
             today = today_et()
@@ -4077,6 +5141,8 @@ class OptionsEvaluator:
                     })
 
             return contracts
+        except ProviderExhausted:
+            raise
         except Exception:
             return []
 
@@ -4697,12 +5763,18 @@ class OutputFormatter:
                 ],
             },
             "attestation": (
-                "This scan used live data only: Massive (universe discovery + "
-                "options chains + live snapshot), MBOUM Pro (5yr OHLCV + "
-                "fundamentals), Yahoo v8 (macro snapshot, options fallback). "
-                "No hardcoded tickers, no presets, no fabricated values, no "
-                "demo data. Intraday partial bars are trimmed during RTH."
+                "This scan used live data only. MBOUM Pro is the primary "
+                "OHLCV/fundamentals/options source when credits remain. On "
+                "credit or quota failure the engine falls back to Massive, "
+                "TwelveData, Finnhub, then Yahoo v8 / yfinance. No hardcoded "
+                "tickers, no presets, no fabricated values, no demo data. "
+                "Intraday partial bars are trimmed during RTH."
             ),
+            "data_sources": {
+                "ohlcv": dict(DATA_SOURCE_USAGE["ohlcv"]),
+                "fundamentals": dict(DATA_SOURCE_USAGE["fundamentals"]),
+                "options": dict(DATA_SOURCE_USAGE["options"]),
+            },
             "macro_regime": macro.to_dict() if macro is not None else None,
             "stage_counts": stage_counts,
             "ml_hyperparameters": ml_params,
@@ -4997,6 +6069,7 @@ def main():
     near_misses: List[Dict] = []
 
     try:
+        reset_market_router()
         verify_api_credentials()
 
         # ── STAGE 0: Macro Regime Snapshot ───────────────────────────
@@ -5012,7 +6085,7 @@ def main():
         tickers = discovery.discover()
         stage_counts["Stage 1: Universe Discovered"] = len(tickers)
 
-        # ── DATA FETCH: OHLCV via yfinance ───────────────────────────
+        # ── DATA FETCH: OHLCV via MBOUM primary + live fallbacks ──────
         clock.check("Data Fetch")
         fetcher = DataFetcher()
         all_data = fetcher.fetch_ohlcv(tickers)
