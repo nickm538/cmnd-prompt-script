@@ -35,6 +35,13 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+      ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+      MBOUM_API_KEY: ${{ secrets.MBOUM_API_KEY }}
+      MBOUM_OPTIONS_KEY: ${{ secrets.MBOUM_OPTIONS_KEY }}
+      TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+      FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 
     steps:
       - name: Confirm scheduled ET scan window
@@ -102,23 +109,33 @@ jobs:
       - name: Verify API credentials
         if: steps.schedule_window.outputs.run_scan == 'true'
         shell: bash
-        env:
-          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
-          MBOUM_API_KEY: ${{ secrets.MBOUM_API_KEY }}
-          MBOUM_OPTIONS_KEY: ${{ secrets.MBOUM_OPTIONS_KEY }}
-          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: |
-          # Fail in seconds with an actionable message instead of burning the
-          # whole job on requests that are all going to be rejected.
+          # Report presence only -- never echo secret values. Keys must live
+          # under Settings → Secrets and variables → Actions (repository
+          # secrets). Named Environments are not used by this job.
+          report() {
+            local name="$1"
+            local value="$2"
+            if [[ -n "$value" ]]; then
+              echo "$name: present"
+            else
+              echo "$name: empty"
+            fi
+          }
+          echo "Repository secrets visible to this job:"
+          report MASSIVE_API_KEY "$MASSIVE_API_KEY"
+          report MBOUM_API_KEY "$MBOUM_API_KEY"
+          report MBOUM_OPTIONS_KEY "$MBOUM_OPTIONS_KEY"
+          report TWELVEDATA_API_KEY "$TWELVEDATA_API_KEY"
+          report FINNHUB_API_KEY "$FINNHUB_API_KEY"
           if [[ -z "$MASSIVE_API_KEY" ]]; then
             echo "::notice::MASSIVE_API_KEY secret is empty; the engine will use its committed fallback key."
           fi
           if [[ -z "$MBOUM_API_KEY" ]]; then
-            echo "::warning::MBOUM_API_KEY is not set; OHLCV/fundamentals will fall back to Massive/TwelveData/Finnhub/Yahoo. MBOUM remains primary when the key and credits are available."
+            echo "::warning::MBOUM_API_KEY repository secret is empty in this job. Put it in Settings → Secrets and variables → Actions as MBOUM_API_KEY (not a Variable, and not an Environment secret unless the job sets environment:)."
           fi
           if [[ -z "$MBOUM_OPTIONS_KEY" ]]; then
-            echo "::warning::MBOUM_OPTIONS_KEY is not set; options chains will fall back to Massive/Yahoo."
+            echo "::warning::MBOUM_OPTIONS_KEY repository secret is empty in this job; options chains will fall back to Massive/Yahoo."
           fi
           if [[ -z "$TWELVEDATA_API_KEY" ]]; then
             echo "::notice::TWELVEDATA_API_KEY secret is empty; the engine will use its committed fallback key."
@@ -126,23 +143,17 @@ jobs:
           if [[ -z "$FINNHUB_API_KEY" ]]; then
             echo "::notice::FINNHUB_API_KEY secret is empty; the engine will use its committed fallback key."
           fi
-          echo "Credential check complete. MBOUM is primary when credits remain."
+          echo "Credential check complete. MBOUM is primary when the key and credits are present."
 
       - name: Run scanner regression tests
         if: >-
           steps.schedule_window.outputs.run_scan == 'true' &&
           (github.event_name != 'workflow_dispatch' || inputs.run_tests)
-        run: python -m unittest -v
+        run: python -m unittest -v test_stock_scanner_pipeline.py
 
       - name: Run live stock scanner
         if: steps.schedule_window.outputs.run_scan == 'true'
         env:
-          MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
-          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-          MBOUM_API_KEY: ${{ secrets.MBOUM_API_KEY }}
-          MBOUM_OPTIONS_KEY: ${{ secrets.MBOUM_OPTIONS_KEY }}
-          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           SCAN_BUDGET_MINUTES: ${{ inputs.scan_budget_minutes || '100' }}
           LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
         run: python new_stock_scanner_pipeline_claude_opus_41426.py

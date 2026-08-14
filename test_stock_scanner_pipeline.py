@@ -205,6 +205,7 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertEqual(scanner.classify_http_error(403, "You don't have access"), "auth")
 
         circuit = scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4)
+        self.assertTrue(callable(getattr(circuit, "record_failure", None)))
         self.assertTrue(circuit.available())
         circuit.record_failure("credits exhausted", credit=True)
         self.assertFalse(circuit.available())
@@ -213,7 +214,8 @@ class ScannerRegressionTests(unittest.TestCase):
 
     def test_missing_mboum_key_is_optional_when_massive_is_present(self):
         with patch.dict(os.environ, {"MASSIVE_API_KEY": "massive-test-key"}, clear=True):
-            status = scanner.verify_api_credentials()
+            with patch.object(scanner.log, "warning"), patch.object(scanner.log, "info"):
+                status = scanner.verify_api_credentials()
         self.assertEqual(status["MASSIVE_API_KEY"], "env")
         self.assertEqual(status["MBOUM_API_KEY"], "absent")
         self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
@@ -221,7 +223,8 @@ class ScannerRegressionTests(unittest.TestCase):
 
     def test_committed_fallback_keys_are_used_when_secrets_are_empty(self):
         with patch.dict(os.environ, {}, clear=True):
-            status = scanner.verify_api_credentials()
+            with patch.object(scanner.log, "warning"), patch.object(scanner.log, "info"):
+                status = scanner.verify_api_credentials()
             massive = scanner._env_or_default(
                 "MASSIVE_API_KEY", "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H"
             )

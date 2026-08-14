@@ -74,7 +74,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ENGINE_NAME = "Claude Opus 5 Live Scanner Engine"
-ENGINE_VERSION = "5.3.0"
+ENGINE_VERSION = "5.3.1"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION -- API credentials prefer the environment, then committed
@@ -460,11 +460,17 @@ def verify_api_credentials() -> Dict[str, str]:
     if status.get("TWELVEDATA_API_KEY") == "absent":
         log.info("TWELVEDATA_API_KEY is not set; TwelveData is skipped in the fallback chain.")
     elif status.get("TWELVEDATA_API_KEY") == "embedded":
-        log.info("TwelveData will use the committed fallback key (no Actions secret set).")
+        log.info(
+            "TwelveData will use the committed fallback key "
+            "(MBOUM/Massive env still win when set)."
+        )
     if status.get("FINNHUB_API_KEY") == "absent":
         log.info("FINNHUB_API_KEY is not set; Finnhub is skipped in the fallback chain.")
     elif status.get("FINNHUB_API_KEY") == "embedded":
-        log.info("Finnhub will use the committed fallback key (no Actions secret set).")
+        log.info(
+            "Finnhub will use the committed fallback key "
+            "(env/Actions secrets still win when set)."
+        )
     return status
 
 
@@ -572,20 +578,21 @@ class ProviderCircuit:
             self.consecutive_failures = 0
             self.successes += 1
 
-def record_failure(self, reason: str = "error", credit: bool = False) -> None:
-    do_trip = False
-    fail_reason = reason
-    with self._lock:
-        self.consecutive_failures += 1
-        if credit or self.consecutive_failures >= self.fail_limit:
-            if not self.disabled:
-                # Disable under the lock to avoid races with record_success().
-                self.disabled = True
-                self.reason = fail_reason or "unavailable"
-                do_trip = True
-                fail_reason = self.reason
-    if do_trip:
-        self.trip(fail_reason)
+    def record_failure(self, reason: str = "error", credit: bool = False) -> None:
+        do_trip = False
+        fail_reason = reason
+        with self._lock:
+            self.consecutive_failures += 1
+            if credit or self.consecutive_failures >= self.fail_limit:
+                if not self.disabled:
+                    # Disable under the lock to avoid races with record_success().
+                    self.disabled = True
+                    self.reason = fail_reason or "unavailable"
+                    do_trip = True
+                    fail_reason = self.reason
+        if do_trip:
+            self.trip(fail_reason)
+
 
 DATA_SOURCE_USAGE: Dict[str, Counter] = {
     "ohlcv": Counter(),
