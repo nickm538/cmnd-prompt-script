@@ -627,20 +627,121 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertEqual(scanner.MLRanker._scale_pos_weight(np.ones(10, dtype=int)), 1.0)
         self.assertEqual(scanner.MLRanker._scale_pos_weight(np.zeros(10, dtype=int)), 1.0)
 
-    def test_single_class_labels_do_not_crash_either_trainer(self):
-        ranker = scanner.MLRanker()
+    def test_single_class_labels_degrade_gracefully_instead_of_crashing(self):
+        # Contract: the raw trainers signal an impossible fit by raising the
+        # typed _ModelDegradedError -- never XGBoost's ValueError or a
+        # one-column predict_proba IndexError -- and _safe_scores converts
+        # that into neutral scores plus a recorded degradation, so Stage 4
+        # keeps the scan alive and the report says the ensemble was degraded.
         n_feat = len(scanner.MLRanker.FEATURE_COLS)
         rng = np.random.default_rng(1)
         X_train = rng.normal(size=(500, n_feat))
         X_current = rng.normal(size=(3, n_feat))
 
         for labels in (np.ones(500, dtype=int), np.zeros(500, dtype=int)):
+            ranker = scanner.MLRanker()
+            with self.assertRaises(scanner._ModelDegradedError):
+                ranker._train_xgboost(X_train, labels, X_current)
+            with self.assertRaises(scanner._ModelDegradedError):
+                ranker._train_rf(X_train, labels, X_current)
+
             with patch.object(scanner.log, "warning"):
-                xgb_scores = ranker._train_xgboost(X_train, labels, X_current)
-                rf_scores = ranker._train_rf(X_train, labels, X_current)
+                xgb_scores = ranker._safe_scores(
+                    "XGBoost", ranker._train_xgboost, X_train, labels, X_current
+                )
+                rf_scores = ranker._safe_scores(
+                    "RandomForest", ranker._train_rf, X_train, labels, X_current
+                )
             np.testing.assert_array_equal(xgb_scores, np.full(3, 0.5))
             np.testing.assert_array_equal(rf_scores, np.full(3, 0.5))
-        self.assertEqual(ranker.degraded_models, [])
+            self.assertEqual(ranker.degraded_models, ["XGBoost", "RandomForest"])
+
+    def test_optional_lstm_failure_cannot_end_the_scan(self):
+        # torch is installed in CI but not locally, so this path first executes
+        # on a live run. The LSTM is purely informational -- lstm_score is
+        # reported, never ranked on -- so a failure there must cost the score,
+        # not the scan.
+        ranker = scanner.MLRanker()
+        n_feat = len(scanner.MLRanker.FEATURE_COLS)
+        rng = np.random.default_rng(4)
+        X_train = rng.normal(size=(600, n_feat))
+        y_train = (rng.random(600) < 0.35).astype(int)
+        X_current = rng.normal(size=(1, n_feat))
+        survivors = [{"ticker": "TEST", "flags": []}]
+
+        with patch.object(
+            ranker, "_build_dataset",
+            return_value=(X_train, y_train, X_current, ["TEST"]),
+        ):
+            with patch.object(ranker, "_train_xgboost", return_value=np.array([0.7])):
+                with patch.object(ranker, "_train_rf", return_value=np.array([0.9])):
+                    with patch.object(
+                        ranker, "_train_lstm", side_effect=RuntimeError("torch blew up")
+                    ):
+                        with patch.object(scanner.log, "error"):
+                            out = ranker.rank(survivors, {}, training_universe={})
+
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["lstm_score"])
+        self.assertIn("LSTM", ranker.degraded_models)
+        # The tree ensemble is untouched -- only the optional layer is lost.
+        self.assertEqual(out[0]["ml_score_xgb"], 0.7)
+        self.assertEqual(out[0]["ml_score_rf"], 0.9)
+        self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.8)
+        self.assertIn("ML_DEGRADED:LSTM", out[0]["flags"])
+
+    def test_optional_lstm_internal_training_failure_propagates_to_degraded(self):
+        # This test verifies that when an exception occurs INSIDE _train_lstm's
+        # training code (not mocking _train_lstm itself), it propagates up to
+        # MLRanker.rank()'s try/except, which then correctly adds "LSTM" to
+        # degraded_models and applies the ML_DEGRADED:LSTM flag.
+        ranker = scanner.MLRanker()
+        n_feat = len(scanner.MLRanker.FEATURE_COLS)
+        rng = np.random.default_rng(5)
+        X_train = rng.normal(size=(600, n_feat))
+        y_train = (rng.random(600) < 0.35).astype(int)
+        X_current = rng.normal(size=(1, n_feat))
+        survivors = [{"ticker": "TEST", "flags": []}]
+
+        # Build a DataFrame with all required LSTM SEQ_FEATURES columns and enough rows
+        n_days = 252  # MIN_TRADING_DAYS
+        dates = pd.bdate_range(end=pd.Timestamp("2026-01-15"), periods=n_days)
+        df_data = {
+            "Close": np.linspace(100.0, 120.0, n_days),
+            "Volume": np.full(n_days, 1_000_000),
+            "RSI_14": np.full(n_days, 55.0),
+            "MACD_histogram": np.full(n_days, 0.1),
+            "EMA_20": np.linspace(100.0, 120.0, n_days),
+            "EMA_50": np.linspace(98.0, 118.0, n_days),
+            "SMA_50": np.linspace(99.0, 119.0, n_days),
+            "SMA_200": np.linspace(95.0, 115.0, n_days),
+            "Avg_Dollar_Vol_20": np.full(n_days, 12_000_000),
+            "Vol_SMA_20": np.full(n_days, 1_000_000),
+        }
+        all_data = {"TEST": pd.DataFrame(df_data, index=dates)}
+
+        with patch.object(
+            ranker, "_build_dataset",
+            return_value=(X_train, y_train, X_current, ["TEST"]),
+        ):
+            with patch.object(ranker, "_train_xgboost", return_value=np.array([0.7])):
+                with patch.object(ranker, "_train_rf", return_value=np.array([0.9])):
+                    # Ensure LSTM_AVAILABLE is True so the method enters the training path
+                    with patch.object(scanner, "LSTM_AVAILABLE", True):
+                        # Inject a failure inside the training code by patching torch.optim.Adam
+                        with patch("torch.optim.Adam", side_effect=RuntimeError("Adam optimizer failed")):
+                            with patch.object(scanner.log, "error"):
+                                with patch.object(scanner.log, "warning"):
+                                    out = ranker.rank(survivors, all_data, training_universe={})
+
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["lstm_score"])
+        self.assertIn("LSTM", ranker.degraded_models)
+        # The tree ensemble is untouched -- only the optional layer is lost.
+        self.assertEqual(out[0]["ml_score_xgb"], 0.7)
+        self.assertEqual(out[0]["ml_score_rf"], 0.9)
+        self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.8)
+        self.assertIn("ML_DEGRADED:LSTM", out[0]["flags"])
 
     def test_model_failure_degrades_and_flags_instead_of_ending_the_scan(self):
         ranker = scanner.MLRanker()

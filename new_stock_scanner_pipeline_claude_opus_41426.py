@@ -2793,9 +2793,11 @@ class ExecutionGuards:
         accuracy, and teaches the ranker patterns that are an artifact of the
         filter rather than of the market.
 
-        Screening on price and liquidity instead keeps untradeable noise out
-        using characteristics that are broadly stable across the training
-        window, so the forward-return label stays honest. Scoring still happens
+        This pool only drops series that are degenerate end to end (too short,
+        halted/flat). The price and liquidity screen is applied per-row inside
+        MLRanker._build_dataset, using each bar's own close and trailing
+        20-day dollar volume, so eligibility is judged with what was knowable
+        on that bar rather than with today's values. Scoring still happens
         only on fully guarded candidates -- this changes what the model learns
         from, not what it is allowed to buy.
         """
@@ -3559,7 +3561,23 @@ class MLRanker:
             )
 
         # Optional LSTM -- keyed by ticker, not by the XGB/RF row index.
-        lstm_scores = self._train_lstm(survivors, all_data)
+        #
+        # Guarded separately from _safe_scores because it returns a
+        # {ticker: score} map rather than a score array. This is the one Stage
+        # 4 model that is purely informational: lstm_score is reported but
+        # never ranked on. Letting an optional extra abort a ~100 minute scan
+        # minutes before the output is written is the worst trade available.
+        try:
+            lstm_scores = self._train_lstm(survivors, all_data)
+        except Exception as exc:
+            log.error(
+                f"  LSTM layer failed ({exc}) -- continuing with XGBoost + "
+                "Random Forest."
+            )
+            log.debug(traceback.format_exc())
+            if "LSTM" not in self.degraded_models:
+                self.degraded_models.append("LSTM")
+            lstm_scores = None
 
         # Assign scores back to survivors
         ticker_to_idx = {t: i for i, t in enumerate(current_tickers)}
@@ -4159,7 +4177,7 @@ class MLRanker:
 
         except Exception as e:
             log.warning(f"  LSTM training failed: {e}")
-            return None
+            raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
