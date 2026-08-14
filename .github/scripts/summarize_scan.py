@@ -46,6 +46,17 @@ def _render(report: Dict[str, Any]) -> List[str]:
             f"({macro.get('regime_score', '?')}/100)"
         )
 
+    world = macro.get("world_context") or {}
+    if world.get("event_risk") is not None:
+        lines.append(f"- Live event risk: {world.get('event_risk')}/100")
+    headlines = world.get("headlines") or []
+    if headlines:
+        lines.append("")
+        lines.append("Today's market headlines (context only; not a ticker list):")
+        for item in headlines[:5]:
+            headline = item.get("headline") if isinstance(item, dict) else item
+            lines.append(f"- {headline}")
+
     lines.append("")
 
     rows = report.get("top_25") or []

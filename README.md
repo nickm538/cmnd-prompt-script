@@ -7,10 +7,15 @@ entry point is:
 new_stock_scanner_pipeline_claude_opus_41426.py
 ```
 
-The scanner dynamically discovers the live universe, pulls current market data,
-checks macro regime context, applies execution guards and hard buy rules, ranks
-survivors, evaluates fundamentals/options, and writes auditable outputs. It does
-not use preset ticker baskets or mock data.
+The scanner dynamically discovers the live universe, pulls current market data
+and headlines, checks macro regime context against today's world events and
+live market status (VIX, yields, USD, gold, oil, session open/holiday),
+applies execution guards and hard buy rules, ranks survivors, evaluates
+fundamentals/options, and writes auditable outputs. It does not use preset
+ticker baskets, watchlists, yesterday's CSV, mock data, or a pre-selected
+benchmark ETF. News and the earnings calendar annotate names that already
+survived; they never choose the universe. Relative strength is measured
+against the live S&P 500 index fetched that run.
 
 ## Local setup
 
@@ -27,14 +32,23 @@ python -m pip install -r requirements.txt
 
 The script supports these environment variable overrides:
 
-- `MASSIVE_API_KEY`
+- `MASSIVE_API_KEY` (required for universe discovery)
+- `MBOUM_API_KEY` (primary OHLCV and fundamentals source when credits remain)
+- `MBOUM_OPTIONS_KEY` (primary options chains when present)
+- `TWELVEDATA_API_KEY` (fallback OHLCV and fundamentals)
+- `FINNHUB_API_KEY` (fallback fundamentals; OHLCV if the plan includes candles)
 - `ALPHAVANTAGE_API_KEY`
-- `MBOUM_API_KEY`
-- `MBOUM_OPTIONS_KEY`
 
-If they are not set, the scanner falls back to the keys embedded in the source
-file. For GitHub Actions, configure these as repository secrets so scheduled
-runs do not depend on local machine state.
+MBOUM stays the primary market-data source. If the MBOUM plan is out of
+credits, unauthorized, or returning empty history, the engine trips a
+process-local circuit and continues the same scan through Massive, then
+TwelveData, then Finnhub, then Yahoo v8 / yfinance. Restored MBOUM credits
+are used first again on the next run. No bars or fundamentals are fabricated.
+
+Environment variables and GitHub Actions secrets override the committed
+fallback keys for Massive, TwelveData, and Finnhub. If those secrets are
+empty, the engine uses the keys checked in on this branch so the scan can
+still run. MBOUM keys are not committed and still come from secrets.
 
 ## Run locally
 
@@ -91,8 +105,9 @@ Runtime outputs are ignored by git and written to:
 - `scan_results/near_misses_<timestamp>.json` when no ticker passes all hard
   rules
 
-The JSON report includes macro regime snapshots, pipeline funnel counts,
-feature importances, and an attestation that live data sources were used.
+The JSON report includes macro regime snapshots, live headlines, market
+status, pipeline funnel counts, feature importances, and an attestation
+that live data sources were used and that no preset ticker list was loaded.
 
 ## Operational notes
 

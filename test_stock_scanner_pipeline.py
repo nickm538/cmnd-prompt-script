@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import inspect
+import os
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +28,9 @@ def _guard_ready_df(last_day, unique_prices=True):
 
 
 class ScannerRegressionTests(unittest.TestCase):
+    def setUp(self):
+        scanner.reset_market_router()
+
     def test_macro_regime_requires_live_required_symbols(self):
         macro = scanner.MacroRegime()
         with patch.object(macro, "_series", return_value=None):
@@ -186,6 +191,172 @@ class ScannerRegressionTests(unittest.TestCase):
 
         self.assertGreaterEqual(score, 60.0)
         self.assertEqual(candidate["overall_confidence_score"], round(score, 1))
+
+    def test_credit_errors_trip_mboum_but_minute_limits_do_not(self):
+        self.assertEqual(scanner.classify_http_error(402, ""), "credit")
+        self.assertEqual(
+            scanner.classify_http_error(429, "You have run out of API credits for the current month"),
+            "credit",
+        )
+        self.assertEqual(
+            scanner.classify_http_error(429, "You have run out of API credits for the current minute"),
+            "rate",
+        )
+        self.assertEqual(scanner.classify_http_error(403, "You don't have access"), "auth")
+
+        circuit = scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4)
+        self.assertTrue(circuit.available())
+        circuit.record_failure("credits exhausted", credit=True)
+        self.assertFalse(circuit.available())
+        scanner.ProviderCircuit.reset_all()
+        self.assertTrue(scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4).available())
+
+    def test_missing_mboum_key_is_optional_when_massive_is_present(self):
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "massive-test-key"}, clear=True):
+            status = scanner.verify_api_credentials()
+        self.assertEqual(status["MASSIVE_API_KEY"], "env")
+        self.assertEqual(status["MBOUM_API_KEY"], "absent")
+        self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
+        self.assertEqual(status["FINNHUB_API_KEY"], "embedded")
+
+    def test_committed_fallback_keys_are_used_when_secrets_are_empty(self):
+        with patch.dict(os.environ, {}, clear=True):
+            status = scanner.verify_api_credentials()
+            massive = scanner._env_or_default(
+                "MASSIVE_API_KEY", "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H"
+            )
+            twelve = scanner._env_or_default(
+                "TWELVEDATA_API_KEY", "5e7a5daaf41d46a8966963106ebef210"
+            )
+            finnhub = scanner._env_or_default(
+                "FINNHUB_API_KEY", "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg"
+            )
+        self.assertEqual(status["MASSIVE_API_KEY"], "embedded")
+        self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
+        self.assertEqual(status["FINNHUB_API_KEY"], "embedded")
+        self.assertTrue(massive)
+        self.assertTrue(twelve)
+        self.assertTrue(finnhub)
+
+    def test_ohlcv_router_keeps_mboum_primary_when_it_returns_history(self):
+        history = _guard_ready_df(datetime(2026, 4, 29).date())
+        router = scanner.MarketDataRouter()
+        with patch.object(router, "_provider_enabled", return_value=True):
+            with patch.object(router, "_history_mboum", return_value=history) as mboum:
+                with patch.object(router, "_history_massive") as massive:
+                    df, source = router.get_history("AAPL")
+        self.assertEqual(source, "MBOUM")
+        self.assertIs(df, history)
+        mboum.assert_called_once_with("AAPL")
+        massive.assert_not_called()
+
+    def test_ohlcv_router_falls_back_to_massive_when_mboum_is_out_of_credit(self):
+        history = _guard_ready_df(datetime(2026, 4, 29).date())
+        router = scanner.MarketDataRouter()
+        with patch.object(router, "_provider_enabled", return_value=True):
+            with patch.object(
+                router,
+                "_history_mboum",
+                side_effect=scanner.ProviderExhausted("MBOUM", "credits exhausted"),
+            ):
+                with patch.object(router, "_history_massive", return_value=history) as massive:
+                    with patch.object(router, "_history_twelvedata") as twelve:
+                        df, source = router.get_history("AAPL")
+        self.assertEqual(source, "Massive")
+        self.assertIs(df, history)
+        massive.assert_called_once_with("AAPL")
+        twelve.assert_not_called()
+
+    def test_ohlcv_router_skips_tripped_mboum_circuit_on_later_tickers(self):
+        history = _guard_ready_df(datetime(2026, 4, 29).date())
+        router = scanner.MarketDataRouter()
+        scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4).trip("credits exhausted")
+        with patch.object(router, "_provider_enabled", return_value=True):
+            with patch.object(router, "_history_mboum") as mboum:
+                with patch.object(router, "_history_massive", return_value=history):
+                    df, source = router.get_history("MSFT")
+        self.assertEqual(source, "Massive")
+        self.assertIsNotNone(df)
+        mboum.assert_not_called()
+
+    def test_world_context_never_adds_tickers(self):
+        ctx = scanner.WorldContext()
+        ctx.earnings_soon = {"TEST": "2026-08-18"}
+        incoming = [{"ticker": "TEST", "flags": []}, {"ticker": "OTHER", "flags": []}]
+        with patch.object(ctx, "_company_headlines", return_value=["Live geopolitics headline"]):
+            out = ctx.annotate(incoming)
+        self.assertEqual([row["ticker"] for row in out], ["TEST", "OTHER"])
+        self.assertIn("LIVE_EARNINGS_WINDOW", out[0]["flags"])
+        self.assertIn("LIVE_NEWS", out[0]["flags"])
+        self.assertNotIn("LIVE_EARNINGS_WINDOW", out[1]["flags"])
+        self.assertFalse(ctx.to_dict()["seeds_universe"])
+
+    def test_high_live_event_risk_tightens_position_sizing(self):
+        macro = scanner.MacroRegime()
+        macro.regime_score = 80.0
+        macro.world.event_risk = 80.0
+        self.assertLess(macro.position_sizing_scalar(), 1.20)
+        macro.world.event_risk = 40.0
+        self.assertEqual(macro.position_sizing_scalar(), 1.20)
+
+    def test_universe_cleaner_is_a_filter_not_a_basket(self):
+        cleaned = scanner.UniverseDiscovery._clean_listed_equities(
+            [
+                {"ticker": "TEST", "primary_exchange": "XNAS", "type": "CS"},
+                {"ticker": "BRK.A", "primary_exchange": "XNYS", "type": "CS"},
+                {"symbol": "FAKE", "mic": "XNAS", "type": "Warrant"},
+            ]
+        )
+        self.assertEqual(cleaned, ["TEST"])
+
+    def test_engine_has_no_preset_screener_or_spy_etf_fetch(self):
+        source = inspect.getsource(scanner)
+        self.assertNotIn('get_history("SPY")', source)
+        self.assertNotIn("most_actives", source)
+        self.assertNotIn("SCAN_TICKERS", source)
+        self.assertNotIn("TICKER_LIST", source)
+        self.assertFalse(hasattr(scanner.MboumAPI, "get_screener"))
+
+    def test_benchmark_uses_live_spx_snapshot_not_spy(self):
+        idx = pd.bdate_range(end="2026-04-29", periods=120)
+        spx = pd.DataFrame({"Close": np.linspace(4000.0, 5200.0, 120)}, index=idx)
+        macro = scanner.MacroRegime()
+        macro.snapshot["spx"] = {"df": spx, "last": 5200.0}
+        panel = scanner.InvestorPanel(macro=macro)
+        with patch.object(scanner, "get_market_router") as router:
+            with patch.object(macro, "_series") as series:
+                panel.load_benchmark()
+        router.assert_not_called()
+        series.assert_not_called()
+        self.assertIs(panel.benchmark_data, spx)
+
+    def test_benchmark_fallback_fetches_live_spx_index_not_spy(self):
+        idx = pd.bdate_range(end="2026-04-29", periods=120)
+        spx = pd.DataFrame({"Close": np.linspace(4000.0, 5200.0, 120)}, index=idx)
+        macro = scanner.MacroRegime()
+        panel = scanner.InvestorPanel(macro=macro)
+        with patch.object(macro, "_series", return_value=spx) as series:
+            with patch.object(scanner, "get_market_router") as router:
+                panel.load_benchmark()
+        series.assert_called_once_with("^GSPC", range_="2y")
+        router.assert_not_called()
+        self.assertIs(panel.benchmark_data, spx)
+
+    def test_live_vix_raises_event_risk(self):
+        ctx = scanner.WorldContext()
+        ctx._score_event_risk(snapshot={"vix": {"last": 40.0}})
+        stressed = ctx.event_risk
+        ctx._score_event_risk(snapshot={"vix": {"last": 12.0}})
+        self.assertGreater(stressed, ctx.event_risk)
+
+    def test_world_headlines_drop_vendor_related_tickers(self):
+        ctx = scanner.WorldContext()
+        ctx.headlines = [
+            {"headline": "Fed holds rates amid tariff risk", "source": "wire"}
+        ]
+        dumped = ctx.to_dict()["headlines"][0]
+        self.assertNotIn("related", dumped)
+        self.assertFalse(dumped.get("related"))
 
 
 if __name__ == "__main__":
