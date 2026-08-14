@@ -3561,7 +3561,23 @@ class MLRanker:
             )
 
         # Optional LSTM -- keyed by ticker, not by the XGB/RF row index.
-        lstm_scores = self._train_lstm(survivors, all_data)
+        #
+        # Guarded separately from _safe_scores because it returns a
+        # {ticker: score} map rather than a score array. This is the one Stage
+        # 4 model that is purely informational: lstm_score is reported but
+        # never ranked on. Letting an optional extra abort a ~100 minute scan
+        # minutes before the output is written is the worst trade available.
+        try:
+            lstm_scores = self._train_lstm(survivors, all_data)
+        except Exception as exc:
+            log.error(
+                f"  LSTM layer failed ({exc}) -- continuing with XGBoost + "
+                "Random Forest."
+            )
+            log.debug(traceback.format_exc())
+            if "LSTM" not in self.degraded_models:
+                self.degraded_models.append("LSTM")
+            lstm_scores = None
 
         # Assign scores back to survivors
         ticker_to_idx = {t: i for i, t in enumerate(current_tickers)}

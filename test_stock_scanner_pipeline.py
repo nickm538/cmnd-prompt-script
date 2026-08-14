@@ -656,6 +656,40 @@ class ScannerRegressionTests(unittest.TestCase):
             np.testing.assert_array_equal(rf_scores, np.full(3, 0.5))
             self.assertEqual(ranker.degraded_models, ["XGBoost", "RandomForest"])
 
+    def test_optional_lstm_failure_cannot_end_the_scan(self):
+        # torch is installed in CI but not locally, so this path first executes
+        # on a live run. The LSTM is purely informational -- lstm_score is
+        # reported, never ranked on -- so a failure there must cost the score,
+        # not the scan.
+        ranker = scanner.MLRanker()
+        n_feat = len(scanner.MLRanker.FEATURE_COLS)
+        rng = np.random.default_rng(4)
+        X_train = rng.normal(size=(600, n_feat))
+        y_train = (rng.random(600) < 0.35).astype(int)
+        X_current = rng.normal(size=(1, n_feat))
+        survivors = [{"ticker": "TEST", "flags": []}]
+
+        with patch.object(
+            ranker, "_build_dataset",
+            return_value=(X_train, y_train, X_current, ["TEST"]),
+        ):
+            with patch.object(ranker, "_train_xgboost", return_value=np.array([0.7])):
+                with patch.object(ranker, "_train_rf", return_value=np.array([0.9])):
+                    with patch.object(
+                        ranker, "_train_lstm", side_effect=RuntimeError("torch blew up")
+                    ):
+                        with patch.object(scanner.log, "error"):
+                            out = ranker.rank(survivors, {}, training_universe={})
+
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["lstm_score"])
+        self.assertIn("LSTM", ranker.degraded_models)
+        # The tree ensemble is untouched -- only the optional layer is lost.
+        self.assertEqual(out[0]["ml_score_xgb"], 0.7)
+        self.assertEqual(out[0]["ml_score_rf"], 0.9)
+        self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.8)
+        self.assertIn("ML_DEGRADED:LSTM", out[0]["flags"])
+
     def test_model_failure_degrades_and_flags_instead_of_ending_the_scan(self):
         ranker = scanner.MLRanker()
         n_feat = len(scanner.MLRanker.FEATURE_COLS)
