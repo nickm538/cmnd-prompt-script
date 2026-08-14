@@ -4177,7 +4177,7 @@ class MLRanker:
 
         except Exception as e:
             log.warning(f"  LSTM training failed: {e}")
-            return None
+            raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
