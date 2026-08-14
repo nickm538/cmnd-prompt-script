@@ -462,7 +462,7 @@ def verify_api_credentials() -> Dict[str, str]:
     elif status.get("TWELVEDATA_API_KEY") == "embedded":
         log.info(
             "TwelveData will use the committed fallback key "
-            "(MBOUM/Massive env still win when set)."
+            "(env/Actions secrets still win when set)."
         )
     if status.get("FINNHUB_API_KEY") == "absent":
         log.info("FINNHUB_API_KEY is not set; Finnhub is skipped in the fallback chain.")
