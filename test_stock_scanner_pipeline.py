@@ -627,20 +627,34 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertEqual(scanner.MLRanker._scale_pos_weight(np.ones(10, dtype=int)), 1.0)
         self.assertEqual(scanner.MLRanker._scale_pos_weight(np.zeros(10, dtype=int)), 1.0)
 
-    def test_single_class_labels_do_not_crash_either_trainer(self):
-        ranker = scanner.MLRanker()
+    def test_single_class_labels_degrade_gracefully_instead_of_crashing(self):
+        # Contract: the raw trainers signal an impossible fit by raising the
+        # typed _ModelDegradedError -- never XGBoost's ValueError or a
+        # one-column predict_proba IndexError -- and _safe_scores converts
+        # that into neutral scores plus a recorded degradation, so Stage 4
+        # keeps the scan alive and the report says the ensemble was degraded.
         n_feat = len(scanner.MLRanker.FEATURE_COLS)
         rng = np.random.default_rng(1)
         X_train = rng.normal(size=(500, n_feat))
         X_current = rng.normal(size=(3, n_feat))
 
         for labels in (np.ones(500, dtype=int), np.zeros(500, dtype=int)):
+            ranker = scanner.MLRanker()
+            with self.assertRaises(scanner._ModelDegradedError):
+                ranker._train_xgboost(X_train, labels, X_current)
+            with self.assertRaises(scanner._ModelDegradedError):
+                ranker._train_rf(X_train, labels, X_current)
+
             with patch.object(scanner.log, "warning"):
-                xgb_scores = ranker._train_xgboost(X_train, labels, X_current)
-                rf_scores = ranker._train_rf(X_train, labels, X_current)
+                xgb_scores = ranker._safe_scores(
+                    "XGBoost", ranker._train_xgboost, X_train, labels, X_current
+                )
+                rf_scores = ranker._safe_scores(
+                    "RandomForest", ranker._train_rf, X_train, labels, X_current
+                )
             np.testing.assert_array_equal(xgb_scores, np.full(3, 0.5))
             np.testing.assert_array_equal(rf_scores, np.full(3, 0.5))
-        self.assertEqual(ranker.degraded_models, [])
+            self.assertEqual(ranker.degraded_models, ["XGBoost", "RandomForest"])
 
     def test_model_failure_degrades_and_flags_instead_of_ending_the_scan(self):
         ranker = scanner.MLRanker()

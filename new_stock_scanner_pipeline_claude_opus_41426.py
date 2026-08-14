@@ -2793,9 +2793,11 @@ class ExecutionGuards:
         accuracy, and teaches the ranker patterns that are an artifact of the
         filter rather than of the market.
 
-        Screening on price and liquidity instead keeps untradeable noise out
-        using characteristics that are broadly stable across the training
-        window, so the forward-return label stays honest. Scoring still happens
+        This pool only drops series that are degenerate end to end (too short,
+        halted/flat). The price and liquidity screen is applied per-row inside
+        MLRanker._build_dataset, using each bar's own close and trailing
+        20-day dollar volume, so eligibility is judged with what was knowable
+        on that bar rather than with today's values. Scoring still happens
         only on fully guarded candidates -- this changes what the model learns
         from, not what it is allowed to buy.
         """
