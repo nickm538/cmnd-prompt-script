@@ -3345,6 +3345,9 @@ class MLRanker:
         # pairwise as they arrived made the blend depend on training order and
         # silently halved the first model's contribution.
         self._importances_by_model: Dict[str, Dict[str, float]] = {}
+        # Models that fell back to neutral scores this run, so the report can
+        # say the ensemble was degraded instead of presenting 0.5 as a signal.
+        self.degraded_models: List[str] = []
 
     def _finalize_feature_importances(self) -> None:
         """Average the per-model importances into the reported blend."""
@@ -3401,11 +3404,14 @@ class MLRanker:
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_current_scaled = self.scaler.transform(X_current)
 
-        # Train XGBoost
-        xgb_scores = self._train_xgboost(X_train_scaled, y_train, X_current_scaled)
-
-        # Train Random Forest
-        rf_scores = self._train_rf(X_train_scaled, y_train, X_current_scaled)
+        # Train XGBoost and Random Forest. A model that fails degrades to
+        # neutral scores instead of ending the run at Stage 4.
+        xgb_scores = self._safe_scores(
+            "XGBoost", self._train_xgboost, X_train_scaled, y_train, X_current_scaled
+        )
+        rf_scores = self._safe_scores(
+            "RandomForest", self._train_rf, X_train_scaled, y_train, X_current_scaled
+        )
 
         # Ensemble
         ensemble_scores = (xgb_scores + rf_scores) / 2
@@ -3436,6 +3442,13 @@ class MLRanker:
             s["lstm_score"] = (
                 lstm_scores.get(s["ticker"]) if lstm_scores else None
             )
+            if self.degraded_models:
+                # Flag rather than hide it: a 0.5 from a failed model is the
+                # absence of a signal, not a neutral verdict on the name.
+                flags = s.setdefault("flags", [])
+                flag = "ML_DEGRADED:" + "+".join(self.degraded_models)
+                if flag not in flags:
+                    flags.append(flag)
 
         # Log feature importances
         self._finalize_feature_importances()
@@ -3452,26 +3465,87 @@ class MLRanker:
     def _cap_training_rows(
         X_train: np.ndarray, y_train: np.ndarray, max_rows: int = 80_000
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Keep the most recent, class-balanced rows so live scans finish."""
+        """
+        Keep the most recent rows, in date order, so live scans finish.
+
+        Rows arrive sorted by date and the walk-forward CV in _train_xgboost /
+        _train_rf depends on that order. Taking the most recent N rows of each
+        class *separately* breaks it: the majority class is drawn from a much
+        shorter recent window than the minority class, so once the kept rows
+        are re-sorted the oldest block contains minority-class rows only. On
+        the live universe (511,649 samples, 30.6% positive) that left the
+        first ~22,300 rows all class 1, TimeSeriesSplit handed XGBoost a
+        single-class first fold, and the scan died at Stage 4 with
+        "Invalid classes inferred from unique values of `y`".
+
+        It also trained the models on a class prior that drifted with the
+        calendar -- 100% positive in the oldest rows -- which is a data defect
+        no fold-skipping would repair.
+
+        Truncating chronologically keeps every fold contiguous in time and the
+        class prior stable. Imbalance is handled where it belongs: by the
+        estimators' own class weighting.
+        """
         if len(X_train) <= max_rows:
             return X_train, y_train
-        rng = np.random.default_rng(42)
-        per_class = max_rows // 2
-        keep = []
-        for cls in (0, 1):
-            idx = np.flatnonzero(y_train == cls)
-            if len(idx) > per_class:
-                idx = idx[-per_class:]
-            keep.append(idx)
-        keep_idx = np.concatenate(keep)
-        if len(keep_idx) < max_rows:
-            remaining = np.setdiff1d(np.arange(len(y_train)), keep_idx, assume_unique=False)
-            fill_n = min(max_rows - len(keep_idx), len(remaining))
-            if fill_n:
-                keep_idx = np.concatenate([keep_idx, remaining[-fill_n:]])
-        keep_idx = np.sort(keep_idx)
-        log.info(f"  Training set capped to {len(keep_idx)} most-recent balanced samples.")
-        return X_train[keep_idx], y_train[keep_idx]
+        X_train = X_train[-max_rows:]
+        y_train = y_train[-max_rows:]
+        log.info(
+            f"  Training set capped to the {len(y_train)} most recent samples "
+            f"(positive class {float(y_train.mean()):.1%}); imbalance handled "
+            "by model class weighting."
+        )
+        return X_train, y_train
+
+    @staticmethod
+    def _class_counts(y: np.ndarray) -> Tuple[int, int]:
+        """(negatives, positives) in a binary label vector."""
+        positives = int(np.count_nonzero(y == 1))
+        return int(np.asarray(y).size - positives), positives
+
+    @classmethod
+    def _scale_pos_weight(cls, y: np.ndarray) -> float:
+        """
+        XGBoost's imbalance lever: negatives / positives.
+
+        Takes over from the balanced subsample the trainer used to rely on, so
+        the model still weighs the classes equally while the rows stay in
+        unbroken date order. Keeping the effective balance also keeps the
+        predicted probabilities on the same scale downstream scoring already
+        assumes (0.5 = neutral).
+        """
+        negatives, positives = cls._class_counts(y)
+        if not positives or not negatives:
+            return 1.0
+        return float(negatives) / float(positives)
+
+    def _safe_scores(
+        self,
+        label: str,
+        trainer,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_current: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Run one model, degrading to neutral scores instead of aborting the scan.
+
+        Stage 4 lands a few minutes into a ~100 minute run and every later
+        stage depends on it, so a single estimator blowing up must not throw
+        away the whole scan. The degradation is recorded and reported rather
+        than passed off as a real score.
+        """
+        try:
+            return trainer(X_train, y_train, X_current)
+        except Exception as exc:
+            log.error(
+                f"  {label} training failed ({exc}) -- scoring every survivor "
+                "0.5 for this model and continuing."
+            )
+            log.debug(traceback.format_exc())
+            if label not in self.degraded_models:
+                self.degraded_models.append(label)
+            return np.full(X_current.shape[0], 0.5)
 
     def rank_near_misses(
         self,
@@ -3604,6 +3678,17 @@ class MLRanker:
             log.warning("XGBoost not installed -- using Random Forest only")
             return np.full(X_current.shape[0], 0.5)
 
+        negatives, positives = self._class_counts(y_train)
+        if not negatives or not positives:
+            # XGBoost treats a single-class target as a fatal ValueError.
+            log.warning(
+                "  XGBoost skipped -- training labels are single-class "
+                f"(all {'positive' if positives else 'negative'}); "
+                "scoring every survivor 0.5 for this model."
+            )
+            return np.full(X_current.shape[0], 0.5)
+
+        scale_pos_weight = self._scale_pos_weight(y_train)
         model = xgb.XGBClassifier(
             n_estimators=200,
             max_depth=6,
@@ -3611,6 +3696,7 @@ class MLRanker:
             subsample=0.8,
             colsample_bytree=0.8,
             eval_metric="logloss",
+            scale_pos_weight=scale_pos_weight,
             random_state=42,
             verbosity=0,
         )
@@ -3621,21 +3707,42 @@ class MLRanker:
         tscv = TimeSeriesSplit(n_splits=5)
         val_accs = []
         train_accs = []
+        skipped_folds = 0
         for train_idx, val_idx in tscv.split(X_train):
             if gap > 0:
                 val_start = val_idx[0]
                 train_idx = train_idx[train_idx < (val_start - gap)]
                 if train_idx.size == 0:
                     continue
+            if np.unique(y_train[train_idx]).size < 2:
+                # Still reachable on a narrow or quiet universe, where an early
+                # window can hold one class only. Skip rather than let XGBoost
+                # raise and take the whole scan down with it.
+                skipped_folds += 1
+                continue
             model.fit(X_train[train_idx], y_train[train_idx])
             train_pred = model.predict(X_train[train_idx])
             val_pred = model.predict(X_train[val_idx])
             train_accs.append(accuracy_score(y_train[train_idx], train_pred))
             val_accs.append(accuracy_score(y_train[val_idx], val_pred))
 
-        avg_train = np.mean(train_accs)
-        avg_val = np.mean(val_accs)
-        log.info(f"  XGBoost CV -- Train acc: {avg_train:.3f}, Val acc: {avg_val:.3f}")
+        if skipped_folds:
+            log.warning(
+                f"  XGBoost CV skipped {skipped_folds} single-class fold(s)."
+            )
+
+        if val_accs:
+            avg_train = float(np.mean(train_accs))
+            avg_val = float(np.mean(val_accs))
+            log.info(
+                f"  XGBoost CV -- Train acc: {avg_train:.3f}, Val acc: {avg_val:.3f}"
+            )
+        else:
+            avg_train = avg_val = float("nan")
+            log.warning(
+                "  XGBoost CV produced no usable folds -- fitting on the full "
+                "training set without validation accuracy."
+            )
 
         if avg_train > 0.90 and avg_val < 0.60:
             log.warning(
@@ -3650,6 +3757,7 @@ class MLRanker:
                 reg_alpha=1.0,
                 reg_lambda=2.0,
                 eval_metric="logloss",
+                scale_pos_weight=scale_pos_weight,
                 random_state=42,
                 verbosity=0,
             )
@@ -3671,10 +3779,24 @@ class MLRanker:
         self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray
     ) -> np.ndarray:
         """Train Random Forest and return predicted probabilities."""
+        negatives, positives = self._class_counts(y_train)
+        if not negatives or not positives:
+            # A single-class fit leaves predict_proba with one column, so the
+            # [:, 1] lookup below would raise IndexError.
+            log.warning(
+                "  Random Forest skipped -- training labels are single-class "
+                f"(all {'positive' if positives else 'negative'}); "
+                "scoring every survivor 0.5 for this model."
+            )
+            return np.full(X_current.shape[0], 0.5)
+
         model = RandomForestClassifier(
             n_estimators=200,
             max_depth=8,
             min_samples_leaf=20,
+            # Matches XGBoost's scale_pos_weight now that the training rows are
+            # capped chronologically instead of class-balanced by subsampling.
+            class_weight="balanced",
             random_state=42,
             n_jobs=-1,
         )
@@ -3690,16 +3812,32 @@ class MLRanker:
             use_manual_gap = True
 
         val_accs = []
+        skipped_folds = 0
         for train_idx, val_idx in tscv.split(X_train):
             if use_manual_gap:
                 if len(train_idx) <= gap:
                     continue
                 train_idx = train_idx[:-gap]
+            if np.unique(y_train[train_idx]).size < 2:
+                # Single-class fold: the fit would produce a one-column
+                # predict_proba and a meaningless accuracy. Skip it.
+                skipped_folds += 1
+                continue
             model.fit(X_train[train_idx], y_train[train_idx])
             val_pred = model.predict(X_train[val_idx])
             val_accs.append(accuracy_score(y_train[val_idx], val_pred))
 
-        log.info(f"  Random Forest CV -- Val acc: {np.mean(val_accs):.3f}")
+        if skipped_folds:
+            log.warning(
+                f"  Random Forest CV skipped {skipped_folds} single-class fold(s)."
+            )
+        if val_accs:
+            log.info(f"  Random Forest CV -- Val acc: {np.mean(val_accs):.3f}")
+        else:
+            log.warning(
+                "  Random Forest CV produced no usable folds -- fitting on the "
+                "full training set without validation accuracy."
+            )
 
         # Final fit
         model.fit(X_train, y_train)
@@ -6602,7 +6740,14 @@ def main():
             "LSTM": "Available (PyTorch)" if LSTM_AVAILABLE else "Not installed",
             "XGB_available": XGB_AVAILABLE,
             "training_universe_size": len(guarded_data),
+            "degraded_models": list(ranker.degraded_models),
         }
+        if ranker.degraded_models:
+            log.warning(
+                "  ML ensemble degraded this run -- "
+                f"{', '.join(ranker.degraded_models)} scored 0.5 for every "
+                "survivor. Ranking leans on the hard rules and panel."
+            )
         feature_importances = ranker.feature_importances
 
         # ── FUNDAMENTALS FETCH (survivors only) ──────────────────────

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import TimeSeriesSplit
 
 import new_stock_scanner_pipeline_claude_opus_41426 as scanner
 
@@ -383,6 +384,97 @@ class ScannerRegressionTests(unittest.TestCase):
         stressed = ctx.event_risk
         ctx._score_event_risk(snapshot={"vix": {"last": 12.0}})
         self.assertGreater(stressed, ctx.event_risk)
+
+    def test_training_cap_keeps_the_chronological_tail(self):
+        rows = 200_000
+        X = np.arange(rows, dtype=float).reshape(-1, 1)
+        y = (np.arange(rows) % 3 == 0).astype(int)
+
+        X_cap, y_cap = scanner.MLRanker._cap_training_rows(X, y, max_rows=80_000)
+
+        self.assertEqual(len(X_cap), 80_000)
+        # Date-sorted rows in, contiguous most-recent block out. Sampling each
+        # class separately used to reorder them and strand a minority-only
+        # block at the front.
+        np.testing.assert_array_equal(X_cap, X[-80_000:])
+        np.testing.assert_array_equal(y_cap, y[-80_000:])
+
+    def test_training_cap_leaves_no_single_class_cv_fold(self):
+        # The live failure: 511,649 samples at 30.6% positive produced a capped
+        # set whose oldest ~22,300 rows were all class 1, so TimeSeriesSplit
+        # handed XGBoost a single-class first fold and the scan died with
+        # "Invalid classes inferred from unique values of `y`".
+        rng = np.random.default_rng(0)
+        y = (rng.random(511_649) < 0.306).astype(int)
+        X = np.zeros((len(y), 1))
+
+        _, y_cap = scanner.MLRanker._cap_training_rows(X, y, max_rows=80_000)
+
+        gap = 20
+        folds = 0
+        for train_idx, val_idx in TimeSeriesSplit(n_splits=5).split(y_cap):
+            train_idx = train_idx[train_idx < (val_idx[0] - gap)]
+            if train_idx.size == 0:
+                continue
+            folds += 1
+            self.assertEqual(
+                np.unique(y_cap[train_idx]).size, 2,
+                "TimeSeriesSplit fold is single-class -- XGBoost will raise",
+            )
+        self.assertGreater(folds, 0)
+
+    def test_scale_pos_weight_rebalances_the_minority_class(self):
+        y = np.array([0] * 700 + [1] * 300)
+
+        self.assertAlmostEqual(scanner.MLRanker._scale_pos_weight(y), 700 / 300)
+        self.assertEqual(scanner.MLRanker._class_counts(y), (700, 300))
+        # Degenerate targets must not produce a divide-by-zero weight.
+        self.assertEqual(scanner.MLRanker._scale_pos_weight(np.ones(10, dtype=int)), 1.0)
+        self.assertEqual(scanner.MLRanker._scale_pos_weight(np.zeros(10, dtype=int)), 1.0)
+
+    def test_single_class_labels_do_not_crash_either_trainer(self):
+        ranker = scanner.MLRanker()
+        n_feat = len(scanner.MLRanker.FEATURE_COLS)
+        rng = np.random.default_rng(1)
+        X_train = rng.normal(size=(500, n_feat))
+        X_current = rng.normal(size=(3, n_feat))
+
+        for labels in (np.ones(500, dtype=int), np.zeros(500, dtype=int)):
+            with patch.object(scanner.log, "warning"):
+                xgb_scores = ranker._train_xgboost(X_train, labels, X_current)
+                rf_scores = ranker._train_rf(X_train, labels, X_current)
+            np.testing.assert_array_equal(xgb_scores, np.full(3, 0.5))
+            np.testing.assert_array_equal(rf_scores, np.full(3, 0.5))
+        self.assertEqual(ranker.degraded_models, [])
+
+    def test_model_failure_degrades_and_flags_instead_of_ending_the_scan(self):
+        ranker = scanner.MLRanker()
+        n_feat = len(scanner.MLRanker.FEATURE_COLS)
+        rng = np.random.default_rng(2)
+        X_train = rng.normal(size=(600, n_feat))
+        y_train = (rng.random(600) < 0.3).astype(int)
+        X_current = rng.normal(size=(1, n_feat))
+        survivors = [{"ticker": "TEST", "flags": []}]
+
+        with patch.object(
+            ranker, "_build_dataset",
+            return_value=(X_train, y_train, X_current, ["TEST"]),
+        ):
+            with patch.object(
+                ranker, "_train_xgboost", side_effect=RuntimeError("model blew up")
+            ):
+                with patch.object(ranker, "_train_rf", return_value=np.array([0.8])):
+                    with patch.object(ranker, "_train_lstm", return_value=None):
+                        with patch.object(scanner.log, "error"):
+                            out = ranker.rank(survivors, {}, training_universe={})
+
+        self.assertEqual(ranker.degraded_models, ["XGBoost"])
+        self.assertEqual(out[0]["ml_score_xgb"], 0.5)
+        self.assertEqual(out[0]["ml_score_rf"], 0.8)
+        self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.65)
+        # A 0.5 from a dead model is the absence of a signal, so it is flagged
+        # rather than presented as a neutral read on the name.
+        self.assertIn("ML_DEGRADED:XGBoost", out[0]["flags"])
 
     def test_world_headlines_drop_vendor_related_tickers(self):
         ctx = scanner.WorldContext()
