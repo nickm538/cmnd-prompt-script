@@ -8,12 +8,15 @@
   Capital: Real money -- zero tolerance for hallucinated data or shortcuts
 
   STAGES:
-    1. Universe Discovery   (Finnhub + yfinance)
+    1. Universe Discovery   (live exchange listings -- never a preset basket)
     2. Execution Guards     (data integrity, liquidity, spread, 3mo perf)
     3. Hard Buy Rules       (ALL 10 must pass)
     4. ML Ranking           (XGBoost + Random Forest + optional LSTM)
     5. 5-Investor Panel     (Livermore, Druckenmiller, Lynch, Minervini, O'Neil)
     6. Options Evaluation   (long calls, 0.35-0.50 delta, 14-45 DTE)
+
+  World context (live headlines + earnings calendar) annotates the regime and
+  survivors. It does not choose the universe.
 
   Run:  python new_stock_scanner_pipeline_claude_opus_41426.py
 ===============================================================================
@@ -71,7 +74,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ENGINE_NAME = "Claude Opus 5 Live Scanner Engine"
-ENGINE_VERSION = "5.2.0"
+ENGINE_VERSION = "5.3.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION -- API credentials prefer the environment, then committed
@@ -667,13 +670,16 @@ class WorldContext:
     NEWS_LOOKBACK_HOURS = 36
     EARNINGS_WINDOW_DAYS = 5
     MAX_HEADLINES = 12
-    # Classifiers for live headline text. These are event types, not tickers.
+    # Classifiers for live headline text. These are event types, never
+    # company names or a watchlist -- they only score today's tape.
     RISK_TERMS = (
         "federal reserve", "fomc", "rate hike", "rate cut", "interest rate",
         "cpi", "inflation", "pce ", "nonfarm", "payroll", "recession",
         "tariff", "sanction", "embargo", "blockade", "ceasefire",
         "invasion", "missile", "oil supply", "opec",
         "bank failure", "credit crunch", "sovereign default",
+        "geopolit", "war ", "shutdown", "debt ceiling", "default risk",
+        "nuclear", "hostage", "pandemic", "supply chain",
     )
 
     def __init__(self):
@@ -684,12 +690,12 @@ class WorldContext:
         self.market_status: Dict[str, Any] = {}
         self.source: str = ""
 
-    def load(self) -> None:
+    def load(self, snapshot: Optional[Dict[str, Dict]] = None) -> None:
         session = get_market_router().session
         self._load_news(session)
         self._load_earnings(session)
         self._load_market_status(session)
-        self._score_event_risk()
+        self._score_event_risk(snapshot)
         log.info(
             f"  World context: {len(self.headlines)} live headlines, "
             f"event-risk {self.event_risk:.0f}/100, "
@@ -737,7 +743,6 @@ class WorldContext:
                     "source": str(item.get("source") or ""),
                     "datetime": when.isoformat() if when is not None else None,
                     "url": str(item.get("url") or ""),
-                    "related": str(item.get("related") or ""),
                 })
                 if len(rows) >= 80:
                     break
@@ -804,7 +809,7 @@ class WorldContext:
         except Exception as exc:
             log.debug(f"  Market status fetch failed: {exc}")
 
-    def _score_event_risk(self) -> None:
+    def _score_event_risk(self, snapshot: Optional[Dict[str, Dict]] = None) -> None:
         score = 40.0
         notes: List[str] = []
         blob = " ".join(
@@ -822,6 +827,33 @@ class WorldContext:
         if holiday:
             score += 5
             notes.append(f"US session holiday flag: {holiday}")
+        is_open = self.market_status.get("is_open")
+        if is_open is False:
+            notes.append("US cash session closed at scan time (live market-status)")
+        # Live gauges from this run's macro snapshot -- indices/commodities,
+        # never a pre-selected equity.
+        snap = snapshot or {}
+        vix_last = (snap.get("vix") or {}).get("last")
+        if vix_last is not None:
+            if vix_last >= 35:
+                score += 18
+                notes.append(f"Live VIX {vix_last:.1f} -- panic tape")
+            elif vix_last >= 25:
+                score += 10
+                notes.append(f"Live VIX {vix_last:.1f} -- stressed tape")
+            elif vix_last >= 20:
+                score += 4
+                notes.append(f"Live VIX {vix_last:.1f} -- elevated tape")
+        gold_ret = (snap.get("gold") or {}).get("ret_20d")
+        if gold_ret is not None and gold_ret > 0.06 and (
+            vix_last is None or vix_last > 20
+        ):
+            score += 4
+            notes.append(f"Live gold +{gold_ret:.1%} 20d -- safe-haven bid")
+        wti_ret = (snap.get("wti") or {}).get("ret_20d")
+        if wti_ret is not None and abs(wti_ret) > 0.12:
+            score += 4
+            notes.append(f"Live WTI {wti_ret:+.1%} 20d -- energy shock tape")
         if self.earnings_soon:
             notes.append(
                 f"Live earnings calendar: {len(self.earnings_soon)} names "
@@ -836,7 +868,12 @@ class WorldContext:
         self.event_notes = notes
 
     def annotate(self, candidates: List[Dict], session=None) -> List[Dict]:
-        """Attach live news/earnings to already-selected names. Never adds tickers."""
+        """Attach live news/earnings to already-selected names. Never adds tickers.
+
+        Incoming candidate order and membership are preserved. Headlines and
+        the earnings calendar cannot insert, drop, or reorder names.
+        """
+        incoming_tickers = [str(c.get("ticker") or "") for c in candidates]
         if not candidates:
             return candidates
         session = session or get_market_router().session
@@ -858,6 +895,12 @@ class WorldContext:
                 candidate["live_headlines"] = headlines
                 if "LIVE_NEWS" not in flags:
                     flags.append("LIVE_NEWS")
+        outgoing = [str(c.get("ticker") or "") for c in candidates]
+        if outgoing != incoming_tickers:
+            raise PipelineError(
+                "World context mutated the candidate set. "
+                "News/earnings must never pick names."
+            )
         return candidates
 
     def _company_headlines(self, session, ticker: str, start: str, end: str) -> List[str]:
@@ -1159,7 +1202,7 @@ class MacroRegime:
     def _apply_world_context(self) -> None:
         """Fold live headlines into the already-computed price regime."""
         try:
-            self.world.load()
+            self.world.load(snapshot=self.snapshot)
         except Exception as exc:
             log.warning(f"  World context unavailable this run: {exc}")
             return
@@ -1429,7 +1472,7 @@ class UniverseDiscovery:
 class MboumAPI:
     """
     MBOUM Pro API client -- primary data source when credits remain.
-    Provides: OHLCV history (5yr), fundamentals, screener, options.
+    Provides: OHLCV history (5yr), fundamentals, options.
     Credit/quota failures trip a process-wide circuit so the rest of the
     scan falls through to Massive / TwelveData / Finnhub / Yahoo.
     """
@@ -1650,19 +1693,6 @@ class MboumAPI:
         except Exception:
             return None
         return None
-
-    def get_screener(self, list_name: str = "most_actives") -> List[Dict]:
-        """Fetch screener results."""
-        try:
-            url = f"{self.base}/v1/markets/screener"
-            params = {"list": list_name}
-            resp = self.session.get(url, params=params, timeout=15)
-            if resp.status_code == 200:
-                return resp.json().get("body", [])
-        except Exception:
-            pass
-        return []
-
 
 class YahooDirectAPI:
     """
@@ -4466,7 +4496,7 @@ class InvestorPanel:
     """
 
     def __init__(self, macro: Optional["MacroRegime"] = None):
-        self.spy_data = None
+        self.benchmark_data = None
         self.macro = macro
         # Universe-wide percentile lookups (computed lazily)
         self._rs_universe_returns: Optional[np.ndarray] = None
@@ -4497,34 +4527,34 @@ class InvestorPanel:
         return float((self._rs_universe_returns < ret_63d).mean() * 100.0)
 
     def load_benchmark(self):
-        """Load a live market benchmark for relative strength.
+        """Load a live market INDEX for relative strength.
 
-        Prefers the S&P 500 series already fetched for macro context (an index,
-        not a pre-selected equity). Only then fetches a live SPY history if
-        that snapshot is missing -- still not a stock pick.
+        Uses the S&P 500 series already fetched for macro context. If that
+        snapshot is missing, refetches the live ^GSPC index -- never an
+        equity ETF such as SPY, and never a stock pick.
         """
         try:
             if self.macro is not None:
                 snap = self.macro.snapshot.get("spx") or {}
-                spy = snap.get("df")
-                if spy is not None and len(spy) > 100:
-                    self.spy_data = spy
+                bench = snap.get("df")
+                if bench is not None and len(bench) > 100:
+                    self.benchmark_data = bench
                     log.info(
-                        f"  Market benchmark loaded ({len(spy)} bars via live SPX) "
+                        f"  Market benchmark loaded ({len(bench)} bars via live SPX) "
                         "for relative strength"
                     )
                     return
-            spy, source = get_market_router().get_history("SPY")
-            if spy is not None and len(spy) > 100:
-                self.spy_data = spy
-                log.info(
-                    f"  Market benchmark loaded ({len(spy)} bars via {source or 'live'}) "
-                    "for relative strength"
-                )
-            else:
-                log.warning("  Could not load live market benchmark")
+                bench = self.macro._series("^GSPC", range_="2y")
+                if bench is not None and len(bench) > 100:
+                    self.benchmark_data = bench
+                    log.info(
+                        f"  Market benchmark loaded ({len(bench)} bars via live ^GSPC) "
+                        "for relative strength"
+                    )
+                    return
+            log.warning("  Could not load live market index benchmark")
         except Exception as e:
-            log.warning(f"  Could not load live market benchmark: {e}")
+            log.warning(f"  Could not load live market index benchmark: {e}")
 
     def score_all(
         self,
@@ -4695,17 +4725,17 @@ class InvestorPanel:
             else:
                 pullback_score = 35
 
-        # 5. Relative Strength vs SPY (10%)
+        # 5. Relative Strength vs live SPX (10%)
         rs_score = 60
-        if self.spy_data is not None and len(self.spy_data) >= 126 and len(df) >= 126:
-            spy_close = self.spy_data["Close"]
+        if self.benchmark_data is not None and len(self.benchmark_data) >= 126 and len(df) >= 126:
+            bench_close = self.benchmark_data["Close"]
             stock_ret_1m = (close / df["Close"].iloc[-21]) - 1 if len(df) >= 21 else 0
             stock_ret_3m = (close / df["Close"].iloc[-63]) - 1 if len(df) >= 63 else 0
             stock_ret_6m = (close / df["Close"].iloc[-126]) - 1 if len(df) >= 126 else 0
 
-            spy_ret_1m = (spy_close.iloc[-1] / spy_close.iloc[-21]) - 1 if len(spy_close) >= 21 else 0
-            spy_ret_3m = (spy_close.iloc[-1] / spy_close.iloc[-63]) - 1 if len(spy_close) >= 63 else 0
-            spy_ret_6m = (spy_close.iloc[-1] / spy_close.iloc[-126]) - 1 if len(spy_close) >= 126 else 0
+            spy_ret_1m = (bench_close.iloc[-1] / bench_close.iloc[-21]) - 1 if len(bench_close) >= 21 else 0
+            spy_ret_3m = (bench_close.iloc[-1] / bench_close.iloc[-63]) - 1 if len(bench_close) >= 63 else 0
+            spy_ret_6m = (bench_close.iloc[-1] / bench_close.iloc[-126]) - 1 if len(bench_close) >= 126 else 0
 
             outperform_count = sum([
                 stock_ret_1m > spy_ret_1m,
@@ -4736,12 +4766,12 @@ class InvestorPanel:
         # 1. Macro Alignment (25%) -- sector momentum as proxy
         macro_score = 60
         sector = fund.get("sector", "Unknown")
-        # Use relative strength vs SPY as macro proxy
-        if self.spy_data is not None and len(df) >= 63:
+        # Use relative strength vs the live SPX index as macro proxy
+        if self.benchmark_data is not None and len(df) >= 63:
             stock_ret = (close / df["Close"].iloc[-63]) - 1
             spy_ret = (
-                self.spy_data["Close"].iloc[-1] / self.spy_data["Close"].iloc[-63] - 1
-            ) if len(self.spy_data) >= 63 else 0
+                self.benchmark_data["Close"].iloc[-1] / self.benchmark_data["Close"].iloc[-63] - 1
+            ) if len(self.benchmark_data) >= 63 else 0
             excess = stock_ret - spy_ret
             if excess > 0.15:
                 macro_score = 90
@@ -5145,14 +5175,14 @@ class InvestorPanel:
 
         # M: Market Direction (10%) -- Macro regime composite.
         # O'Neil emphasized following the general market; we use the full
-        # macro snapshot (VIX, yields, DXY, gold, oil, breadth) instead of
-        # SPY alone. Falls back to SPY MA stack when macro unavailable.
+        # live macro snapshot (VIX, yields, DXY, gold, oil, breadth) instead
+        # of a single ETF. Falls back to the live SPX MA stack if needed.
         if self.macro is not None:
             m_score = self.macro.panel_m_score()
         else:
             m_score = 60
-            if self.spy_data is not None and len(self.spy_data) >= 50:
-                spy_close = self.spy_data["Close"]
+            if self.benchmark_data is not None and len(self.benchmark_data) >= 50:
+                spy_close = self.benchmark_data["Close"]
                 spy_sma50 = spy_close.rolling(50).mean()
                 spy_sma200 = spy_close.rolling(200).mean()
                 if (not pd.isna(spy_sma50.iloc[-1]) and not pd.isna(spy_sma200.iloc[-1]) and
@@ -6139,10 +6169,12 @@ class OutputFormatter:
                 "This scan used live data only. The equity universe is discovered "
                 "fresh from the exchange listing each run. Prior scan_results are "
                 "never read as input. No hardcoded tickers, no watchlists, no "
-                "preset baskets, no fabricated values, no demo data. Live "
-                "headlines and the near-term earnings calendar contextualize "
-                "regime and annotate survivors; they do not select names. "
-                "Intraday partial bars are trimmed during RTH."
+                "preset baskets, no fabricated values, no demo data. Relative "
+                "strength uses the live S&P 500 index, not a pre-selected ETF. "
+                "Live headlines, US market status, VIX/energy/gold gauges, and "
+                "the near-term earnings calendar contextualize regime and "
+                "annotate survivors; they do not select names. Intraday partial "
+                "bars are trimmed during RTH."
             ),
             "data_sources": {
                 "ohlcv": dict(DATA_SOURCE_USAGE["ohlcv"]),

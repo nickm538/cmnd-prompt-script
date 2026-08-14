@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import inspect
 import os
 import unittest
 from unittest.mock import patch
@@ -307,6 +308,55 @@ class ScannerRegressionTests(unittest.TestCase):
             ]
         )
         self.assertEqual(cleaned, ["TEST"])
+
+    def test_engine_has_no_preset_screener_or_spy_etf_fetch(self):
+        source = inspect.getsource(scanner)
+        self.assertNotIn('get_history("SPY")', source)
+        self.assertNotIn("most_actives", source)
+        self.assertNotIn("SCAN_TICKERS", source)
+        self.assertNotIn("TICKER_LIST", source)
+        self.assertFalse(hasattr(scanner.MboumAPI, "get_screener"))
+
+    def test_benchmark_uses_live_spx_snapshot_not_spy(self):
+        idx = pd.bdate_range(end="2026-04-29", periods=120)
+        spx = pd.DataFrame({"Close": np.linspace(4000.0, 5200.0, 120)}, index=idx)
+        macro = scanner.MacroRegime()
+        macro.snapshot["spx"] = {"df": spx, "last": 5200.0}
+        panel = scanner.InvestorPanel(macro=macro)
+        with patch.object(scanner, "get_market_router") as router:
+            with patch.object(macro, "_series") as series:
+                panel.load_benchmark()
+        router.assert_not_called()
+        series.assert_not_called()
+        self.assertIs(panel.benchmark_data, spx)
+
+    def test_benchmark_fallback_fetches_live_spx_index_not_spy(self):
+        idx = pd.bdate_range(end="2026-04-29", periods=120)
+        spx = pd.DataFrame({"Close": np.linspace(4000.0, 5200.0, 120)}, index=idx)
+        macro = scanner.MacroRegime()
+        panel = scanner.InvestorPanel(macro=macro)
+        with patch.object(macro, "_series", return_value=spx) as series:
+            with patch.object(scanner, "get_market_router") as router:
+                panel.load_benchmark()
+        series.assert_called_once_with("^GSPC", range_="2y")
+        router.assert_not_called()
+        self.assertIs(panel.benchmark_data, spx)
+
+    def test_live_vix_raises_event_risk(self):
+        ctx = scanner.WorldContext()
+        ctx._score_event_risk(snapshot={"vix": {"last": 40.0}})
+        stressed = ctx.event_risk
+        ctx._score_event_risk(snapshot={"vix": {"last": 12.0}})
+        self.assertGreater(stressed, ctx.event_risk)
+
+    def test_world_headlines_drop_vendor_related_tickers(self):
+        ctx = scanner.WorldContext()
+        ctx.headlines = [
+            {"headline": "Fed holds rates amid tariff risk", "source": "wire"}
+        ]
+        dumped = ctx.to_dict()["headlines"][0]
+        self.assertNotIn("related", dumped)
+        self.assertFalse(dumped.get("related"))
 
 
 if __name__ == "__main__":

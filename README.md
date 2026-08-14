@@ -8,12 +8,14 @@ new_stock_scanner_pipeline_claude_opus_41426.py
 ```
 
 The scanner dynamically discovers the live universe, pulls current market data
-and headlines, checks macro regime context against today's world events,
+and headlines, checks macro regime context against today's world events and
+live market status (VIX, yields, USD, gold, oil, session open/holiday),
 applies execution guards and hard buy rules, ranks survivors, evaluates
 fundamentals/options, and writes auditable outputs. It does not use preset
-ticker baskets, watchlists, yesterday's CSV, or mock data. News and the
-earnings calendar annotate names that already survived; they never choose
-the universe.
+ticker baskets, watchlists, yesterday's CSV, mock data, or a pre-selected
+benchmark ETF. News and the earnings calendar annotate names that already
+survived; they never choose the universe. Relative strength is measured
+against the live S&P 500 index fetched that run.
 
 ## Local setup
 
@@ -103,8 +105,9 @@ Runtime outputs are ignored by git and written to:
 - `scan_results/near_misses_<timestamp>.json` when no ticker passes all hard
   rules
 
-The JSON report includes macro regime snapshots, pipeline funnel counts,
-feature importances, and an attestation that live data sources were used.
+The JSON report includes macro regime snapshots, live headlines, market
+status, pipeline funnel counts, feature importances, and an attestation
+that live data sources were used and that no preset ticker list was loaded.
 
 ## Operational notes
 
