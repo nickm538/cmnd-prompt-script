@@ -88,14 +88,30 @@ def _env_or_default(name: str, default: str = "") -> str:
     return value if value else default
 
 
-MASSIVE_API_KEY = _env_or_default("MASSIVE_API_KEY", "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H")
-ALPHAVANTAGE_API_KEY = _env_or_default("ALPHAVANTAGE_API_KEY")
-MBOUM_API_KEY = _env_or_default("MBOUM_API_KEY")
+# Committed fallback keys, in one table so credential reporting can tell a live
+# secret apart from a fallback. MBOUM (both tiers) and AlphaVantage have no
+# fallback on purpose -- MBOUM is the credit-metered primary, and running it on
+# a shared committed key would burn the plan the whole cascade depends on.
+EMBEDDED_FALLBACK_KEYS: Dict[str, str] = {
+    "MASSIVE_API_KEY": "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H",
+    "FINNHUB_API_KEY": "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg",
+    "TWELVEDATA_API_KEY": "5e7a5daaf41d46a8966963106ebef210",
+}
+
+
+def _resolve_api_key(name: str) -> str:
+    """Live env/secret first, then the committed fallback for that key."""
+    return _env_or_default(name, EMBEDDED_FALLBACK_KEYS.get(name, ""))
+
+
+MASSIVE_API_KEY = _resolve_api_key("MASSIVE_API_KEY")
+ALPHAVANTAGE_API_KEY = _resolve_api_key("ALPHAVANTAGE_API_KEY")
+MBOUM_API_KEY = _resolve_api_key("MBOUM_API_KEY")
 # Options-tier MBOUM key (different plan that includes the /v1/markets/options
 # endpoint), kept separate from the standard MBOUM key.
-MBOUM_OPTIONS_KEY = _env_or_default("MBOUM_OPTIONS_KEY")
-FINNHUB_API_KEY = _env_or_default("FINNHUB_API_KEY", "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg")
-TWELVEDATA_API_KEY = _env_or_default("TWELVEDATA_API_KEY", "5e7a5daaf41d46a8966963106ebef210")
+MBOUM_OPTIONS_KEY = _resolve_api_key("MBOUM_OPTIONS_KEY")
+FINNHUB_API_KEY = _resolve_api_key("FINNHUB_API_KEY")
+TWELVEDATA_API_KEY = _resolve_api_key("TWELVEDATA_API_KEY")
 MBOUM_BASE_URL = "https://api.mboum.com"
 MASSIVE_BASE_URL = "https://api.massive.com/v2"
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
@@ -406,19 +422,19 @@ class PipelineBudgetExceeded(PipelineError):
 
 
 def _credential_status(name: str) -> str:
+    """
+    Where this run's key comes from: a live env/Actions secret ("env"), the
+    committed fallback ("embedded"), or nowhere ("absent").
+
+    Resolved from the environment and EMBEDDED_FALLBACK_KEYS on every call --
+    never from the module constants above. Those freeze whatever environment
+    the process started in, so on Actions (where every secret is exported for
+    the job) they would report a live secret as "embedded" and claim a
+    committed fallback exists for keys that have none, such as MBOUM.
+    """
     if os.environ.get(name, "").strip():
         return "env"
-    resolved = {
-        "MASSIVE_API_KEY": MASSIVE_API_KEY,
-        "ALPHAVANTAGE_API_KEY": ALPHAVANTAGE_API_KEY,
-        "MBOUM_API_KEY": MBOUM_API_KEY,
-        "MBOUM_OPTIONS_KEY": MBOUM_OPTIONS_KEY,
-        "FINNHUB_API_KEY": FINNHUB_API_KEY,
-        "TWELVEDATA_API_KEY": TWELVEDATA_API_KEY,
-    }.get(name, "")
-    if resolved:
-        return "embedded"
-    return "absent"
+    return "embedded" if EMBEDDED_FALLBACK_KEYS.get(name, "") else "absent"
 
 
 def verify_api_credentials() -> Dict[str, str]:
