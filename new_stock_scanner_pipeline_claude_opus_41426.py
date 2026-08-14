@@ -2803,13 +2803,6 @@ class ExecutionGuards:
         for ticker, df in data.items():
             if df is None or df.empty or len(df) < MIN_TRADING_DAYS:
                 continue
-            last = df.iloc[-1]
-            close = last.get("Close", np.nan)
-            avg_dv = last.get("Avg_Dollar_Vol_20", np.nan)
-            if pd.isna(close) or close < 5.0:
-                continue
-            if pd.isna(avg_dv) or avg_dv < ExecutionGuards.MIN_DOLLAR_VOLUME:
-                continue
             # Halted / delisted-style series carry flat prices and a trivially
             # negative label, which is noise rather than signal. These are the
             # same integrity conditions GUARD_A uses, and unlike the 63-day
@@ -3753,6 +3746,9 @@ class MLRanker:
             except KeyError:
                 continue
             close = df["Close"]
+            avg_dv = df.get("Avg_Dollar_Vol_20")
+            if avg_dv is None:
+                continue
 
             # Forward-return label over the strategy's actual holding horizon.
             # The target is a *meaningful* move, not merely "up": training on
@@ -3765,8 +3761,12 @@ class MLRanker:
 
             train_section = feat_df.iloc[:-horizon]
             label_section = label.iloc[:-horizon]
+            eligible_section = (
+                (close >= 5.0) &
+                (avg_dv >= ExecutionGuards.MIN_DOLLAR_VOLUME)
+            ).iloc[:-horizon].fillna(False)
 
-            valid = train_section.dropna()
+            valid = train_section.loc[eligible_section].dropna()
             valid_labels = label_section.loc[valid.index].dropna()
             common_idx = valid.index.intersection(valid_labels.index)
 

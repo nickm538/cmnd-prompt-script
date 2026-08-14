@@ -572,7 +572,7 @@ class ScannerRegressionTests(unittest.TestCase):
             {"LOSER": loser, "WINNER": winner, "ILLIQUID": illiquid, "PENNY": penny}
         )
 
-        self.assertEqual(sorted(pool), ["LOSER", "WINNER"])
+        self.assertEqual(sorted(pool), ["ILLIQUID", "LOSER", "WINNER"])
         # ...while the guards themselves still reject the loser for trading.
         self.assertIsNotNone(
             scanner.ExecutionGuards._check(
