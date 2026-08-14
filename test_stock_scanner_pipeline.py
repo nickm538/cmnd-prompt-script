@@ -385,6 +385,110 @@ class ScannerRegressionTests(unittest.TestCase):
         ctx._score_event_risk(snapshot={"vix": {"last": 12.0}})
         self.assertGreater(stressed, ctx.event_risk)
 
+    def test_anti_chase_limits_reject_already_run_moves(self):
+        base = {
+            "Close_vs_SMA50": 0.10, "RSI_14": 55.0,
+            "Return_5d": 0.03, "Return_20d": 0.10, "Stretch_ATR": 1.5,
+        }
+        self.assertIsNone(scanner.ExecutionGuards._exhaustion_reason(pd.Series(base)))
+
+        # Each limit rejects on its own. The values that motivated tightening:
+        # 30% over the 50DMA, RSI 80, +35% in a week and +80% in a month all
+        # cleared the previous thresholds.
+        for field, value, expect in [
+            ("Close_vs_SMA50", 0.30, "Over-extended"),
+            ("RSI_14", 80.0, "Blow-off RSI"),
+            ("Return_5d", 0.35, "Vertical 5-day spike"),
+            ("Return_20d", 0.80, "Parabolic 20-day run"),
+            ("Stretch_ATR", 6.0, "Climax extension"),
+        ]:
+            reason = scanner.ExecutionGuards._exhaustion_reason(
+                pd.Series({**base, field: value})
+            )
+            self.assertIsNotNone(reason, f"{field}={value} should be rejected")
+            self.assertIn(expect, reason)
+
+    def test_climax_extension_is_volatility_aware_not_percentage_only(self):
+        # A name only 12% over its 50DMA but 6 ATR above its 20-day mean has
+        # gone vertical *for what it is*. The percentage checks cannot see that.
+        quiet_but_vertical = pd.Series({
+            "Close_vs_SMA50": 0.12, "RSI_14": 62.0,
+            "Return_5d": 0.08, "Return_20d": 0.15, "Stretch_ATR": 6.0,
+        })
+        reason = scanner.ExecutionGuards._exhaustion_reason(quiet_but_vertical)
+        self.assertIn("Climax extension", reason)
+
+        # A high-beta name at the same 3 ATR is an ordinary breakout, not a
+        # climax, and must survive.
+        high_beta_breakout = pd.Series({
+            "Close_vs_SMA50": 0.22, "RSI_14": 66.0,
+            "Return_5d": 0.11, "Return_20d": 0.30, "Stretch_ATR": 3.0,
+        })
+        self.assertIsNone(
+            scanner.ExecutionGuards._exhaustion_reason(high_beta_breakout)
+        )
+
+    def test_ml_features_are_cross_sectionally_comparable(self):
+        # No raw price-unit or raw-dollar magnitudes: the model ranks a $9 name
+        # against a $900 one, so every feature has to be a ratio or log scale.
+        self.assertNotIn("MACD_histogram", scanner.MLRanker.FEATURE_COLS)
+        self.assertNotIn("Avg_Dollar_Vol_20", scanner.MLRanker.FEATURE_COLS)
+        self.assertIn("MACD_hist_pct", scanner.MLRanker.FEATURE_COLS)
+        self.assertIn("Log_Dollar_Vol_20", scanner.MLRanker.FEATURE_COLS)
+
+        idx = pd.bdate_range(end="2026-04-29", periods=300)
+        rng = np.random.default_rng(5)
+        steps = rng.normal(0, 0.01, 300)
+        cheap = pd.DataFrame({"Close": 9.0 * np.exp(np.cumsum(steps))}, index=idx)
+        rich = pd.DataFrame({"Close": 900.0 * np.exp(np.cumsum(steps))}, index=idx)
+        for frame in (cheap, rich):
+            frame["Open"] = frame["Close"]
+            frame["High"] = frame["Close"] * 1.01
+            frame["Low"] = frame["Close"] * 0.99
+            frame["Volume"] = 1_000_000.0
+
+        cheap_out = scanner.TechnicalEngine.compute_all(cheap)
+        rich_out = scanner.TechnicalEngine.compute_all(rich)
+
+        # Identical price *path*, 100x different level: the normalised MACD
+        # must agree, while the raw one differs by roughly that same factor.
+        self.assertAlmostEqual(
+            cheap_out["MACD_hist_pct"].iloc[-1],
+            rich_out["MACD_hist_pct"].iloc[-1],
+            places=6,
+        )
+        self.assertGreater(
+            abs(rich_out["MACD_histogram"].iloc[-1]),
+            abs(cheap_out["MACD_histogram"].iloc[-1]) * 50,
+        )
+        # Log liquidity separates decades, not just the mega-cap tail.
+        self.assertAlmostEqual(
+            rich_out["Log_Dollar_Vol_20"].iloc[-1],
+            np.log10(rich_out["Avg_Dollar_Vol_20"].iloc[-1]),
+            places=6,
+        )
+
+    def test_lstm_sequence_norm_cannot_see_the_future(self):
+        idx = pd.bdate_range(end="2026-04-29", periods=120)
+        rng = np.random.default_rng(11)
+        feats = pd.DataFrame(
+            {"a": rng.normal(100, 5, 120), "b": rng.normal(0, 1, 120)}, index=idx
+        )
+
+        normed = scanner.MLRanker._causal_sequence_norm(feats, 20)
+
+        # Rewriting the tail must not move a single earlier normalised value.
+        tampered = feats.copy()
+        tampered.iloc[90:] *= 50.0
+        tampered_normed = scanner.MLRanker._causal_sequence_norm(tampered, 20)
+        pd.testing.assert_frame_equal(normed.iloc[:90], tampered_normed.iloc[:90])
+
+        # And the transform is a real trailing z-score, not a passthrough.
+        window = feats["a"].iloc[80:100]
+        expected = (feats["a"].iloc[99] - window.mean()) / window.std()
+        self.assertAlmostEqual(normed["a"].iloc[99], expected, places=9)
+        self.assertTrue(np.isfinite(normed.values).all())
+
     def test_backfill_pool_rejects_broken_trend_and_late_rsi(self):
         data = {
             f"T{i}": _guard_ready_df(datetime(2026, 4, 29).date()) for i in range(4)

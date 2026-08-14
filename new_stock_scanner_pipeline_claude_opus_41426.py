@@ -160,10 +160,23 @@ except ValueError:
 # names that have already gone parabolic and are statistically due to unwind.
 HOLDING_HORIZON_DAYS = 20          # short-to-mid term; also the ML label horizon
 ML_TARGET_RETURN = 0.05            # a "win" is +5% over the holding horizon
-MAX_EXTENSION_ABOVE_SMA50 = 0.35   # >35% above the 50DMA = climax-extended
-MAX_EXHAUSTION_RSI = 82.0          # blow-off territory
-MAX_SPIKE_RETURN_5D = 0.40         # +40% in a week = vertical, do not chase
-MAX_SPIKE_RETURN_20D = 1.00        # doubled in a month = late to the party
+
+# ── Anti-chase limits ────────────────────────────────────────────────────────
+# Calibrated against the actual objective: a 20-session hold for +5%. The test
+# for every limit below is "if a name is already past this, is the next +5%
+# still the most likely next move, or is the unwind?" The previous settings
+# (35% / RSI 82 / +40% in 5d / +100% in 20d) answered that generously -- a name
+# up 39% in a week and 34% over its 50DMA cleared every one of them, which is
+# not an entry, it is the exit somebody else is taking.
+MAX_EXTENSION_ABOVE_SMA50 = 0.25   # >25% above the 50DMA = climax-extended
+MAX_EXHAUSTION_RSI = 78.0          # blow-off territory
+MAX_SPIKE_RETURN_5D = 0.25         # +25% in a week is already violent
+MAX_SPIKE_RETURN_20D = 0.60        # +60% in a month = late to the party
+# Distance from the 20-day mean in ATRs. Volatility-aware, so it catches the
+# climax on a quiet $200 name and does not punish an ordinary breakout on a
+# high-beta one -- the blind spot a fixed percentage cannot cover. Ordinary
+# breakouts run 1.5-3 ATR; the exhaustion score already reads 100 at 4.0.
+MAX_STRETCH_ATR = 4.5
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -2472,6 +2485,11 @@ class TechnicalEngine:
         df["MACD_line"] = macd_line
         df["MACD_signal"] = signal_line
         df["MACD_histogram"] = histogram
+        # MACD in price units is meaningless across a universe: the same
+        # momentum reads ~100x larger on a $900 name than a $9 one. The rules
+        # only test its sign, so raw is fine there, but a cross-sectional model
+        # needs it per-dollar-of-price to compare names at all.
+        df["MACD_hist_pct"] = histogram / c.replace(0, np.nan)
 
         # Bollinger Bands
         upper, middle, lower = TechnicalEngine.bollinger_bands(c)
@@ -2488,6 +2506,15 @@ class TechnicalEngine:
         # Average dollar volume (20d)
         df["Dollar_Volume"] = c * v
         df["Avg_Dollar_Vol_20"] = TechnicalEngine.sma(df["Dollar_Volume"], 20)
+        # Liquidity spans $5M to $50B+ across the universe -- four orders of
+        # magnitude, almost all of the mass at the bottom. Standardising that
+        # raw leaves a feature that is ~0 for every name except a handful of
+        # mega-caps. On a log scale the same variable separates a $6M name from
+        # a $60M one as readily as $6B from $60B, which is how liquidity
+        # actually differs.
+        df["Log_Dollar_Vol_20"] = np.log10(
+            df["Avg_Dollar_Vol_20"].clip(lower=1.0)
+        )
 
         # Rolling 20-day high close
         df["High_Close_20"] = c.rolling(window=20, min_periods=20).max()
@@ -2911,6 +2938,17 @@ class ExecutionGuards:
             return (
                 f"Parabolic 20-day run ({ret_20d:.0%} > "
                 f"{MAX_SPIKE_RETURN_20D:.0%})"
+            )
+
+        # Volatility-normalised extension. The percentage checks above are
+        # blind to how much a given name normally moves; this one is not, so a
+        # $200 low-beta name that has quietly gone vertical is caught by the
+        # same rule that leaves a high-beta breakout alone.
+        stretch = last.get("Stretch_ATR", np.nan)
+        if not pd.isna(stretch) and stretch > MAX_STRETCH_ATR:
+            return (
+                f"Climax extension ({stretch:.1f} ATR above the 20-day mean "
+                f"> {MAX_STRETCH_ATR:.1f})"
             )
 
         return None
@@ -3415,10 +3453,15 @@ class MLRanker:
     Optional LSTM sequence layer.
     """
 
+    # Every feature here has to be comparable across a $9 name and a $900 one,
+    # because the model is fitted on the whole cross-section and then asked to
+    # rank names against each other. Returns, RSI and the vs-MA spreads are
+    # already ratios; MACD and dollar volume are the two that were not, and are
+    # taken price-normalised and log-scaled respectively.
     FEATURE_COLS = [
         "Return_1d", "Return_5d", "Return_20d", "RSI_14",
-        "MACD_histogram", "Volume_Ratio", "Close_vs_SMA50",
-        "Close_vs_SMA200", "EMA20_vs_EMA50", "Avg_Dollar_Vol_20",
+        "MACD_hist_pct", "Volume_Ratio", "Close_vs_SMA50",
+        "Close_vs_SMA200", "EMA20_vs_EMA50", "Log_Dollar_Vol_20",
     ]
 
     def __init__(self):
@@ -3605,6 +3648,25 @@ class MLRanker:
             return 1.0
         return float(negatives) / float(positives)
 
+    @staticmethod
+    def _causal_sequence_norm(feat_df: pd.DataFrame, window: int) -> pd.DataFrame:
+        """
+        Z-score each row against its own trailing window, never the full series.
+
+        Normalising the whole series at once computes the mean and std from
+        every bar, including ones after the row being scored: a day-50 sequence
+        was scaled using information from day 1200. That is look-ahead -- the
+        scale itself encodes where the bar sits relative to the future the
+        model is being asked to predict, and it inflates the reported score.
+
+        A trailing window keeps the transform causal. Dropping the level along
+        with it also makes sequences comparable across names, which raw prices
+        in the feature list otherwise are not.
+        """
+        roll = feat_df.rolling(window=window, min_periods=window)
+        normed = (feat_df - roll.mean()) / roll.std().replace(0, np.nan)
+        return normed.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     def _safe_scores(
         self,
         label: str,
@@ -3632,22 +3694,6 @@ class MLRanker:
             if label not in self.degraded_models:
                 self.degraded_models.append(label)
             return np.full(X_current.shape[0], 0.5)
-
-    def rank_near_misses(
-        self,
-        near_misses: List[Dict],
-        all_data: Dict[str, pd.DataFrame],
-        training_universe: Dict[str, pd.DataFrame],
-    ) -> List[Dict]:
-        """Score near misses for diagnostics without converting them to buys."""
-        shadow = [{"ticker": nm["ticker"]} for nm in near_misses]
-        scored = self.rank(shadow, all_data, training_universe=training_universe)
-        score_by_ticker = {s["ticker"]: s for s in scored}
-        for nm in near_misses:
-            scores = score_by_ticker.get(nm["ticker"], {})
-            for key in ("ml_score_xgb", "ml_score_rf", "ml_ensemble_score", "lstm_score"):
-                nm[key] = scores.get(key)
-        return near_misses
 
     def _build_dataset(
         self,
@@ -3978,11 +4024,7 @@ class MLRanker:
 
             feat_df = df[SEQ_FEATURES].copy()
             close = df["Close"]
-
-            # Normalize per-ticker (z-score)
-            feat_norm = (feat_df - feat_df.mean()) / feat_df.std().replace(0, 1)
-            feat_norm = feat_norm.fillna(0)
-            values = feat_norm.values
+            values = MLRanker._causal_sequence_norm(feat_df, SEQ_LEN).values
 
             # Forward return labels on the same horizon/threshold as the
             # tree ensemble so all three models optimise the same objective.
