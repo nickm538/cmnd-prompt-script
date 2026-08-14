@@ -32,11 +32,65 @@ class ScannerRegressionTests(unittest.TestCase):
     def setUp(self):
         scanner.reset_market_router()
 
-    def test_macro_regime_requires_live_required_symbols(self):
+    def test_missing_macro_series_degrades_instead_of_stopping_the_scan(self):
+        # The live failure: 9 of 10 macro series loaded, ^IRX did not, and the
+        # whole universe scan was discarded at Stage 0. Macro is context -- it
+        # tunes sizing and the panel's market-direction score, it does not pick
+        # or price a candidate -- so a dead endpoint must not cost the run.
+        macro = scanner.MacroRegime()
+        real_series = macro._series
+
+        def drop_irx(symbol, *args, **kwargs):
+            return None if symbol == macro.SYMBOLS["irx"] else real_series(
+                symbol, *args, **kwargs
+            )
+
+        idx = pd.bdate_range(end="2026-08-13", periods=260)
+        frame = pd.DataFrame({"Close": np.linspace(100.0, 130.0, 260)}, index=idx)
+
+        def fake_series(symbol, *args, **kwargs):
+            return None if symbol == macro.SYMBOLS["irx"] else frame.copy()
+
+        with patch.object(macro, "_series", side_effect=fake_series):
+            with patch.object(macro.world, "load"):
+                with patch.object(scanner.log, "warning"):
+                    macro.load()   # must not raise
+
+        self.assertTrue(macro.degraded)
+        self.assertEqual(macro.missing_symbols, ["irx"])
+        self.assertEqual(macro.missing_required, ["irx"])
+        self.assertIsNotNone(macro.regime_score)
+        self.assertNotEqual(macro.regime_label, "UNAVAILABLE")
+        # The absent series contributes nothing -- no yield-curve note is
+        # invented from a guessed short rate.
+        self.assertFalse(any("Yield curve" in n for n in macro.notes))
+        payload = macro.to_dict()
+        self.assertTrue(payload["macro_degraded"])
+        self.assertEqual(payload["inputs_missing_required"], ["irx"])
+
+    def test_total_macro_outage_still_yields_a_neutral_regime(self):
         macro = scanner.MacroRegime()
         with patch.object(macro, "_series", return_value=None):
-            with self.assertRaisesRegex(scanner.PipelineError, "Macro regime unavailable"):
-                macro.load()
+            with patch.object(macro.world, "load"):
+                with patch.object(scanner.log, "warning"):
+                    macro.load()   # must not raise
+
+        self.assertTrue(macro.degraded)
+        self.assertEqual(macro.regime_score, 50.0)
+        self.assertEqual(macro.regime_label, "NEUTRAL")
+        self.assertEqual(macro.notes, [])
+        self.assertEqual(len(macro.missing_symbols), len(macro.SYMBOLS))
+
+    def test_partial_macro_never_sizes_above_neutral(self):
+        macro = scanner.MacroRegime()
+        macro.regime_score = 90.0          # would normally scale to 1.20
+        macro.world.event_risk = 10.0
+        self.assertEqual(macro.position_sizing_scalar(), 1.20)
+
+        macro.missing_required = ["irx"]
+        # Read the regime from what loaded, but do not lever up on a partial
+        # picture: above 1.0 asserts confirmed risk-on.
+        self.assertEqual(macro.position_sizing_scalar(), 1.00)
 
     def test_expected_last_closed_trading_day_before_close_uses_prior_session(self):
         now = datetime(2026, 4, 30, 12, 0, tzinfo=scanner.ET_TZ)
@@ -690,6 +744,7 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.8)
         self.assertIn("ML_DEGRADED:LSTM", out[0]["flags"])
 
+    @unittest.skipUnless(scanner.LSTM_AVAILABLE, "torch not installed")
     def test_optional_lstm_internal_training_failure_propagates_to_degraded(self):
         # This test verifies that when an exception occurs INSIDE _train_lstm's
         # training code (not mocking _train_lstm itself), it propagates up to
