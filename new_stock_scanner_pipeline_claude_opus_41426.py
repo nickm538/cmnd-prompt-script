@@ -71,7 +71,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ENGINE_NAME = "Claude Opus 5 Live Scanner Engine"
-ENGINE_VERSION = "5.1.0"
+ENGINE_VERSION = "5.2.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION -- API credentials prefer the environment, then committed
@@ -653,6 +653,259 @@ class PipelineClock:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WORLD CONTEXT -- live headlines and event risk for THIS run only
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class WorldContext:
+    """
+    Current-world overlay. Headlines, market status and the near-term
+    earnings calendar contextualize regime and annotate names that already
+    survived the live scan. They never seed, replace, or shrink the equity
+    universe -- no watchlist, no yesterday's CSV, no news-derived basket.
+    """
+
+    NEWS_LOOKBACK_HOURS = 36
+    EARNINGS_WINDOW_DAYS = 5
+    MAX_HEADLINES = 12
+    # Classifiers for live headline text. These are event types, not tickers.
+    RISK_TERMS = (
+        "federal reserve", "fomc", "rate hike", "rate cut", "interest rate",
+        "cpi", "inflation", "pce ", "nonfarm", "payroll", "recession",
+        "tariff", "sanction", "embargo", "blockade", "ceasefire",
+        "invasion", "missile", "oil supply", "opec",
+        "bank failure", "credit crunch", "sovereign default",
+    )
+
+    def __init__(self):
+        self.headlines: List[Dict[str, Any]] = []
+        self.event_risk: float = 50.0
+        self.event_notes: List[str] = []
+        self.earnings_soon: Dict[str, str] = {}
+        self.market_status: Dict[str, Any] = {}
+        self.source: str = ""
+
+    def load(self) -> None:
+        session = get_market_router().session
+        self._load_news(session)
+        self._load_earnings(session)
+        self._load_market_status(session)
+        self._score_event_risk()
+        log.info(
+            f"  World context: {len(self.headlines)} live headlines, "
+            f"event-risk {self.event_risk:.0f}/100, "
+            f"{len(self.earnings_soon)} names reporting within "
+            f"{self.EARNINGS_WINDOW_DAYS}d"
+        )
+        for note in self.event_notes[:6]:
+            log.info(f"    - {note}")
+
+    def _load_news(self, session) -> None:
+        if not FINNHUB_API_KEY:
+            return
+        try:
+            resp = session.get(
+                f"{FINNHUB_BASE_URL}/news",
+                params={"category": "general", "token": FINNHUB_API_KEY},
+                timeout=15,
+            )
+            kind = classify_http_error(resp.status_code, resp.text or "")
+            if kind in ("credit", "auth"):
+                log.warning(f"  World news unavailable (HTTP {resp.status_code})")
+                return
+            if resp.status_code != 200:
+                return
+            payload = resp.json()
+            if not isinstance(payload, list):
+                return
+            cutoff = now_et_dt() - timedelta(hours=self.NEWS_LOOKBACK_HOURS)
+            rows = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                headline = str(item.get("headline") or "").strip()
+                if not headline:
+                    continue
+                ts = item.get("datetime")
+                try:
+                    when = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(ET_TZ)
+                except Exception:
+                    when = None
+                if when is not None and when < cutoff:
+                    continue
+                rows.append({
+                    "headline": headline[:240],
+                    "source": str(item.get("source") or ""),
+                    "datetime": when.isoformat() if when is not None else None,
+                    "url": str(item.get("url") or ""),
+                    "related": str(item.get("related") or ""),
+                })
+                if len(rows) >= 80:
+                    break
+            rows.sort(key=lambda r: r.get("datetime") or "", reverse=True)
+            self.headlines = rows[:self.MAX_HEADLINES]
+            if self.headlines:
+                self.source = "Finnhub"
+        except Exception as exc:
+            log.debug(f"  World news fetch failed: {exc}")
+
+    def _load_earnings(self, session) -> None:
+        if not FINNHUB_API_KEY:
+            return
+        start = today_et()
+        end = start + timedelta(days=self.EARNINGS_WINDOW_DAYS)
+        try:
+            resp = session.get(
+                f"{FINNHUB_BASE_URL}/calendar/earnings",
+                params={
+                    "from": start.isoformat(),
+                    "to": end.isoformat(),
+                    "token": FINNHUB_API_KEY,
+                },
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                return
+            payload = resp.json() or {}
+            rows = payload.get("earningsCalendar") or []
+            if not isinstance(rows, list):
+                return
+            soon = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                sym = str(row.get("symbol") or "").upper()
+                day = str(row.get("date") or "")
+                if not sym or not day or not sym.isalpha() or len(sym) > 5:
+                    continue
+                soon.setdefault(sym, day)
+            self.earnings_soon = soon
+        except Exception as exc:
+            log.debug(f"  Earnings calendar fetch failed: {exc}")
+
+    def _load_market_status(self, session) -> None:
+        if not FINNHUB_API_KEY:
+            return
+        try:
+            resp = session.get(
+                f"{FINNHUB_BASE_URL}/stock/market-status",
+                params={"exchange": "US", "token": FINNHUB_API_KEY},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return
+            payload = resp.json()
+            if isinstance(payload, dict):
+                self.market_status = {
+                    "exchange": payload.get("exchange"),
+                    "is_open": payload.get("isOpen"),
+                    "holiday": payload.get("holiday"),
+                    "timezone": payload.get("timezone"),
+                }
+        except Exception as exc:
+            log.debug(f"  Market status fetch failed: {exc}")
+
+    def _score_event_risk(self) -> None:
+        score = 40.0
+        notes: List[str] = []
+        blob = " ".join(
+            str(h.get("headline") or "").lower() for h in self.headlines
+        )
+        hits = [term for term in self.RISK_TERMS if term in blob]
+        if hits:
+            score += min(40.0, 8.0 * len(set(hits)))
+            notes.append(
+                "Live headlines mention: " + ", ".join(sorted(set(hits))[:8])
+            )
+        if self.headlines:
+            notes.append(f"Lead headline: {self.headlines[0]['headline'][:160]}")
+        holiday = self.market_status.get("holiday")
+        if holiday:
+            score += 5
+            notes.append(f"US session holiday flag: {holiday}")
+        if self.earnings_soon:
+            notes.append(
+                f"Live earnings calendar: {len(self.earnings_soon)} names "
+                f"print within {self.EARNINGS_WINDOW_DAYS} sessions "
+                "(used only to annotate survivors, not to pick names)"
+            )
+        if not self.headlines and not self.earnings_soon:
+            notes.append(
+                "World-event feed empty this run; regime uses live prices only."
+            )
+        self.event_risk = float(clamp(score, 0.0, 100.0))
+        self.event_notes = notes
+
+    def annotate(self, candidates: List[Dict], session=None) -> List[Dict]:
+        """Attach live news/earnings to already-selected names. Never adds tickers."""
+        if not candidates:
+            return candidates
+        session = session or get_market_router().session
+        start = (today_et() - timedelta(days=5)).isoformat()
+        end = today_et().isoformat()
+        for candidate in candidates:
+            ticker = str(candidate.get("ticker") or "").upper()
+            flags = candidate.get("flags")
+            if not isinstance(flags, list):
+                flags = []
+                candidate["flags"] = flags
+            earn = self.earnings_soon.get(ticker)
+            if earn:
+                candidate["live_earnings_date"] = earn
+                if "LIVE_EARNINGS_WINDOW" not in flags:
+                    flags.append("LIVE_EARNINGS_WINDOW")
+            headlines = self._company_headlines(session, ticker, start, end)
+            if headlines:
+                candidate["live_headlines"] = headlines
+                if "LIVE_NEWS" not in flags:
+                    flags.append("LIVE_NEWS")
+        return candidates
+
+    def _company_headlines(self, session, ticker: str, start: str, end: str) -> List[str]:
+        if not FINNHUB_API_KEY or not ticker:
+            return []
+        try:
+            resp = session.get(
+                f"{FINNHUB_BASE_URL}/company-news",
+                params={
+                    "symbol": ticker,
+                    "from": start,
+                    "to": end,
+                    "token": FINNHUB_API_KEY,
+                },
+                timeout=12,
+            )
+            if resp.status_code != 200:
+                return []
+            payload = resp.json()
+            if not isinstance(payload, list):
+                return []
+            out = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                headline = str(item.get("headline") or "").strip()
+                if headline:
+                    out.append(headline[:200])
+                if len(out) >= 3:
+                    break
+            return out
+        except Exception:
+            return []
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source": self.source or None,
+            "event_risk": round(self.event_risk, 1),
+            "notes": list(self.event_notes),
+            "market_status": dict(self.market_status),
+            "headlines": list(self.headlines),
+            "earnings_window_days": self.EARNINGS_WINDOW_DAYS,
+            "earnings_names_in_window": len(self.earnings_soon),
+            "seeds_universe": False,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MACRO REGIME -- live geopolitical / market-context overlay
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -698,6 +951,7 @@ class MacroRegime:
         self.regime_score: Optional[float] = None
         self.regime_label: str = "UNAVAILABLE"
         self.notes: List[str] = []
+        self.world = WorldContext()
 
     def _series(self, symbol: str, range_: str = "2y") -> Optional[pd.DataFrame]:
         """Pull recent OHLCV via Yahoo v8 chart -- no key needed."""
@@ -762,6 +1016,7 @@ class MacroRegime:
             )
 
         self._score_regime()
+        self._apply_world_context()
 
     def _score_regime(self) -> None:
         """Composite 0-100 macro regime score. Higher = more risk-on."""
@@ -901,6 +1156,42 @@ class MacroRegime:
         for n in notes:
             log.info(f"    - {n}")
 
+    def _apply_world_context(self) -> None:
+        """Fold live headlines into the already-computed price regime."""
+        try:
+            self.world.load()
+        except Exception as exc:
+            log.warning(f"  World context unavailable this run: {exc}")
+            return
+        if self.regime_score is None:
+            return
+        if self.world.event_risk >= 70:
+            self.regime_score = float(clamp(self.regime_score - 8.0, 0.0, 100.0))
+            self.notes.append(
+                f"Live event risk {self.world.event_risk:.0f}/100 -- "
+                "tightening regime until headlines cool"
+            )
+        elif self.world.event_risk >= 55:
+            self.regime_score = float(clamp(self.regime_score - 3.0, 0.0, 100.0))
+            self.notes.append(
+                f"Live event risk {self.world.event_risk:.0f}/100 -- modest caution"
+            )
+        self.notes.extend(self.world.event_notes[:4])
+        if self.regime_score >= 75:
+            self.regime_label = "RISK_ON"
+        elif self.regime_score >= 60:
+            self.regime_label = "CONSTRUCTIVE"
+        elif self.regime_score >= 45:
+            self.regime_label = "NEUTRAL"
+        elif self.regime_score >= 30:
+            self.regime_label = "DEFENSIVE"
+        else:
+            self.regime_label = "RISK_OFF"
+        log.info(
+            f"  Macro regime after world context: {self.regime_label} "
+            f"(score {self.regime_score:.0f}/100)"
+        )
+
     def position_sizing_scalar(self) -> float:
         """Multiplier in [0.4, 1.2] for downstream position sizing.
         Used to scale the recommended dollar exposure based on regime."""
@@ -908,14 +1199,20 @@ class MacroRegime:
             raise PipelineError("Macro regime score unavailable for position sizing.")
         s = self.regime_score
         if s >= 75:
-            return 1.20
-        if s >= 60:
-            return 1.00
-        if s >= 45:
-            return 0.80
-        if s >= 30:
-            return 0.55
-        return 0.40
+            scalar = 1.20
+        elif s >= 60:
+            scalar = 1.00
+        elif s >= 45:
+            scalar = 0.80
+        elif s >= 30:
+            scalar = 0.55
+        else:
+            scalar = 0.40
+        if self.world.event_risk >= 70:
+            scalar *= 0.80
+        elif self.world.event_risk >= 55:
+            scalar *= 0.90
+        return float(clamp(scalar, 0.40, 1.20))
 
     def panel_m_score(self) -> float:
         """Use the regime score directly as O'Neil's M (Market Direction)
@@ -928,6 +1225,7 @@ class MacroRegime:
         out = {"regime_score": round(self.regime_score, 1) if self.regime_score is not None else None,
                "regime_label": self.regime_label,
                "notes": list(self.notes),
+               "world_context": self.world.to_dict(),
                "snapshots": {}}
         for name, snap in self.snapshot.items():
             out["snapshots"][name] = {
@@ -1014,10 +1312,11 @@ class UniverseDiscovery:
                 except Exception as e:
                     retries += 1
                     if retries >= 3:
-                        raise PipelineError(
-                            f"Live universe discovery FAILED. Source: Massive. "
-                            f"Error: {e}. Do NOT substitute a preset basket."
+                        log.warning(
+                            f"Massive live universe failed ({e}); "
+                            "trying Finnhub US symbol list. Still no preset basket."
                         )
+                        return self._discover_finnhub()
                     log.warning(f"Massive retry {retries}/3 after {backoff}s -- {e}")
                     time.sleep(backoff)
                     backoff *= 2
@@ -1033,55 +1332,94 @@ class UniverseDiscovery:
             params = {"apiKey": self.api_key} if url else None
 
         if not isinstance(data, list) or len(data) == 0:
-            raise PipelineError(
-                "Massive returned empty symbol list. Pipeline STOPPED."
+            log.warning(
+                "Massive returned an empty symbol list; trying Finnhub US symbol list."
             )
+            return self._discover_finnhub()
 
-        # Filter to common stocks and ETFs on major exchanges ONLY
-        # Exclude OTC (OOTC), warrants, rights, units, ADRs with poor liquidity
-        VALID_MIC = {"XNYS", "XNAS", "XASE", "ARCX", "BATS"}
-        VALID_TYPES = {
-            "CS", "Common Stock", "EQS",
-            "ETF", "ETP", "REIT", "MLP", "Closed-End Fund",
-        }
-
-        tickers = []
-        for item in data:
-            sym = item.get("ticker", item.get("symbol", ""))
-            mic = item.get("primary_exchange", item.get("mic", ""))
-            sec_type = item.get("type", "")
-
-            # Must be on a major exchange (excludes 17K+ OTC names)
-            if mic not in VALID_MIC:
-                continue
-
-            # Must be a valid security type
-            if sec_type not in VALID_TYPES:
-                continue
-
-            # Skip symbols with special characters (warrants, preferred, units)
-            if any(c in sym for c in [".", "-", "/", "+"]):
-                continue
-            if len(sym) > 5 or len(sym) == 0:
-                continue
-            if not sym.isalpha():
-                continue
-
-            tickers.append(sym)
-
-        tickers = sorted(set(tickers))
+        tickers = self._clean_listed_equities(data)
         log.info(
             f"STAGE 1 COMPLETE: {len(data)} raw symbols -> {len(tickers)} "
             f"cleaned tickers (common stocks + ETFs)"
         )
 
         if len(tickers) < MIN_UNIVERSE_SIZE:
+            log.warning(
+                f"Massive universe too small ({len(tickers)}); trying Finnhub live list."
+            )
+            alt = self._discover_finnhub()
+            if len(alt) >= MIN_UNIVERSE_SIZE:
+                return alt
             raise PipelineError(
                 f"Universe too small ({len(tickers)} < {MIN_UNIVERSE_SIZE}). "
                 f"Pipeline STOPPED. Do NOT substitute a preset basket."
             )
 
         return tickers
+
+    def _discover_finnhub(self) -> List[str]:
+        """Live US listing fallback. Still a full exchange dump, never a watchlist."""
+        if not FINNHUB_API_KEY:
+            raise PipelineError(
+                "Live universe discovery FAILED on Massive and Finnhub is not "
+                "configured. Do NOT substitute a preset basket."
+            )
+        log.info("STAGE 1: Universe Discovery -- querying Finnhub /stock/symbol")
+        try:
+            resp = self.session.get(
+                f"{FINNHUB_BASE_URL}/stock/symbol",
+                params={"exchange": "US", "token": FINNHUB_API_KEY},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            raise PipelineError(
+                f"Live universe discovery FAILED. Sources: Massive then Finnhub. "
+                f"Error: {exc}. Do NOT substitute a preset basket."
+            )
+        if not isinstance(payload, list) or not payload:
+            raise PipelineError(
+                "Finnhub returned an empty symbol list. Do NOT substitute a preset basket."
+            )
+        tickers = self._clean_listed_equities(payload)
+        log.info(
+            f"STAGE 1 COMPLETE via Finnhub: {len(payload)} raw symbols -> "
+            f"{len(tickers)} cleaned tickers"
+        )
+        if len(tickers) < MIN_UNIVERSE_SIZE:
+            raise PipelineError(
+                f"Universe too small ({len(tickers)} < {MIN_UNIVERSE_SIZE}). "
+                f"Pipeline STOPPED. Do NOT substitute a preset basket."
+            )
+        return tickers
+
+    @staticmethod
+    def _clean_listed_equities(data: List[Dict]) -> List[str]:
+        VALID_MIC = {"XNYS", "XNAS", "XASE", "ARCX", "BATS"}
+        VALID_TYPES = {
+            "CS", "Common Stock", "EQS",
+            "ETF", "ETP", "REIT", "MLP", "Closed-End Fund",
+        }
+        tickers = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("ticker") or item.get("symbol") or item.get("displaySymbol") or "")
+            mic = str(item.get("primary_exchange") or item.get("mic") or "")
+            sec_type = str(item.get("type") or "")
+            if mic and mic not in VALID_MIC:
+                continue
+            if sec_type and sec_type not in VALID_TYPES:
+                continue
+            if any(c in sym for c in [".", "-", "/", "+"]):
+                continue
+            if len(sym) > 5 or len(sym) == 0:
+                continue
+            if not sym.isalpha():
+                continue
+            tickers.append(sym.upper())
+        return sorted(set(tickers))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4159,19 +4497,34 @@ class InvestorPanel:
         return float((self._rs_universe_returns < ret_63d).mean() * 100.0)
 
     def load_benchmark(self):
-        """Load SPY data for relative strength via MBOUM first, then fallbacks."""
+        """Load a live market benchmark for relative strength.
+
+        Prefers the S&P 500 series already fetched for macro context (an index,
+        not a pre-selected equity). Only then fetches a live SPY history if
+        that snapshot is missing -- still not a stock pick.
+        """
         try:
+            if self.macro is not None:
+                snap = self.macro.snapshot.get("spx") or {}
+                spy = snap.get("df")
+                if spy is not None and len(spy) > 100:
+                    self.spy_data = spy
+                    log.info(
+                        f"  Market benchmark loaded ({len(spy)} bars via live SPX) "
+                        "for relative strength"
+                    )
+                    return
             spy, source = get_market_router().get_history("SPY")
             if spy is not None and len(spy) > 100:
                 self.spy_data = spy
                 log.info(
-                    f"  SPY benchmark loaded ({len(spy)} bars via {source or 'fallback'}) "
+                    f"  Market benchmark loaded ({len(spy)} bars via {source or 'live'}) "
                     "for relative strength"
                 )
             else:
-                log.warning("  Could not load SPY benchmark from live providers")
+                log.warning("  Could not load live market benchmark")
         except Exception as e:
-            log.warning(f"  Could not load SPY benchmark: {e}")
+            log.warning(f"  Could not load live market benchmark: {e}")
 
     def score_all(
         self,
@@ -5783,11 +6136,12 @@ class OutputFormatter:
                 ],
             },
             "attestation": (
-                "This scan used live data only. MBOUM Pro is the primary "
-                "OHLCV/fundamentals/options source when credits remain. On "
-                "credit or quota failure the engine falls back to Massive, "
-                "TwelveData, Finnhub, then Yahoo v8 / yfinance. No hardcoded "
-                "tickers, no presets, no fabricated values, no demo data. "
+                "This scan used live data only. The equity universe is discovered "
+                "fresh from the exchange listing each run. Prior scan_results are "
+                "never read as input. No hardcoded tickers, no watchlists, no "
+                "preset baskets, no fabricated values, no demo data. Live "
+                "headlines and the near-term earnings calendar contextualize "
+                "regime and annotate survivors; they do not select names. "
                 "Intraday partial bars are trimmed during RTH."
             ),
             "data_sources": {
@@ -5822,6 +6176,8 @@ class OutputFormatter:
                     "hard_buy_pass": s.get("hard_buy_pass"),
                     "option_score": round(s.get("option_score", 0), 1),
                     "action": s.get("recommended_action", ""),
+                    "live_earnings_date": s.get("live_earnings_date"),
+                    "live_headlines": s.get("live_headlines") or [],
                 }
                 for s in survivors_sorted[:25]
             ],
@@ -5853,6 +6209,19 @@ class OutputFormatter:
             print(f"  │  Score: {macro_dict.get('regime_score', '')}/100" + " " * 38 + "│")
             for n in macro_dict.get("notes", []):
                 txt = str(n)[:48]
+                print(f"  │  - {txt:<48} │")
+            print(f"  └──────────────────────────────────────────────────┘")
+
+        world = macro_dict.get("world_context") or report.get("world_context") or {}
+        headlines = world.get("headlines") or []
+        if headlines or world.get("event_risk") is not None:
+            print("\n  ┌─ LIVE WORLD CONTEXT (does not pick tickers) ─────┐")
+            print(
+                f"  │  Event risk: {world.get('event_risk', '--')}/100"
+                + " " * 32 + "│"
+            )
+            for item in headlines[:5]:
+                txt = str(item.get("headline") or item)[:48]
                 print(f"  │  - {txt:<48} │")
             print(f"  └──────────────────────────────────────────────────┘")
 
@@ -6091,6 +6460,10 @@ def main():
     try:
         reset_market_router()
         verify_api_credentials()
+        log.info(
+            "Fresh run: live universe discovery only -- prior scan_results "
+            "are never read, and no ticker basket is preloaded."
+        )
 
         # ── STAGE 0: Macro Regime Snapshot ───────────────────────────
         # Establishes geopolitical/macro context BEFORE any equity work
@@ -6332,6 +6705,11 @@ def main():
             log.warning(
                 f"Only {len(final)} verified candidates available for top-{TARGET_FINAL_CANDIDATES} output."
             )
+
+        try:
+            macro.world.annotate(final)
+        except Exception as exc:
+            log.debug(f"  Live news annotation skipped: {exc}")
 
         # ── FORMAT AND SAVE OUTPUT ───────────────────────────────────
         result_df = OutputFormatter.format_and_save(

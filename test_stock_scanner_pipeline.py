@@ -278,6 +278,36 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertIsNotNone(df)
         mboum.assert_not_called()
 
+    def test_world_context_never_adds_tickers(self):
+        ctx = scanner.WorldContext()
+        ctx.earnings_soon = {"TEST": "2026-08-18"}
+        incoming = [{"ticker": "TEST", "flags": []}, {"ticker": "OTHER", "flags": []}]
+        with patch.object(ctx, "_company_headlines", return_value=["Live geopolitics headline"]):
+            out = ctx.annotate(incoming)
+        self.assertEqual([row["ticker"] for row in out], ["TEST", "OTHER"])
+        self.assertIn("LIVE_EARNINGS_WINDOW", out[0]["flags"])
+        self.assertIn("LIVE_NEWS", out[0]["flags"])
+        self.assertNotIn("LIVE_EARNINGS_WINDOW", out[1]["flags"])
+        self.assertFalse(ctx.to_dict()["seeds_universe"])
+
+    def test_high_live_event_risk_tightens_position_sizing(self):
+        macro = scanner.MacroRegime()
+        macro.regime_score = 80.0
+        macro.world.event_risk = 80.0
+        self.assertLess(macro.position_sizing_scalar(), 1.20)
+        macro.world.event_risk = 40.0
+        self.assertEqual(macro.position_sizing_scalar(), 1.20)
+
+    def test_universe_cleaner_is_a_filter_not_a_basket(self):
+        cleaned = scanner.UniverseDiscovery._clean_listed_equities(
+            [
+                {"ticker": "TEST", "primary_exchange": "XNAS", "type": "CS"},
+                {"ticker": "BRK.A", "primary_exchange": "XNYS", "type": "CS"},
+                {"symbol": "FAKE", "mic": "XNAS", "type": "Warrant"},
+            ]
+        )
+        self.assertEqual(cleaned, ["TEST"])
+
 
 if __name__ == "__main__":
     unittest.main()

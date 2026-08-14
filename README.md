@@ -7,10 +7,13 @@ entry point is:
 new_stock_scanner_pipeline_claude_opus_41426.py
 ```
 
-The scanner dynamically discovers the live universe, pulls current market data,
-checks macro regime context, applies execution guards and hard buy rules, ranks
-survivors, evaluates fundamentals/options, and writes auditable outputs. It does
-not use preset ticker baskets or mock data.
+The scanner dynamically discovers the live universe, pulls current market data
+and headlines, checks macro regime context against today's world events,
+applies execution guards and hard buy rules, ranks survivors, evaluates
+fundamentals/options, and writes auditable outputs. It does not use preset
+ticker baskets, watchlists, yesterday's CSV, or mock data. News and the
+earnings calendar annotate names that already survived; they never choose
+the universe.
 
 ## Local setup
 
