@@ -572,14 +572,20 @@ class ProviderCircuit:
             self.consecutive_failures = 0
             self.successes += 1
 
-    def record_failure(self, reason: str = "error", credit: bool = False) -> None:
-        with self._lock:
-            self.consecutive_failures += 1
-            should_trip = credit or self.consecutive_failures >= self.fail_limit
-            fail_reason = reason
-        if should_trip:
-            self.trip(fail_reason)
-
+def record_failure(self, reason: str = "error", credit: bool = False) -> None:
+    do_trip = False
+    fail_reason = reason
+    with self._lock:
+        self.consecutive_failures += 1
+        if credit or self.consecutive_failures >= self.fail_limit:
+            if not self.disabled:
+                # Disable under the lock to avoid races with record_success().
+                self.disabled = True
+                self.reason = fail_reason or "unavailable"
+                do_trip = True
+                fail_reason = self.reason
+    if do_trip:
+        self.trip(fail_reason)
 
 DATA_SOURCE_USAGE: Dict[str, Counter] = {
     "ohlcv": Counter(),
