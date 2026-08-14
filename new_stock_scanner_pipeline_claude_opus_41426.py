@@ -160,10 +160,23 @@ except ValueError:
 # names that have already gone parabolic and are statistically due to unwind.
 HOLDING_HORIZON_DAYS = 20          # short-to-mid term; also the ML label horizon
 ML_TARGET_RETURN = 0.05            # a "win" is +5% over the holding horizon
-MAX_EXTENSION_ABOVE_SMA50 = 0.35   # >35% above the 50DMA = climax-extended
-MAX_EXHAUSTION_RSI = 82.0          # blow-off territory
-MAX_SPIKE_RETURN_5D = 0.40         # +40% in a week = vertical, do not chase
-MAX_SPIKE_RETURN_20D = 1.00        # doubled in a month = late to the party
+
+# ── Anti-chase limits ────────────────────────────────────────────────────────
+# Calibrated against the actual objective: a 20-session hold for +5%. The test
+# for every limit below is "if a name is already past this, is the next +5%
+# still the most likely next move, or is the unwind?" The previous settings
+# (35% / RSI 82 / +40% in 5d / +100% in 20d) answered that generously -- a name
+# up 39% in a week and 34% over its 50DMA cleared every one of them, which is
+# not an entry, it is the exit somebody else is taking.
+MAX_EXTENSION_ABOVE_SMA50 = 0.25   # >25% above the 50DMA = climax-extended
+MAX_EXHAUSTION_RSI = 78.0          # blow-off territory
+MAX_SPIKE_RETURN_5D = 0.25         # +25% in a week is already violent
+MAX_SPIKE_RETURN_20D = 0.60        # +60% in a month = late to the party
+# Distance from the 20-day mean in ATRs. Volatility-aware, so it catches the
+# climax on a quiet $200 name and does not punish an ordinary breakout on a
+# high-beta one -- the blind spot a fixed percentage cannot cover. Ordinary
+# breakouts run 1.5-3 ATR; the exhaustion score already reads 100 at 4.0.
+MAX_STRETCH_ATR = 4.5
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -2472,6 +2485,11 @@ class TechnicalEngine:
         df["MACD_line"] = macd_line
         df["MACD_signal"] = signal_line
         df["MACD_histogram"] = histogram
+        # MACD in price units is meaningless across a universe: the same
+        # momentum reads ~100x larger on a $900 name than a $9 one. The rules
+        # only test its sign, so raw is fine there, but a cross-sectional model
+        # needs it per-dollar-of-price to compare names at all.
+        df["MACD_hist_pct"] = histogram / c.replace(0, np.nan)
 
         # Bollinger Bands
         upper, middle, lower = TechnicalEngine.bollinger_bands(c)
@@ -2488,6 +2506,15 @@ class TechnicalEngine:
         # Average dollar volume (20d)
         df["Dollar_Volume"] = c * v
         df["Avg_Dollar_Vol_20"] = TechnicalEngine.sma(df["Dollar_Volume"], 20)
+        # Liquidity spans $5M to $50B+ across the universe -- four orders of
+        # magnitude, almost all of the mass at the bottom. Standardising that
+        # raw leaves a feature that is ~0 for every name except a handful of
+        # mega-caps. On a log scale the same variable separates a $6M name from
+        # a $60M one as readily as $6B from $60B, which is how liquidity
+        # actually differs.
+        df["Log_Dollar_Vol_20"] = np.log10(
+            df["Avg_Dollar_Vol_20"].clip(lower=1.0)
+        )
 
         # Rolling 20-day high close
         df["High_Close_20"] = c.rolling(window=20, min_periods=20).max()
@@ -2752,6 +2779,41 @@ class ExecutionGuards:
     MIN_DOLLAR_VOLUME = 5_000_000
 
     @staticmethod
+    def ml_training_pool(
+        data: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Universe for *fitting* the ML models -- deliberately not the guarded set.
+
+        The guards admit a name partly on its latest 63-day return. Training on
+        that set conditions every historical row on performance that had not
+        happened yet when the row was printed: the model only ever sees a
+        January bar because the name went on to rally through August. That is
+        look-ahead selection. It inflates the positive class, flatters CV
+        accuracy, and teaches the ranker patterns that are an artifact of the
+        filter rather than of the market.
+
+        Screening on price and liquidity instead keeps untradeable noise out
+        using characteristics that are broadly stable across the training
+        window, so the forward-return label stays honest. Scoring still happens
+        only on fully guarded candidates -- this changes what the model learns
+        from, not what it is allowed to buy.
+        """
+        pool = {}
+        for ticker, df in data.items():
+            if df is None or df.empty or len(df) < MIN_TRADING_DAYS:
+                continue
+            # Halted / delisted-style series carry flat prices and a trivially
+            # negative label, which is noise rather than signal. These are the
+            # same integrity conditions GUARD_A uses, and unlike the 63-day
+            # return they say nothing about how the name went on to perform.
+            recent = df.iloc[-30:] if len(df) >= 30 else df
+            if (recent["Volume"] <= 0).all() or recent["Close"].nunique() <= 2:
+                continue
+            pool[ticker] = df
+        return pool
+
+    @staticmethod
     def _check(
         ticker: str, df: pd.DataFrame, now: Optional[datetime] = None
     ) -> Optional[str]:
@@ -2871,6 +2933,17 @@ class ExecutionGuards:
                 f"{MAX_SPIKE_RETURN_20D:.0%})"
             )
 
+        # Volatility-normalised extension. The percentage checks above are
+        # blind to how much a given name normally moves; this one is not, so a
+        # $200 low-beta name that has quietly gone vertical is caught by the
+        # same rule that leaves a high-beta breakout alone.
+        stretch = last.get("Stretch_ATR", np.nan)
+        if not pd.isna(stretch) and stretch > MAX_STRETCH_ATR:
+            return (
+                f"Climax extension ({stretch:.1f} ATR above the 20-day mean "
+                f"> {MAX_STRETCH_ATR:.1f})"
+            )
+
         return None
 
 
@@ -2883,6 +2956,17 @@ class HardBuyRules:
     10 hard buy rules. ALL must pass -- no exceptions, no ML override.
     Returns results with per-rule pass/fail and flags.
     """
+
+    # Rules a near-miss backfill may never fail.
+    #
+    # Most of the 10-rule card is about entry *timing* -- crossover recency,
+    # breakout, VWAP reclaim, volume surge -- and a genuinely strong name can
+    # miss one of those and still be the better trade. These two are not
+    # timing. BUY_01 is the trend itself, so failing it means buying a name
+    # below its own 200DMA with a rolling 50DMA, and BUY_08 failing on the
+    # high side is the definition of arriving after the move. Backfills are
+    # ranked and sized alongside strict passers, so they are held to both.
+    CRITICAL_NEAR_MISS_RULES = ("BUY_01", "BUY_08")
 
     @staticmethod
     def apply(
@@ -2999,6 +3083,7 @@ class HardBuyRules:
 
         needed_pool = max(target_size * 3, max_pool_size - len(pool))
         near_misses = HardBuyRules.near_misses(data, top_n=needed_pool)
+        blocked = 0
         for nm in near_misses:
             ticker = nm["ticker"]
             if ticker in seen or nm.get("rules_passed", 0) < MIN_NEAR_MISS_RULES:
@@ -3006,14 +3091,18 @@ class HardBuyRules:
             df = data.get(ticker)
             if df is None:
                 continue
-            pool.append(
-                HardBuyRules._candidate_record(
-                    ticker,
-                    df,
-                    rule_result=nm,
-                    hard_buy_pass=False,
-                )
+            record = HardBuyRules._candidate_record(
+                ticker,
+                df,
+                rule_result=nm,
+                hard_buy_pass=False,
             )
+            block_reason = HardBuyRules._backfill_block_reason(nm, record)
+            if block_reason:
+                blocked += 1
+                log.debug(f"  Backfill rejected {ticker}: {block_reason}")
+                continue
+            pool.append(record)
             seen.add(ticker)
             if len(pool) >= max_pool_size:
                 break
@@ -3022,7 +3111,35 @@ class HardBuyRules:
             f"STAGE 3B: Ranked candidate pool -- {len(pool)} total "
             f"({len(strict_survivors)} strict passers, {len(pool) - len(strict_survivors)} near-miss backfills)"
         )
+        if blocked:
+            log.info(
+                f"  {blocked} near-miss(es) held out of the buy pool: broken "
+                "trend, late RSI, or an already-extended move."
+            )
         return pool, near_misses
+
+    @staticmethod
+    def _backfill_block_reason(nm: Dict, record: Dict) -> Optional[str]:
+        """
+        Why this near-miss must not be promoted into the buy pool, or None.
+
+        A backfill is traded, not just reported, so it has to clear the parts
+        of the card that decide *whether* a name is buyable rather than merely
+        *when*. Without this, an 8-of-10 name could reach the top-7 while
+        trading below its 200DMA, or with RSI in the 70s -- the exact
+        "already ran, we are late" entry the strategy is built to avoid.
+        """
+        failed = {rule.split(":", 1)[0] for rule in nm.get("failed_rules", [])}
+        blocked_rules = [
+            rule for rule in HardBuyRules.CRITICAL_NEAR_MISS_RULES if rule in failed
+        ]
+        if blocked_rules:
+            return f"failed critical rule(s) {', '.join(blocked_rules)}"
+        # Reuses the exhaustion threshold that already drives EXTENDED_MOVE,
+        # so the anti-chase line is defined in exactly one place.
+        if "EXTENDED_MOVE" in record.get("flags", []):
+            return f"already extended (exhaustion {record.get('exhaustion_score')})"
+        return None
 
     @staticmethod
     def near_misses(
@@ -3322,6 +3439,18 @@ class HardBuyRules:
 # STAGE 4 -- ML RANKING LAYER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+class _ModelDegradedError(Exception):
+    """
+    Raised by a trainer when it cannot produce a real fit (e.g. single-class
+    labels, missing library) and has chosen to fall back to neutral scores.
+
+    Raising instead of returning allows _safe_scores to detect the skip and
+    record the model in degraded_models, so the ensemble status is always
+    reported correctly.
+    """
+
+
 class MLRanker:
     """
     XGBoost + Random Forest ensemble ranking.
@@ -3329,10 +3458,15 @@ class MLRanker:
     Optional LSTM sequence layer.
     """
 
+    # Every feature here has to be comparable across a $9 name and a $900 one,
+    # because the model is fitted on the whole cross-section and then asked to
+    # rank names against each other. Returns, RSI and the vs-MA spreads are
+    # already ratios; MACD and dollar volume are the two that were not, and are
+    # taken price-normalised and log-scaled respectively.
     FEATURE_COLS = [
         "Return_1d", "Return_5d", "Return_20d", "RSI_14",
-        "MACD_histogram", "Volume_Ratio", "Close_vs_SMA50",
-        "Close_vs_SMA200", "EMA20_vs_EMA50", "Avg_Dollar_Vol_20",
+        "MACD_hist_pct", "Volume_Ratio", "Close_vs_SMA50",
+        "Close_vs_SMA200", "EMA20_vs_EMA50", "Log_Dollar_Vol_20",
     ]
 
     def __init__(self):
@@ -3345,6 +3479,9 @@ class MLRanker:
         # pairwise as they arrived made the blend depend on training order and
         # silently halved the first model's contribution.
         self._importances_by_model: Dict[str, Dict[str, float]] = {}
+        # Models that fell back to neutral scores this run, so the report can
+        # say the ensemble was degraded instead of presenting 0.5 as a signal.
+        self.degraded_models: List[str] = []
 
     def _finalize_feature_importances(self) -> None:
         """Average the per-model importances into the reported blend."""
@@ -3401,11 +3538,14 @@ class MLRanker:
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_current_scaled = self.scaler.transform(X_current)
 
-        # Train XGBoost
-        xgb_scores = self._train_xgboost(X_train_scaled, y_train, X_current_scaled)
-
-        # Train Random Forest
-        rf_scores = self._train_rf(X_train_scaled, y_train, X_current_scaled)
+        # Train XGBoost and Random Forest. A model that fails degrades to
+        # neutral scores instead of ending the run at Stage 4.
+        xgb_scores = self._safe_scores(
+            "XGBoost", self._train_xgboost, X_train_scaled, y_train, X_current_scaled
+        )
+        rf_scores = self._safe_scores(
+            "RandomForest", self._train_rf, X_train_scaled, y_train, X_current_scaled
+        )
 
         # Ensemble
         ensemble_scores = (xgb_scores + rf_scores) / 2
@@ -3436,6 +3576,13 @@ class MLRanker:
             s["lstm_score"] = (
                 lstm_scores.get(s["ticker"]) if lstm_scores else None
             )
+            if self.degraded_models:
+                # Flag rather than hide it: a 0.5 from a failed model is the
+                # absence of a signal, not a neutral verdict on the name.
+                flags = s.setdefault("flags", [])
+                flag = "ML_DEGRADED:" + "+".join(self.degraded_models)
+                if flag not in flags:
+                    flags.append(flag)
 
         # Log feature importances
         self._finalize_feature_importances()
@@ -3452,42 +3599,118 @@ class MLRanker:
     def _cap_training_rows(
         X_train: np.ndarray, y_train: np.ndarray, max_rows: int = 80_000
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Keep the most recent, class-balanced rows so live scans finish."""
+        """
+        Keep the most recent rows, in date order, so live scans finish.
+
+        Rows arrive sorted by date and the walk-forward CV in _train_xgboost /
+        _train_rf depends on that order. Taking the most recent N rows of each
+        class *separately* breaks it: the majority class is drawn from a much
+        shorter recent window than the minority class, so once the kept rows
+        are re-sorted the oldest block contains minority-class rows only. On
+        the live universe (511,649 samples, 30.6% positive) that left the
+        first ~22,300 rows all class 1, TimeSeriesSplit handed XGBoost a
+        single-class first fold, and the scan died at Stage 4 with
+        "Invalid classes inferred from unique values of `y`".
+
+        It also trained the models on a class prior that drifted with the
+        calendar -- 100% positive in the oldest rows -- which is a data defect
+        no fold-skipping would repair.
+
+        Truncating chronologically keeps every fold contiguous in time and the
+        class prior stable. Imbalance is handled where it belongs: by the
+        estimators' own class weighting.
+        """
         if len(X_train) <= max_rows:
             return X_train, y_train
-        rng = np.random.default_rng(42)
-        per_class = max_rows // 2
-        keep = []
-        for cls in (0, 1):
-            idx = np.flatnonzero(y_train == cls)
-            if len(idx) > per_class:
-                idx = idx[-per_class:]
-            keep.append(idx)
-        keep_idx = np.concatenate(keep)
-        if len(keep_idx) < max_rows:
-            remaining = np.setdiff1d(np.arange(len(y_train)), keep_idx, assume_unique=False)
-            fill_n = min(max_rows - len(keep_idx), len(remaining))
-            if fill_n:
-                keep_idx = np.concatenate([keep_idx, remaining[-fill_n:]])
-        keep_idx = np.sort(keep_idx)
-        log.info(f"  Training set capped to {len(keep_idx)} most-recent balanced samples.")
-        return X_train[keep_idx], y_train[keep_idx]
+        X_train = X_train[-max_rows:]
+        y_train = y_train[-max_rows:]
+        log.info(
+            f"  Training set capped to the {len(y_train)} most recent samples "
+            f"(positive class {float(y_train.mean()):.1%}); imbalance handled "
+            "by model class weighting."
+        )
+        return X_train, y_train
 
-    def rank_near_misses(
+    @staticmethod
+    def _class_counts(y: np.ndarray) -> Tuple[int, int]:
+        """(negatives, positives) in a binary label vector."""
+        positives = int(np.count_nonzero(y == 1))
+        return int(np.asarray(y).size - positives), positives
+
+    @classmethod
+    def _scale_pos_weight(cls, y: np.ndarray) -> float:
+        """
+        XGBoost's imbalance lever: negatives / positives.
+
+        Takes over from the balanced subsample the trainer used to rely on, so
+        the model still weighs the classes equally while the rows stay in
+        unbroken date order. Keeping the effective balance also keeps the
+        predicted probabilities on the same scale downstream scoring already
+        assumes (0.5 = neutral).
+        """
+        negatives, positives = cls._class_counts(y)
+        if not positives or not negatives:
+            return 1.0
+        return float(negatives) / float(positives)
+
+    @staticmethod
+    def _causal_sequence_norm(feat_df: pd.DataFrame, window: int) -> pd.DataFrame:
+        """
+        Z-score each row against its own trailing window, never the full series.
+
+        Normalising the whole series at once computes the mean and std from
+        every bar, including ones after the row being scored: a day-50 sequence
+        was scaled using information from day 1200. That is look-ahead -- the
+        scale itself encodes where the bar sits relative to the future the
+        model is being asked to predict, and it inflates the reported score.
+
+        A trailing window keeps the transform causal. Dropping the level along
+        with it also makes sequences comparable across names, which raw prices
+        in the feature list otherwise are not.
+        """
+        roll = feat_df.rolling(window=window, min_periods=window)
+        normed = (feat_df - roll.mean()) / roll.std().replace(0, np.nan)
+        return normed.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    def _safe_scores(
         self,
-        near_misses: List[Dict],
-        all_data: Dict[str, pd.DataFrame],
-        training_universe: Dict[str, pd.DataFrame],
-    ) -> List[Dict]:
-        """Score near misses for diagnostics without converting them to buys."""
-        shadow = [{"ticker": nm["ticker"]} for nm in near_misses]
-        scored = self.rank(shadow, all_data, training_universe=training_universe)
-        score_by_ticker = {s["ticker"]: s for s in scored}
-        for nm in near_misses:
-            scores = score_by_ticker.get(nm["ticker"], {})
-            for key in ("ml_score_xgb", "ml_score_rf", "ml_ensemble_score", "lstm_score"):
-                nm[key] = scores.get(key)
-        return near_misses
+        label: str,
+        trainer,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_current: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Run one model, degrading to neutral scores instead of aborting the scan.
+
+        Stage 4 lands a few minutes into a ~100 minute run and every later
+        stage depends on it, so a single estimator blowing up must not throw
+        away the whole scan. The degradation is recorded and reported rather
+        than passed off as a real score.
+
+        Trainers signal a deliberate graceful skip by raising
+        _ModelDegradedError; unexpected exceptions are caught with the same
+        result so that no single model can abort the whole scan.
+        """
+        try:
+            return trainer(X_train, y_train, X_current)
+        except _ModelDegradedError as exc:
+            log.warning(
+                f"  {label} skipped ({exc}) -- scoring every survivor "
+                "0.5 for this model and continuing."
+            )
+            if label not in self.degraded_models:
+                self.degraded_models.append(label)
+            return np.full(X_current.shape[0], 0.5)
+        except Exception as exc:
+            log.error(
+                f"  {label} training failed ({exc}) -- scoring every survivor "
+                "0.5 for this model and continuing."
+            )
+            log.debug(traceback.format_exc())
+            if label not in self.degraded_models:
+                self.degraded_models.append(label)
+            return np.full(X_current.shape[0], 0.5)
 
     def _build_dataset(
         self,
@@ -3523,6 +3746,9 @@ class MLRanker:
             except KeyError:
                 continue
             close = df["Close"]
+            avg_dv = df.get("Avg_Dollar_Vol_20")
+            if avg_dv is None:
+                continue
 
             # Forward-return label over the strategy's actual holding horizon.
             # The target is a *meaningful* move, not merely "up": training on
@@ -3535,8 +3761,12 @@ class MLRanker:
 
             train_section = feat_df.iloc[:-horizon]
             label_section = label.iloc[:-horizon]
+            eligible_section = (
+                (close >= 5.0) &
+                (avg_dv >= ExecutionGuards.MIN_DOLLAR_VOLUME)
+            ).iloc[:-horizon].fillna(False)
 
-            valid = train_section.dropna()
+            valid = train_section.loc[eligible_section].dropna()
             valid_labels = label_section.loc[valid.index].dropna()
             common_idx = valid.index.intersection(valid_labels.index)
 
@@ -3601,9 +3831,17 @@ class MLRanker:
     ) -> np.ndarray:
         """Train XGBoost and return predicted probabilities for current data."""
         if not XGB_AVAILABLE:
-            log.warning("XGBoost not installed -- using Random Forest only")
-            return np.full(X_current.shape[0], 0.5)
+            raise _ModelDegradedError("XGBoost not installed")
 
+        negatives, positives = self._class_counts(y_train)
+        if not negatives or not positives:
+            # XGBoost treats a single-class target as a fatal ValueError.
+            raise _ModelDegradedError(
+                "training labels are single-class "
+                f"(all {'positive' if positives else 'negative'})"
+            )
+
+        scale_pos_weight = self._scale_pos_weight(y_train)
         model = xgb.XGBClassifier(
             n_estimators=200,
             max_depth=6,
@@ -3611,6 +3849,7 @@ class MLRanker:
             subsample=0.8,
             colsample_bytree=0.8,
             eval_metric="logloss",
+            scale_pos_weight=scale_pos_weight,
             random_state=42,
             verbosity=0,
         )
@@ -3621,21 +3860,42 @@ class MLRanker:
         tscv = TimeSeriesSplit(n_splits=5)
         val_accs = []
         train_accs = []
+        skipped_folds = 0
         for train_idx, val_idx in tscv.split(X_train):
             if gap > 0:
                 val_start = val_idx[0]
                 train_idx = train_idx[train_idx < (val_start - gap)]
                 if train_idx.size == 0:
                     continue
+            if np.unique(y_train[train_idx]).size < 2:
+                # Still reachable on a narrow or quiet universe, where an early
+                # window can hold one class only. Skip rather than let XGBoost
+                # raise and take the whole scan down with it.
+                skipped_folds += 1
+                continue
             model.fit(X_train[train_idx], y_train[train_idx])
             train_pred = model.predict(X_train[train_idx])
             val_pred = model.predict(X_train[val_idx])
             train_accs.append(accuracy_score(y_train[train_idx], train_pred))
             val_accs.append(accuracy_score(y_train[val_idx], val_pred))
 
-        avg_train = np.mean(train_accs)
-        avg_val = np.mean(val_accs)
-        log.info(f"  XGBoost CV -- Train acc: {avg_train:.3f}, Val acc: {avg_val:.3f}")
+        if skipped_folds:
+            log.warning(
+                f"  XGBoost CV skipped {skipped_folds} single-class fold(s)."
+            )
+
+        if val_accs:
+            avg_train = float(np.mean(train_accs))
+            avg_val = float(np.mean(val_accs))
+            log.info(
+                f"  XGBoost CV -- Train acc: {avg_train:.3f}, Val acc: {avg_val:.3f}"
+            )
+        else:
+            avg_train = avg_val = float("nan")
+            log.warning(
+                "  XGBoost CV produced no usable folds -- fitting on the full "
+                "training set without validation accuracy."
+            )
 
         if avg_train > 0.90 and avg_val < 0.60:
             log.warning(
@@ -3650,6 +3910,7 @@ class MLRanker:
                 reg_alpha=1.0,
                 reg_lambda=2.0,
                 eval_metric="logloss",
+                scale_pos_weight=scale_pos_weight,
                 random_state=42,
                 verbosity=0,
             )
@@ -3671,10 +3932,22 @@ class MLRanker:
         self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray
     ) -> np.ndarray:
         """Train Random Forest and return predicted probabilities."""
+        negatives, positives = self._class_counts(y_train)
+        if not negatives or not positives:
+            # A single-class fit leaves predict_proba with one column, so the
+            # [:, 1] lookup below would raise IndexError.
+            raise _ModelDegradedError(
+                "training labels are single-class "
+                f"(all {'positive' if positives else 'negative'})"
+            )
+
         model = RandomForestClassifier(
             n_estimators=200,
             max_depth=8,
             min_samples_leaf=20,
+            # Matches XGBoost's scale_pos_weight now that the training rows are
+            # capped chronologically instead of class-balanced by subsampling.
+            class_weight="balanced",
             random_state=42,
             n_jobs=-1,
         )
@@ -3690,16 +3963,32 @@ class MLRanker:
             use_manual_gap = True
 
         val_accs = []
+        skipped_folds = 0
         for train_idx, val_idx in tscv.split(X_train):
             if use_manual_gap:
                 if len(train_idx) <= gap:
                     continue
                 train_idx = train_idx[:-gap]
+            if np.unique(y_train[train_idx]).size < 2:
+                # Single-class fold: the fit would produce a one-column
+                # predict_proba and a meaningless accuracy. Skip it.
+                skipped_folds += 1
+                continue
             model.fit(X_train[train_idx], y_train[train_idx])
             val_pred = model.predict(X_train[val_idx])
             val_accs.append(accuracy_score(y_train[val_idx], val_pred))
 
-        log.info(f"  Random Forest CV -- Val acc: {np.mean(val_accs):.3f}")
+        if skipped_folds:
+            log.warning(
+                f"  Random Forest CV skipped {skipped_folds} single-class fold(s)."
+            )
+        if val_accs:
+            log.info(f"  Random Forest CV -- Val acc: {np.mean(val_accs):.3f}")
+        else:
+            log.warning(
+                "  Random Forest CV produced no usable folds -- fitting on the "
+                "full training set without validation accuracy."
+            )
 
         # Final fit
         model.fit(X_train, y_train)
@@ -3754,11 +4043,7 @@ class MLRanker:
 
             feat_df = df[SEQ_FEATURES].copy()
             close = df["Close"]
-
-            # Normalize per-ticker (z-score)
-            feat_norm = (feat_df - feat_df.mean()) / feat_df.std().replace(0, 1)
-            feat_norm = feat_norm.fillna(0)
-            values = feat_norm.values
+            values = MLRanker._causal_sequence_norm(feat_df, SEQ_LEN).values
 
             # Forward return labels on the same horizon/threshold as the
             # tree ensemble so all three models optimise the same objective.
@@ -6591,18 +6876,35 @@ def main():
             raise PipelineError("No rankable candidates after hard-rule scoring. Pipeline STOPPED.")
 
         # ── STAGE 4: ML Ranking ──────────────────────────────────────
-        # Train on the FULL guarded universe (~50x more samples than
-        # survivors-only) for true discriminative power.
+        # Train on a broad price/liquidity-screened universe (~50x more
+        # samples than survivors-only) for true discriminative power.
         clock.check("Stage 4: ML Ranking")
         ranker = MLRanker()
-        survivors = ranker.rank(survivors, all_data, training_universe=guarded_data)
+        # Fit on the liquidity/price-screened universe, not the guarded set:
+        # the guards condition on a name's latest 63-day return, which is
+        # look-ahead relative to the historical rows being labelled.
+        ml_training_pool = ExecutionGuards.ml_training_pool(all_data)
+        log.info(
+            f"  ML training universe: {len(ml_training_pool)} tickers "
+            f"(price/liquidity screen on {len(all_data)}), scoring "
+            f"{len(survivors)} guarded candidates."
+        )
+        survivors = ranker.rank(survivors, all_data, training_universe=ml_training_pool)
         ml_params = {
             "XGBoost": "n_estimators=200, max_depth=6, lr=0.05, subsample=0.8",
             "RandomForest": "n_estimators=200, max_depth=8, min_samples_leaf=20",
             "LSTM": "Available (PyTorch)" if LSTM_AVAILABLE else "Not installed",
             "XGB_available": XGB_AVAILABLE,
-            "training_universe_size": len(guarded_data),
+            "training_universe_size": len(ml_training_pool),
+            "training_universe_screen": "price >= $5 and 20d avg $vol >= $5M",
+            "degraded_models": list(ranker.degraded_models),
         }
+        if ranker.degraded_models:
+            log.warning(
+                "  ML ensemble degraded this run -- "
+                f"{', '.join(ranker.degraded_models)} scored 0.5 for every "
+                "survivor. Ranking leans on the hard rules and panel."
+            )
         feature_importances = ranker.feature_importances
 
         # ── FUNDAMENTALS FETCH (survivors only) ──────────────────────

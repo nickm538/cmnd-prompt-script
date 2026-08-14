@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import TimeSeriesSplit
 
 import new_stock_scanner_pipeline_claude_opus_41426 as scanner
 
@@ -383,6 +384,292 @@ class ScannerRegressionTests(unittest.TestCase):
         stressed = ctx.event_risk
         ctx._score_event_risk(snapshot={"vix": {"last": 12.0}})
         self.assertGreater(stressed, ctx.event_risk)
+
+    def test_anti_chase_limits_reject_already_run_moves(self):
+        base = {
+            "Close_vs_SMA50": 0.10, "RSI_14": 55.0,
+            "Return_5d": 0.03, "Return_20d": 0.10, "Stretch_ATR": 1.5,
+        }
+        self.assertIsNone(scanner.ExecutionGuards._exhaustion_reason(pd.Series(base)))
+
+        # Each limit rejects on its own. The values that motivated tightening:
+        # 30% over the 50DMA, RSI 80, +35% in a week and +80% in a month all
+        # cleared the previous thresholds.
+        for field, value, expect in [
+            ("Close_vs_SMA50", 0.30, "Over-extended"),
+            ("RSI_14", 80.0, "Blow-off RSI"),
+            ("Return_5d", 0.35, "Vertical 5-day spike"),
+            ("Return_20d", 0.80, "Parabolic 20-day run"),
+            ("Stretch_ATR", 6.0, "Climax extension"),
+        ]:
+            reason = scanner.ExecutionGuards._exhaustion_reason(
+                pd.Series({**base, field: value})
+            )
+            self.assertIsNotNone(reason, f"{field}={value} should be rejected")
+            self.assertIn(expect, reason)
+
+    def test_climax_extension_is_volatility_aware_not_percentage_only(self):
+        # A name only 12% over its 50DMA but 6 ATR above its 20-day mean has
+        # gone vertical *for what it is*. The percentage checks cannot see that.
+        quiet_but_vertical = pd.Series({
+            "Close_vs_SMA50": 0.12, "RSI_14": 62.0,
+            "Return_5d": 0.08, "Return_20d": 0.15, "Stretch_ATR": 6.0,
+        })
+        reason = scanner.ExecutionGuards._exhaustion_reason(quiet_but_vertical)
+        self.assertIn("Climax extension", reason)
+
+        # A high-beta name at the same 3 ATR is an ordinary breakout, not a
+        # climax, and must survive.
+        high_beta_breakout = pd.Series({
+            "Close_vs_SMA50": 0.22, "RSI_14": 66.0,
+            "Return_5d": 0.11, "Return_20d": 0.30, "Stretch_ATR": 3.0,
+        })
+        self.assertIsNone(
+            scanner.ExecutionGuards._exhaustion_reason(high_beta_breakout)
+        )
+
+    def test_ml_features_are_cross_sectionally_comparable(self):
+        # No raw price-unit or raw-dollar magnitudes: the model ranks a $9 name
+        # against a $900 one, so every feature has to be a ratio or log scale.
+        self.assertNotIn("MACD_histogram", scanner.MLRanker.FEATURE_COLS)
+        self.assertNotIn("Avg_Dollar_Vol_20", scanner.MLRanker.FEATURE_COLS)
+        self.assertIn("MACD_hist_pct", scanner.MLRanker.FEATURE_COLS)
+        self.assertIn("Log_Dollar_Vol_20", scanner.MLRanker.FEATURE_COLS)
+
+        idx = pd.bdate_range(end="2026-04-29", periods=300)
+        rng = np.random.default_rng(5)
+        steps = rng.normal(0, 0.01, 300)
+        cheap = pd.DataFrame({"Close": 9.0 * np.exp(np.cumsum(steps))}, index=idx)
+        rich = pd.DataFrame({"Close": 900.0 * np.exp(np.cumsum(steps))}, index=idx)
+        for frame in (cheap, rich):
+            frame["Open"] = frame["Close"]
+            frame["High"] = frame["Close"] * 1.01
+            frame["Low"] = frame["Close"] * 0.99
+            frame["Volume"] = 1_000_000.0
+
+        cheap_out = scanner.TechnicalEngine.compute_all(cheap)
+        rich_out = scanner.TechnicalEngine.compute_all(rich)
+
+        # Identical price *path*, 100x different level: the normalised MACD
+        # must agree, while the raw one differs by roughly that same factor.
+        self.assertAlmostEqual(
+            cheap_out["MACD_hist_pct"].iloc[-1],
+            rich_out["MACD_hist_pct"].iloc[-1],
+            places=6,
+        )
+        self.assertGreater(
+            abs(rich_out["MACD_histogram"].iloc[-1]),
+            abs(cheap_out["MACD_histogram"].iloc[-1]) * 50,
+        )
+        # Log liquidity separates decades, not just the mega-cap tail.
+        self.assertAlmostEqual(
+            rich_out["Log_Dollar_Vol_20"].iloc[-1],
+            np.log10(rich_out["Avg_Dollar_Vol_20"].iloc[-1]),
+            places=6,
+        )
+
+    def test_lstm_sequence_norm_cannot_see_the_future(self):
+        idx = pd.bdate_range(end="2026-04-29", periods=120)
+        rng = np.random.default_rng(11)
+        feats = pd.DataFrame(
+            {"a": rng.normal(100, 5, 120), "b": rng.normal(0, 1, 120)}, index=idx
+        )
+
+        normed = scanner.MLRanker._causal_sequence_norm(feats, 20)
+
+        # Rewriting the tail must not move a single earlier normalised value.
+        tampered = feats.copy()
+        tampered.iloc[90:] *= 50.0
+        tampered_normed = scanner.MLRanker._causal_sequence_norm(tampered, 20)
+        pd.testing.assert_frame_equal(normed.iloc[:90], tampered_normed.iloc[:90])
+
+        # And the transform is a real trailing z-score, not a passthrough.
+        window = feats["a"].iloc[80:100]
+        expected = (feats["a"].iloc[99] - window.mean()) / window.std()
+        self.assertAlmostEqual(normed["a"].iloc[99], expected, places=9)
+        self.assertTrue(np.isfinite(normed.values).all())
+
+    def test_backfill_pool_rejects_broken_trend_and_late_rsi(self):
+        data = {
+            f"T{i}": _guard_ready_df(datetime(2026, 4, 29).date()) for i in range(4)
+        }
+        # T1 is below its own 200DMA, T2 arrives with RSI already run up, T3 is
+        # clean. All three pass the 8-of-10 near-miss bar.
+        near_misses = [
+            {
+                "ticker": "T1",
+                "rules_passed": 8,
+                "rules_failed": 2,
+                "passed_rules": [f"BUY_{j:02d}" for j in (2, 3, 4, 5, 6, 7, 8, 9)],
+                "failed_rules": ["BUY_01:Trend", "BUY_10:Penny"],
+                "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 55,
+            },
+            {
+                "ticker": "T2",
+                "rules_passed": 8,
+                "rules_failed": 2,
+                "passed_rules": [f"BUY_{j:02d}" for j in (1, 2, 3, 4, 5, 6, 7, 9)],
+                "failed_rules": ["BUY_08:RSI", "BUY_10:Penny"],
+                "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 78,
+            },
+            {
+                "ticker": "T3",
+                "rules_passed": 8,
+                "rules_failed": 2,
+                "passed_rules": [f"BUY_{j:02d}" for j in (1, 2, 4, 6, 7, 8, 9, 10)],
+                "failed_rules": ["BUY_03:BB/High", "BUY_05:Crossover"],
+                "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 55,
+            },
+        ]
+
+        with patch.object(scanner.HardBuyRules, "near_misses", return_value=near_misses):
+            pool, _ = scanner.HardBuyRules.build_rank_pool(
+                data, [], target_size=7, max_pool_size=7
+            )
+
+        tickers = [p["ticker"] for p in pool]
+        self.assertIn("T3", tickers)
+        # Failing the trend filter or the RSI sweet spot is not a timing miss,
+        # it is the "already ran / broken chart" entry the strategy refuses.
+        self.assertNotIn("T1", tickers)
+        self.assertNotIn("T2", tickers)
+
+    def test_backfill_pool_rejects_already_extended_move(self):
+        df = _guard_ready_df(datetime(2026, 4, 29).date())
+        nm = {
+            "ticker": "T0",
+            "rules_passed": 9,
+            "rules_failed": 1,
+            "passed_rules": [f"BUY_{j:02d}" for j in range(1, 10)],
+            "failed_rules": ["BUY_05:Crossover"],
+            "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 55,
+        }
+        record = scanner.HardBuyRules._candidate_record(
+            "T0", df, rule_result=nm, hard_buy_pass=False
+        )
+
+        self.assertIsNone(scanner.HardBuyRules._backfill_block_reason(nm, record))
+
+        extended = dict(record, flags=list(record["flags"]) + ["EXTENDED_MOVE"])
+        reason = scanner.HardBuyRules._backfill_block_reason(nm, extended)
+        self.assertIsNotNone(reason)
+        self.assertIn("extended", reason)
+
+    def test_ml_training_pool_is_not_conditioned_on_recent_performance(self):
+        # A name whose 63-day return is negative is excluded by the execution
+        # guards but must still train the model: filtering the training set on
+        # performance measured at the end of the window leaks that outcome back
+        # into every historical row.
+        loser = _guard_ready_df(datetime(2026, 4, 29).date())
+        loser["Return_63d"] = -0.25
+        winner = _guard_ready_df(datetime(2026, 4, 29).date())
+        illiquid = _guard_ready_df(datetime(2026, 4, 29).date())
+        illiquid["Avg_Dollar_Vol_20"] = 100_000
+        penny = _guard_ready_df(datetime(2026, 4, 29).date())
+        penny["Close"] = 2.0
+
+        pool = scanner.ExecutionGuards.ml_training_pool(
+            {"LOSER": loser, "WINNER": winner, "ILLIQUID": illiquid, "PENNY": penny}
+        )
+
+        self.assertEqual(sorted(pool), ["ILLIQUID", "LOSER", "WINNER"])
+        # ...while the guards themselves still reject the loser for trading.
+        self.assertIsNotNone(
+            scanner.ExecutionGuards._check(
+                "LOSER", loser, now=datetime(2026, 4, 30, 12, 0, tzinfo=scanner.ET_TZ)
+            )
+        )
+
+    def test_training_cap_keeps_the_chronological_tail(self):
+        rows = 200_000
+        X = np.arange(rows, dtype=float).reshape(-1, 1)
+        y = (np.arange(rows) % 3 == 0).astype(int)
+
+        X_cap, y_cap = scanner.MLRanker._cap_training_rows(X, y, max_rows=80_000)
+
+        self.assertEqual(len(X_cap), 80_000)
+        # Date-sorted rows in, contiguous most-recent block out. Sampling each
+        # class separately used to reorder them and strand a minority-only
+        # block at the front.
+        np.testing.assert_array_equal(X_cap, X[-80_000:])
+        np.testing.assert_array_equal(y_cap, y[-80_000:])
+
+    def test_training_cap_leaves_no_single_class_cv_fold(self):
+        # The live failure: 511,649 samples at 30.6% positive produced a capped
+        # set whose oldest ~22,300 rows were all class 1, so TimeSeriesSplit
+        # handed XGBoost a single-class first fold and the scan died with
+        # "Invalid classes inferred from unique values of `y`".
+        rng = np.random.default_rng(0)
+        y = (rng.random(511_649) < 0.306).astype(int)
+        X = np.zeros((len(y), 1))
+
+        _, y_cap = scanner.MLRanker._cap_training_rows(X, y, max_rows=80_000)
+
+        gap = 20
+        folds = 0
+        for train_idx, val_idx in TimeSeriesSplit(n_splits=5).split(y_cap):
+            train_idx = train_idx[train_idx < (val_idx[0] - gap)]
+            if train_idx.size == 0:
+                continue
+            folds += 1
+            self.assertEqual(
+                np.unique(y_cap[train_idx]).size, 2,
+                "TimeSeriesSplit fold is single-class -- XGBoost will raise",
+            )
+        self.assertGreater(folds, 0)
+
+    def test_scale_pos_weight_rebalances_the_minority_class(self):
+        y = np.array([0] * 700 + [1] * 300)
+
+        self.assertAlmostEqual(scanner.MLRanker._scale_pos_weight(y), 700 / 300)
+        self.assertEqual(scanner.MLRanker._class_counts(y), (700, 300))
+        # Degenerate targets must not produce a divide-by-zero weight.
+        self.assertEqual(scanner.MLRanker._scale_pos_weight(np.ones(10, dtype=int)), 1.0)
+        self.assertEqual(scanner.MLRanker._scale_pos_weight(np.zeros(10, dtype=int)), 1.0)
+
+    def test_single_class_labels_do_not_crash_either_trainer(self):
+        ranker = scanner.MLRanker()
+        n_feat = len(scanner.MLRanker.FEATURE_COLS)
+        rng = np.random.default_rng(1)
+        X_train = rng.normal(size=(500, n_feat))
+        X_current = rng.normal(size=(3, n_feat))
+
+        for labels in (np.ones(500, dtype=int), np.zeros(500, dtype=int)):
+            with patch.object(scanner.log, "warning"):
+                xgb_scores = ranker._train_xgboost(X_train, labels, X_current)
+                rf_scores = ranker._train_rf(X_train, labels, X_current)
+            np.testing.assert_array_equal(xgb_scores, np.full(3, 0.5))
+            np.testing.assert_array_equal(rf_scores, np.full(3, 0.5))
+        self.assertEqual(ranker.degraded_models, [])
+
+    def test_model_failure_degrades_and_flags_instead_of_ending_the_scan(self):
+        ranker = scanner.MLRanker()
+        n_feat = len(scanner.MLRanker.FEATURE_COLS)
+        rng = np.random.default_rng(2)
+        X_train = rng.normal(size=(600, n_feat))
+        y_train = (rng.random(600) < 0.3).astype(int)
+        X_current = rng.normal(size=(1, n_feat))
+        survivors = [{"ticker": "TEST", "flags": []}]
+
+        with patch.object(
+            ranker, "_build_dataset",
+            return_value=(X_train, y_train, X_current, ["TEST"]),
+        ):
+            with patch.object(
+                ranker, "_train_xgboost", side_effect=RuntimeError("model blew up")
+            ):
+                with patch.object(ranker, "_train_rf", return_value=np.array([0.8])):
+                    with patch.object(ranker, "_train_lstm", return_value=None):
+                        with patch.object(scanner.log, "error"):
+                            out = ranker.rank(survivors, {}, training_universe={})
+
+        self.assertEqual(ranker.degraded_models, ["XGBoost"])
+        self.assertEqual(out[0]["ml_score_xgb"], 0.5)
+        self.assertEqual(out[0]["ml_score_rf"], 0.8)
+        self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.65)
+        # A 0.5 from a dead model is the absence of a signal, so it is flagged
+        # rather than presented as a neutral read on the name.
+        self.assertIn("ML_DEGRADED:XGBoost", out[0]["flags"])
 
     def test_world_headlines_drop_vendor_related_tickers(self):
         ctx = scanner.WorldContext()
