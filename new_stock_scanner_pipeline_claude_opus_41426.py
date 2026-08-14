@@ -1037,6 +1037,13 @@ class MacroRegime:
         self.regime_label: str = "UNAVAILABLE"
         self.notes: List[str] = []
         self.world = WorldContext()
+        # Which macro series failed to load this run. Recorded rather than
+        # fatal: the regime is scored from whatever did load, and the report
+        # says which inputs were missing so a thin read is never mistaken for
+        # a confident one.
+        self.missing_symbols: List[str] = []
+        self.missing_required: List[str] = []
+        self.degraded: bool = False
 
     def _series(self, symbol: str, range_: str = "2y") -> Optional[pd.DataFrame]:
         """Pull recent OHLCV via Yahoo v8 chart -- no key needed."""
@@ -1091,13 +1098,26 @@ class MacroRegime:
                 except Exception:
                     pass
 
-        missing_required = sorted(self.REQUIRED_SYMBOLS - set(self.snapshot))
-        if len(self.snapshot) < self.MIN_SNAPSHOT_COUNT or missing_required:
-            raise PipelineError(
-                "Macro regime unavailable or incomplete "
-                f"({len(self.snapshot)}/{len(self.SYMBOLS)} loaded; "
-                f"missing required: {', '.join(missing_required) or 'none'}). "
-                "Pipeline STOPPED rather than using a neutral fallback."
+        # A macro series that fails to load degrades the regime read; it does
+        # not end the run. Macro is *context* -- it tunes position sizing and
+        # the panel's market-direction score, it does not pick or price a
+        # single candidate. Every block in _score_regime() is already guarded
+        # on presence, so an absent series contributes nothing rather than a
+        # guessed value: the neutral fallback is the honest answer, and it is
+        # not worth discarding a full universe scan over one dead endpoint.
+        self.missing_symbols = sorted(set(self.SYMBOLS) - set(self.snapshot))
+        self.missing_required = sorted(self.REQUIRED_SYMBOLS - set(self.snapshot))
+        self.degraded = bool(self.missing_symbols)
+        if self.degraded:
+            log.warning(
+                f"  Macro context incomplete: {len(self.snapshot)}/"
+                f"{len(self.SYMBOLS)} series loaded. Unavailable: "
+                f"{', '.join(self.missing_symbols)}"
+                + (
+                    f" (required: {', '.join(self.missing_required)})"
+                    if self.missing_required else ""
+                )
+                + ". Scoring the regime from what did load."
             )
 
         self._score_regime()
@@ -1281,7 +1301,14 @@ class MacroRegime:
         """Multiplier in [0.4, 1.2] for downstream position sizing.
         Used to scale the recommended dollar exposure based on regime."""
         if self.regime_score is None:
-            raise PipelineError("Macro regime score unavailable for position sizing.")
+            # load() always scores the regime now, so this only fires if
+            # sizing is asked for before the macro layer ran. Size neutrally
+            # and say so rather than ending the run at the last step.
+            log.warning(
+                "  Macro regime score unavailable for position sizing -- "
+                "using neutral 0.80."
+            )
+            return 0.80
         s = self.regime_score
         if s >= 75:
             scalar = 1.20
@@ -1297,6 +1324,11 @@ class MacroRegime:
             scalar *= 0.80
         elif self.world.event_risk >= 55:
             scalar *= 0.90
+        if self.missing_required:
+            # Read the regime from what loaded, but do not lever up on it.
+            # Sizing above 1.0 is a statement that conditions are confirmed
+            # risk-on, and a partial macro picture cannot confirm that.
+            scalar = min(scalar, 1.00)
         return float(clamp(scalar, 0.40, 1.20))
 
     def panel_m_score(self) -> float:
@@ -1310,6 +1342,10 @@ class MacroRegime:
         out = {"regime_score": round(self.regime_score, 1) if self.regime_score is not None else None,
                "regime_label": self.regime_label,
                "notes": list(self.notes),
+               "inputs_loaded": f"{len(self.snapshot)}/{len(self.SYMBOLS)}",
+               "inputs_missing": list(self.missing_symbols),
+               "inputs_missing_required": list(self.missing_required),
+               "macro_degraded": bool(self.degraded),
                "world_context": self.world.to_dict(),
                "snapshots": {}}
         for name, snap in self.snapshot.items():
