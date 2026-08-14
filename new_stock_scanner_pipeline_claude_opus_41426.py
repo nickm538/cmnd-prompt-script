@@ -2752,6 +2752,48 @@ class ExecutionGuards:
     MIN_DOLLAR_VOLUME = 5_000_000
 
     @staticmethod
+    def ml_training_pool(
+        data: Dict[str, pd.DataFrame],
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Universe for *fitting* the ML models -- deliberately not the guarded set.
+
+        The guards admit a name partly on its latest 63-day return. Training on
+        that set conditions every historical row on performance that had not
+        happened yet when the row was printed: the model only ever sees a
+        January bar because the name went on to rally through August. That is
+        look-ahead selection. It inflates the positive class, flatters CV
+        accuracy, and teaches the ranker patterns that are an artifact of the
+        filter rather than of the market.
+
+        Screening on price and liquidity instead keeps untradeable noise out
+        using characteristics that are broadly stable across the training
+        window, so the forward-return label stays honest. Scoring still happens
+        only on fully guarded candidates -- this changes what the model learns
+        from, not what it is allowed to buy.
+        """
+        pool = {}
+        for ticker, df in data.items():
+            if df is None or df.empty or len(df) < MIN_TRADING_DAYS:
+                continue
+            last = df.iloc[-1]
+            close = last.get("Close", np.nan)
+            avg_dv = last.get("Avg_Dollar_Vol_20", np.nan)
+            if pd.isna(close) or close < 5.0:
+                continue
+            if pd.isna(avg_dv) or avg_dv < ExecutionGuards.MIN_DOLLAR_VOLUME:
+                continue
+            # Halted / delisted-style series carry flat prices and a trivially
+            # negative label, which is noise rather than signal. These are the
+            # same integrity conditions GUARD_A uses, and unlike the 63-day
+            # return they say nothing about how the name went on to perform.
+            recent = df.iloc[-30:] if len(df) >= 30 else df
+            if (recent["Volume"] <= 0).all() or recent["Close"].nunique() <= 2:
+                continue
+            pool[ticker] = df
+        return pool
+
+    @staticmethod
     def _check(
         ticker: str, df: pd.DataFrame, now: Optional[datetime] = None
     ) -> Optional[str]:
@@ -2884,6 +2926,17 @@ class HardBuyRules:
     Returns results with per-rule pass/fail and flags.
     """
 
+    # Rules a near-miss backfill may never fail.
+    #
+    # Most of the 10-rule card is about entry *timing* -- crossover recency,
+    # breakout, VWAP reclaim, volume surge -- and a genuinely strong name can
+    # miss one of those and still be the better trade. These two are not
+    # timing. BUY_01 is the trend itself, so failing it means buying a name
+    # below its own 200DMA with a rolling 50DMA, and BUY_08 failing on the
+    # high side is the definition of arriving after the move. Backfills are
+    # ranked and sized alongside strict passers, so they are held to both.
+    CRITICAL_NEAR_MISS_RULES = ("BUY_01", "BUY_08")
+
     @staticmethod
     def apply(
         data: Dict[str, pd.DataFrame],
@@ -2999,6 +3052,7 @@ class HardBuyRules:
 
         needed_pool = max(target_size * 3, max_pool_size - len(pool))
         near_misses = HardBuyRules.near_misses(data, top_n=needed_pool)
+        blocked = 0
         for nm in near_misses:
             ticker = nm["ticker"]
             if ticker in seen or nm.get("rules_passed", 0) < MIN_NEAR_MISS_RULES:
@@ -3006,14 +3060,18 @@ class HardBuyRules:
             df = data.get(ticker)
             if df is None:
                 continue
-            pool.append(
-                HardBuyRules._candidate_record(
-                    ticker,
-                    df,
-                    rule_result=nm,
-                    hard_buy_pass=False,
-                )
+            record = HardBuyRules._candidate_record(
+                ticker,
+                df,
+                rule_result=nm,
+                hard_buy_pass=False,
             )
+            block_reason = HardBuyRules._backfill_block_reason(nm, record)
+            if block_reason:
+                blocked += 1
+                log.debug(f"  Backfill rejected {ticker}: {block_reason}")
+                continue
+            pool.append(record)
             seen.add(ticker)
             if len(pool) >= max_pool_size:
                 break
@@ -3022,7 +3080,35 @@ class HardBuyRules:
             f"STAGE 3B: Ranked candidate pool -- {len(pool)} total "
             f"({len(strict_survivors)} strict passers, {len(pool) - len(strict_survivors)} near-miss backfills)"
         )
+        if blocked:
+            log.info(
+                f"  {blocked} near-miss(es) held out of the buy pool: broken "
+                "trend, late RSI, or an already-extended move."
+            )
         return pool, near_misses
+
+    @staticmethod
+    def _backfill_block_reason(nm: Dict, record: Dict) -> Optional[str]:
+        """
+        Why this near-miss must not be promoted into the buy pool, or None.
+
+        A backfill is traded, not just reported, so it has to clear the parts
+        of the card that decide *whether* a name is buyable rather than merely
+        *when*. Without this, an 8-of-10 name could reach the top-7 while
+        trading below its 200DMA, or with RSI in the 70s -- the exact
+        "already ran, we are late" entry the strategy is built to avoid.
+        """
+        failed = {rule.split(":", 1)[0] for rule in nm.get("failed_rules", [])}
+        blocked_rules = [
+            rule for rule in HardBuyRules.CRITICAL_NEAR_MISS_RULES if rule in failed
+        ]
+        if blocked_rules:
+            return f"failed critical rule(s) {', '.join(blocked_rules)}"
+        # Reuses the exhaustion threshold that already drives EXTENDED_MOVE,
+        # so the anti-chase line is defined in exactly one place.
+        if "EXTENDED_MOVE" in record.get("flags", []):
+            return f"already extended (exhaustion {record.get('exhaustion_score')})"
+        return None
 
     @staticmethod
     def near_misses(
@@ -6729,17 +6815,27 @@ def main():
             raise PipelineError("No rankable candidates after hard-rule scoring. Pipeline STOPPED.")
 
         # ── STAGE 4: ML Ranking ──────────────────────────────────────
-        # Train on the FULL guarded universe (~50x more samples than
-        # survivors-only) for true discriminative power.
+        # Train on a broad price/liquidity-screened universe (~50x more
+        # samples than survivors-only) for true discriminative power.
         clock.check("Stage 4: ML Ranking")
         ranker = MLRanker()
-        survivors = ranker.rank(survivors, all_data, training_universe=guarded_data)
+        # Fit on the liquidity/price-screened universe, not the guarded set:
+        # the guards condition on a name's latest 63-day return, which is
+        # look-ahead relative to the historical rows being labelled.
+        ml_training_pool = ExecutionGuards.ml_training_pool(all_data)
+        log.info(
+            f"  ML training universe: {len(ml_training_pool)} tickers "
+            f"(price/liquidity screen on {len(all_data)}), scoring "
+            f"{len(survivors)} guarded candidates."
+        )
+        survivors = ranker.rank(survivors, all_data, training_universe=ml_training_pool)
         ml_params = {
             "XGBoost": "n_estimators=200, max_depth=6, lr=0.05, subsample=0.8",
             "RandomForest": "n_estimators=200, max_depth=8, min_samples_leaf=20",
             "LSTM": "Available (PyTorch)" if LSTM_AVAILABLE else "Not installed",
             "XGB_available": XGB_AVAILABLE,
-            "training_universe_size": len(guarded_data),
+            "training_universe_size": len(ml_training_pool),
+            "training_universe_screen": "price >= $5 and 20d avg $vol >= $5M",
             "degraded_models": list(ranker.degraded_models),
         }
         if ranker.degraded_models:

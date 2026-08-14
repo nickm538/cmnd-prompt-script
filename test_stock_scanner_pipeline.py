@@ -385,6 +385,97 @@ class ScannerRegressionTests(unittest.TestCase):
         ctx._score_event_risk(snapshot={"vix": {"last": 12.0}})
         self.assertGreater(stressed, ctx.event_risk)
 
+    def test_backfill_pool_rejects_broken_trend_and_late_rsi(self):
+        data = {
+            f"T{i}": _guard_ready_df(datetime(2026, 4, 29).date()) for i in range(4)
+        }
+        # T1 is below its own 200DMA, T2 arrives with RSI already run up, T3 is
+        # clean. All three pass the 8-of-10 near-miss bar.
+        near_misses = [
+            {
+                "ticker": "T1",
+                "rules_passed": 8,
+                "rules_failed": 2,
+                "passed_rules": [f"BUY_{j:02d}" for j in (2, 3, 4, 5, 6, 7, 8, 9)],
+                "failed_rules": ["BUY_01:Trend", "BUY_10:Penny"],
+                "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 55,
+            },
+            {
+                "ticker": "T2",
+                "rules_passed": 8,
+                "rules_failed": 2,
+                "passed_rules": [f"BUY_{j:02d}" for j in (1, 2, 3, 4, 5, 6, 7, 9)],
+                "failed_rules": ["BUY_08:RSI", "BUY_10:Penny"],
+                "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 78,
+            },
+            {
+                "ticker": "T3",
+                "rules_passed": 8,
+                "rules_failed": 2,
+                "passed_rules": [f"BUY_{j:02d}" for j in (1, 2, 4, 6, 7, 8, 9, 10)],
+                "failed_rules": ["BUY_03:BB/High", "BUY_05:Crossover"],
+                "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 55,
+            },
+        ]
+
+        with patch.object(scanner.HardBuyRules, "near_misses", return_value=near_misses):
+            pool, _ = scanner.HardBuyRules.build_rank_pool(
+                data, [], target_size=7, max_pool_size=7
+            )
+
+        tickers = [p["ticker"] for p in pool]
+        self.assertIn("T3", tickers)
+        # Failing the trend filter or the RSI sweet spot is not a timing miss,
+        # it is the "already ran / broken chart" entry the strategy refuses.
+        self.assertNotIn("T1", tickers)
+        self.assertNotIn("T2", tickers)
+
+    def test_backfill_pool_rejects_already_extended_move(self):
+        df = _guard_ready_df(datetime(2026, 4, 29).date())
+        nm = {
+            "ticker": "T0",
+            "rules_passed": 9,
+            "rules_failed": 1,
+            "passed_rules": [f"BUY_{j:02d}" for j in range(1, 10)],
+            "failed_rules": ["BUY_05:Crossover"],
+            "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 55,
+        }
+        record = scanner.HardBuyRules._candidate_record(
+            "T0", df, rule_result=nm, hard_buy_pass=False
+        )
+
+        self.assertIsNone(scanner.HardBuyRules._backfill_block_reason(nm, record))
+
+        extended = dict(record, flags=list(record["flags"]) + ["EXTENDED_MOVE"])
+        reason = scanner.HardBuyRules._backfill_block_reason(nm, extended)
+        self.assertIsNotNone(reason)
+        self.assertIn("extended", reason)
+
+    def test_ml_training_pool_is_not_conditioned_on_recent_performance(self):
+        # A name whose 63-day return is negative is excluded by the execution
+        # guards but must still train the model: filtering the training set on
+        # performance measured at the end of the window leaks that outcome back
+        # into every historical row.
+        loser = _guard_ready_df(datetime(2026, 4, 29).date())
+        loser["Return_63d"] = -0.25
+        winner = _guard_ready_df(datetime(2026, 4, 29).date())
+        illiquid = _guard_ready_df(datetime(2026, 4, 29).date())
+        illiquid["Avg_Dollar_Vol_20"] = 100_000
+        penny = _guard_ready_df(datetime(2026, 4, 29).date())
+        penny["Close"] = 2.0
+
+        pool = scanner.ExecutionGuards.ml_training_pool(
+            {"LOSER": loser, "WINNER": winner, "ILLIQUID": illiquid, "PENNY": penny}
+        )
+
+        self.assertEqual(sorted(pool), ["LOSER", "WINNER"])
+        # ...while the guards themselves still reject the loser for trading.
+        self.assertIsNotNone(
+            scanner.ExecutionGuards._check(
+                "LOSER", loser, now=datetime(2026, 4, 30, 12, 0, tzinfo=scanner.ET_TZ)
+            )
+        )
+
     def test_training_cap_keeps_the_chronological_tail(self):
         rows = 200_000
         X = np.arange(rows, dtype=float).reshape(-1, 1)
