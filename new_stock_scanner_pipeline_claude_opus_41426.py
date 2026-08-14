@@ -3446,6 +3446,18 @@ class HardBuyRules:
 # STAGE 4 -- ML RANKING LAYER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+class _ModelDegradedError(Exception):
+    """
+    Raised by a trainer when it cannot produce a real fit (e.g. single-class
+    labels, missing library) and has chosen to fall back to neutral scores.
+
+    Raising instead of returning allows _safe_scores to detect the skip and
+    record the model in degraded_models, so the ensemble status is always
+    reported correctly.
+    """
+
+
 class MLRanker:
     """
     XGBoost + Random Forest ensemble ranking.
@@ -3682,9 +3694,21 @@ class MLRanker:
         stage depends on it, so a single estimator blowing up must not throw
         away the whole scan. The degradation is recorded and reported rather
         than passed off as a real score.
+
+        Trainers signal a deliberate graceful skip by raising
+        _ModelDegradedError; unexpected exceptions are caught with the same
+        result so that no single model can abort the whole scan.
         """
         try:
             return trainer(X_train, y_train, X_current)
+        except _ModelDegradedError as exc:
+            log.warning(
+                f"  {label} skipped ({exc}) -- scoring every survivor "
+                "0.5 for this model and continuing."
+            )
+            if label not in self.degraded_models:
+                self.degraded_models.append(label)
+            return np.full(X_current.shape[0], 0.5)
         except Exception as exc:
             log.error(
                 f"  {label} training failed ({exc}) -- scoring every survivor "
@@ -3807,18 +3831,15 @@ class MLRanker:
     ) -> np.ndarray:
         """Train XGBoost and return predicted probabilities for current data."""
         if not XGB_AVAILABLE:
-            log.warning("XGBoost not installed -- using Random Forest only")
-            return np.full(X_current.shape[0], 0.5)
+            raise _ModelDegradedError("XGBoost not installed")
 
         negatives, positives = self._class_counts(y_train)
         if not negatives or not positives:
             # XGBoost treats a single-class target as a fatal ValueError.
-            log.warning(
-                "  XGBoost skipped -- training labels are single-class "
-                f"(all {'positive' if positives else 'negative'}); "
-                "scoring every survivor 0.5 for this model."
+            raise _ModelDegradedError(
+                "training labels are single-class "
+                f"(all {'positive' if positives else 'negative'})"
             )
-            return np.full(X_current.shape[0], 0.5)
 
         scale_pos_weight = self._scale_pos_weight(y_train)
         model = xgb.XGBClassifier(
@@ -3915,12 +3936,10 @@ class MLRanker:
         if not negatives or not positives:
             # A single-class fit leaves predict_proba with one column, so the
             # [:, 1] lookup below would raise IndexError.
-            log.warning(
-                "  Random Forest skipped -- training labels are single-class "
-                f"(all {'positive' if positives else 'negative'}); "
-                "scoring every survivor 0.5 for this model."
+            raise _ModelDegradedError(
+                "training labels are single-class "
+                f"(all {'positive' if positives else 'negative'})"
             )
-            return np.full(X_current.shape[0], 0.5)
 
         model = RandomForestClassifier(
             n_estimators=200,
