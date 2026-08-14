@@ -225,21 +225,53 @@ class ScannerRegressionTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with patch.object(scanner.log, "warning"), patch.object(scanner.log, "info"):
                 status = scanner.verify_api_credentials()
-            massive = scanner._env_or_default(
-                "MASSIVE_API_KEY", "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H"
-            )
-            twelve = scanner._env_or_default(
-                "TWELVEDATA_API_KEY", "5e7a5daaf41d46a8966963106ebef210"
-            )
-            finnhub = scanner._env_or_default(
-                "FINNHUB_API_KEY", "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg"
-            )
+            massive = scanner._resolve_api_key("MASSIVE_API_KEY")
+            twelve = scanner._resolve_api_key("TWELVEDATA_API_KEY")
+            finnhub = scanner._resolve_api_key("FINNHUB_API_KEY")
         self.assertEqual(status["MASSIVE_API_KEY"], "embedded")
         self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
         self.assertEqual(status["FINNHUB_API_KEY"], "embedded")
         self.assertTrue(massive)
         self.assertTrue(twelve)
         self.assertTrue(finnhub)
+
+    def test_credential_status_ignores_import_time_key_snapshot(self):
+        # On Actions every secret is exported for the whole job, so the module
+        # constants hold live keys. Status must report where the key comes from
+        # now, not replay that snapshot -- otherwise a real MBOUM secret is
+        # labelled "embedded" even though MBOUM has no committed fallback.
+        with patch.object(scanner, "MBOUM_API_KEY", "live-mboum-secret"):
+            with patch.object(scanner, "MBOUM_OPTIONS_KEY", "live-mboum-options-secret"):
+                with patch.dict(os.environ, {"MASSIVE_API_KEY": "massive-test-key"}, clear=True):
+                    with patch.object(scanner.log, "warning"), patch.object(scanner.log, "info"):
+                        status = scanner.verify_api_credentials()
+        self.assertEqual(status["MBOUM_API_KEY"], "absent")
+        self.assertEqual(status["MBOUM_OPTIONS_KEY"], "absent")
+
+    def test_env_secrets_win_over_committed_fallback_keys(self):
+        secrets = {
+            "MASSIVE_API_KEY": "massive-secret",
+            "MBOUM_API_KEY": "mboum-secret",
+            "MBOUM_OPTIONS_KEY": "mboum-options-secret",
+            "TWELVEDATA_API_KEY": "twelvedata-secret",
+            "FINNHUB_API_KEY": "finnhub-secret",
+        }
+        with patch.dict(os.environ, secrets, clear=True):
+            with patch.object(scanner.log, "warning"), patch.object(scanner.log, "info"):
+                status = scanner.verify_api_credentials()
+            for name, value in secrets.items():
+                self.assertEqual(scanner._resolve_api_key(name), value)
+        for name in secrets:
+            self.assertEqual(status[name], "env")
+
+    def test_mboum_keys_have_no_committed_fallback(self):
+        # MBOUM is the credit-metered primary; a committed key would spend the
+        # very plan the Massive -> TwelveData -> Finnhub -> Yahoo chain backs up.
+        self.assertNotIn("MBOUM_API_KEY", scanner.EMBEDDED_FALLBACK_KEYS)
+        self.assertNotIn("MBOUM_OPTIONS_KEY", scanner.EMBEDDED_FALLBACK_KEYS)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(scanner._resolve_api_key("MBOUM_API_KEY"), "")
+            self.assertEqual(scanner._resolve_api_key("MBOUM_OPTIONS_KEY"), "")
 
     def test_ohlcv_router_keeps_mboum_primary_when_it_returns_history(self):
         history = _guard_ready_df(datetime(2026, 4, 29).date())
