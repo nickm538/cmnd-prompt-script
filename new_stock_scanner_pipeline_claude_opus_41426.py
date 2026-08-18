@@ -26,6 +26,7 @@ import os
 import sys
 import time
 import json
+import html
 import logging
 import math
 import warnings
@@ -82,7 +83,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ENGINE_NAME = "Live Equity Scanner Engine"
-ENGINE_VERSION = "6.0.0"
+ENGINE_VERSION = "6.0.1"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION -- API credentials prefer the environment, then committed
@@ -125,10 +126,11 @@ MASSIVE_BASE_URL = "https://api.massive.com/v2"
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
-# Universe discovery still needs Massive. MBOUM is the primary OHLCV /
-# fundamentals / options source when credits remain, but it is no longer
-# required: an exhausted MBOUM plan falls through Massive -> TwelveData ->
-# Finnhub -> Yahoo/yfinance without fabricating data.
+# Massive is the preferred OHLCV/listings source. Universe discovery can
+# still complete without it: official NASDAQ/NYSE listing files, then
+# Finnhub. MBOUM remains the primary OHLCV / fundamentals / options source
+# when credits remain; an exhausted MBOUM plan falls through Massive ->
+# TwelveData -> Finnhub -> Yahoo/yfinance without fabricating data.
 REQUIRED_API_KEYS = ("MASSIVE_API_KEY",)
 OPTIONAL_API_KEYS = (
     "MBOUM_API_KEY",
@@ -489,7 +491,74 @@ def normalize_api_scalar(val):
     return val
 
 
-def safe_div(a, b, default=np.nan):
+def normalize_earnings_date(value: Any) -> Optional[str]:
+    """Return YYYY-MM-DD for the nearest upcoming earnings date.
+
+    Vendor calendars return a date, a Timestamp, a two-date window, a
+    DatetimeIndex, or a Python list of ``datetime.date``. ``str(list)`` is
+    not a parseable timestamp, and that silently dropped holding-window
+    event risk on the live scan.
+    """
+    dates = _coerce_earnings_dates(value)
+    if not dates:
+        return None
+    today = today_et()
+    upcoming = [day for day in dates if day >= today]
+    chosen = min(upcoming) if upcoming else min(dates)
+    return chosen.isoformat()
+
+
+def _coerce_earnings_dates(value: Any) -> List[date]:
+    if value is None:
+        return []
+    if isinstance(value, float) and math.isnan(value):
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"nan", "none", "null", "n/a", "nat"}:
+            return []
+        try:
+            ts = pd.Timestamp(text)
+            if pd.isna(ts):
+                return []
+            return [ts.date()]
+        except Exception:
+            return []
+    if isinstance(value, dict):
+        for key in ("fmt", "raw", "date", "earningsDate", "Earnings Date"):
+            if key in value:
+                found = _coerce_earnings_dates(value.get(key))
+                if found:
+                    return found
+        return []
+    if isinstance(value, (datetime, pd.Timestamp)):
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return []
+        return [ts.tz_localize(None).date() if ts.tzinfo else ts.date()]
+    if isinstance(value, date):
+        return [value]
+    if isinstance(value, np.datetime64):
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return []
+        return [ts.date()]
+    if isinstance(value, (list, tuple, set, np.ndarray, pd.Series, pd.Index)):
+        out: List[date] = []
+        try:
+            items = list(value)
+        except TypeError:
+            return []
+        for item in items:
+            out.extend(_coerce_earnings_dates(item))
+        return out
+    try:
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return []
+        return [ts.date()]
+    except Exception:
+        return []
     """Division with zero/nan protection."""
     if is_missing_value(b):
         return default
@@ -1078,10 +1147,26 @@ class WorldContext:
             log.debug(f"  Earnings calendar fetch failed: {exc}")
 
     def _load_economic_calendar(self, session) -> None:
-        """Load scheduled US macro releases that can gap the whole tape."""
-        if not FINNHUB_API_KEY:
-            self.feed_status["economic_calendar"] = "missing_key"
+        """Load scheduled US macro releases that can gap the whole tape.
+
+        Finnhub is preferred because it includes CPI, NFP, and FOMC. When
+        that plan endpoint is blocked, fall back to the official Federal
+        Reserve calendar (FOMC, Beige Book, Fed statistical releases). A
+        Fed-only read is still incomplete versus BLS/BEA, so feed status
+        stays off ``ok`` and position sizing remains conservative.
+        """
+        if self._load_economic_calendar_finnhub(session):
             return
+        if self._load_economic_calendar_fed(session):
+            return
+        if self.feed_status.get("economic_calendar") == "not_loaded":
+            self.feed_status["economic_calendar"] = (
+                "missing_key" if not FINNHUB_API_KEY else "unavailable"
+            )
+
+    def _load_economic_calendar_finnhub(self, session) -> bool:
+        if not FINNHUB_API_KEY:
+            return False
         start = today_et()
         end = start + timedelta(days=self.ECONOMIC_WINDOW_DAYS)
         try:
@@ -1098,16 +1183,15 @@ class WorldContext:
                 self.feed_status[
                     "economic_calendar"
                 ] = f"http_{resp.status_code}"
-                return
+                return False
             payload = resp.json() or {}
             if payload.get("error"):
                 self.feed_status["economic_calendar"] = "provider_error"
-                return
+                return False
             rows = payload.get("economicCalendar") or []
             if not isinstance(rows, list):
                 self.feed_status["economic_calendar"] = "invalid_payload"
-                return
-            self.feed_status["economic_calendar"] = "ok"
+                return False
             events = []
             for row in rows:
                 if not isinstance(row, dict):
@@ -1134,12 +1218,141 @@ class WorldContext:
                         "previous": normalize_api_scalar(row.get("prev")),
                         "unit": row.get("unit"),
                         "country": "US",
+                        "source": "Finnhub",
                     }
                 )
             self.economic_events = events[:20]
+            self.feed_status["economic_calendar"] = "ok"
+            return True
         except Exception as exc:
             self.feed_status["economic_calendar"] = "error"
-            log.debug(f"  Economic calendar fetch failed: {exc}")
+            log.debug(f"  Finnhub economic calendar fetch failed: {exc}")
+            return False
+
+    def _load_economic_calendar_fed(self, session) -> bool:
+        """Official Federal Reserve calendar -- no API key required."""
+        try:
+            resp = session.get(
+                "https://www.federalreserve.gov/json/calendar.json",
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                if self.feed_status.get("economic_calendar") in {
+                    "not_loaded", "missing_key"
+                }:
+                    self.feed_status[
+                        "economic_calendar"
+                    ] = f"fed_http_{resp.status_code}"
+                return False
+            payload = json.loads(resp.content.decode("utf-8-sig") or "{}")
+        except Exception as exc:
+            log.debug(f"  Fed economic calendar fetch failed: {exc}")
+            if self.feed_status.get("economic_calendar") in {
+                "not_loaded", "missing_key"
+            }:
+                self.feed_status["economic_calendar"] = "fed_error"
+            return False
+        events = self._parse_fed_calendar_events(
+            payload,
+            start=today_et(),
+            end=today_et() + timedelta(days=self.ECONOMIC_WINDOW_DAYS),
+        )
+        if not events:
+            if self.feed_status.get("economic_calendar") in {
+                "not_loaded", "missing_key"
+            }:
+                self.feed_status["economic_calendar"] = "fed_empty_window"
+            return False
+        self.economic_events = events[:20]
+        self.feed_status["economic_calendar"] = "ok_fed"
+        log.info(
+            "  Economic calendar via official Federal Reserve schedule "
+            f"({len(events)} event(s) in the next "
+            f"{self.ECONOMIC_WINDOW_DAYS}d; BLS/BEA still unverified)."
+        )
+        return True
+
+    @staticmethod
+    def _parse_fed_calendar_events(
+        payload: Any,
+        start: date,
+        end: date,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+        rows = payload.get("events")
+        if not isinstance(rows, list):
+            return []
+        high_types = {"FOMC", "BEIGE"}
+        high_title_tokens = (
+            "fomc meeting",
+            "fomc press",
+            "fomc minutes",
+            "beige book",
+            "industrial production",
+            "capacity utilization",
+        )
+        events: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            event_type = str(row.get("type") or "").strip()
+            title = html.unescape(str(row.get("title") or "")).strip()
+            if not title:
+                continue
+            if event_type not in {"FOMC", "Beige", "Stat"}:
+                continue
+            when_dates = WorldContext._fed_event_dates(
+                str(row.get("month") or ""),
+                str(row.get("days") or row.get("day") or ""),
+            )
+            in_window = [day for day in when_dates if start <= day <= end]
+            if not in_window:
+                continue
+            blob = f"{event_type} {title}".lower()
+            high_impact = event_type.upper() in high_types or any(
+                token in blob for token in high_title_tokens
+            )
+            events.append(
+                {
+                    "event": title[:160],
+                    "time": in_window[0].isoformat(),
+                    "impact": event_type,
+                    "high_impact": bool(high_impact),
+                    "estimate": None,
+                    "previous": None,
+                    "unit": None,
+                    "country": "US",
+                    "source": "FederalReserve",
+                }
+            )
+        events.sort(key=lambda item: item.get("time") or "")
+        return events
+
+    @staticmethod
+    def _fed_event_dates(month: str, days: str) -> List[date]:
+        try:
+            year_s, month_s = str(month).split("-")[:2]
+            year, month_n = int(year_s), int(month_s)
+        except Exception:
+            return []
+        tokens = (
+            str(days)
+            .replace("–", "-")
+            .replace("—", "-")
+            .replace(",", "-")
+            .split("-")
+        )
+        out: List[date] = []
+        for token in tokens:
+            token = "".join(ch for ch in token if ch.isdigit())
+            if not token:
+                continue
+            try:
+                out.append(date(year, month_n, int(token)))
+            except Exception:
+                continue
+        return out
 
     def _load_market_status(self, session) -> None:
         if not FINNHUB_API_KEY:
@@ -1270,7 +1483,7 @@ class WorldContext:
             if not isinstance(flags, list):
                 flags = []
                 candidate["flags"] = flags
-            earn = self.earnings_soon.get(ticker)
+            earn = normalize_earnings_date(self.earnings_soon.get(ticker))
             if earn:
                 candidate["live_earnings_date"] = earn
                 candidate["earnings_event"] = dict(
@@ -1802,9 +2015,40 @@ class MacroRegime:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class UniverseDiscovery:
-    """Dynamically discovers the live U.S. equity universe from MASSIVE."""
+    """Dynamically discovers the live U.S. equity universe.
+
+    Preferred source is Massive's active US ticker dump. If that feed is
+    empty, blocked, or too small, fall through to the official NASDAQ Trader
+    listing files (no API key) and then Finnhub. Every source is a full
+    exchange listing dump -- never a watchlist, screener, or yesterday's CSV.
+    """
 
     MASSIVE_BASE = "https://api.massive.com/v3"
+    NASDAQ_LISTED_URL = (
+        "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+    )
+    OTHER_LISTED_URL = (
+        "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+    )
+    OTHER_EXCHANGE_MIC = {
+        "N": "XNYS",
+        "A": "XASE",
+        "P": "ARCX",
+        "Z": "BATS",
+    }
+    SKIP_NAME_FRAGMENTS = (
+        " - warrant",
+        " - rights",
+        " - right",
+        " - units",
+        " - unit",
+        " warrant",
+        " rights",
+        " preferred",
+        " test symbol",
+        " test company",
+        " nextshares",
+    )
 
     # Connect/read timeout for a single page. A 10-minute read timeout let a
     # slow-drip endpoint stall each page and burn the whole CI budget before
@@ -1822,11 +2066,12 @@ class UniverseDiscovery:
         adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        self.session.headers.update({"X-Massive-Token": self.api_key})
+        if self.api_key:
+            self.session.headers.update({"X-Massive-Token": self.api_key})
 
     def discover(self) -> List[str]:
         """
-        Fetch all active U.S. equity symbols from Masssive.
+        Fetch all active U.S. equity symbols from live listing sources.
         Returns list of ticker strings.
         Raises PipelineError on failure.
         """
@@ -1873,9 +2118,9 @@ class UniverseDiscovery:
                     if retries >= 3:
                         log.warning(
                             f"Massive live universe failed ({e}); "
-                            "trying Finnhub US symbol list. Still no preset basket."
+                            "trying official NASDAQ listing files. Still no preset basket."
                         )
-                        return self._discover_finnhub()
+                        return self._discover_without_massive()
                     log.warning(f"Massive retry {retries}/3 after {backoff}s -- {e}")
                     time.sleep(backoff)
                     backoff *= 2
@@ -1892,9 +2137,10 @@ class UniverseDiscovery:
 
         if not isinstance(data, list) or len(data) == 0:
             log.warning(
-                "Massive returned an empty symbol list; trying Finnhub US symbol list."
+                "Massive returned an empty symbol list; trying official "
+                "NASDAQ listing files. Still no preset basket."
             )
-            return self._discover_finnhub()
+            return self._discover_without_massive()
 
         tickers = self._clean_listed_equities(data)
         log.info(
@@ -1904,9 +2150,10 @@ class UniverseDiscovery:
 
         if len(tickers) < MIN_UNIVERSE_SIZE:
             log.warning(
-                f"Massive universe too small ({len(tickers)}); trying Finnhub live list."
+                f"Massive universe too small ({len(tickers)}); "
+                "trying official NASDAQ listing files."
             )
-            alt = self._discover_finnhub()
+            alt = self._discover_without_massive()
             if len(alt) >= MIN_UNIVERSE_SIZE:
                 return alt
             raise PipelineError(
@@ -1916,12 +2163,103 @@ class UniverseDiscovery:
 
         return tickers
 
+    def _discover_without_massive(self) -> List[str]:
+        """Live listing fallbacks that do not depend on Massive."""
+        nasdaq = self._discover_nasdaq_listings()
+        if nasdaq and len(nasdaq) >= MIN_UNIVERSE_SIZE:
+            return nasdaq
+        return self._discover_finnhub()
+
+    def _discover_nasdaq_listings(self) -> List[str]:
+        """Official NASDAQ Trader symbol directory. No API key, never a basket."""
+        log.info(
+            "STAGE 1: Universe Discovery -- querying official NASDAQ Trader "
+            "listing files"
+        )
+        rows: List[Dict[str, str]] = []
+        for url, kind in (
+            (self.NASDAQ_LISTED_URL, "nasdaq"),
+            (self.OTHER_LISTED_URL, "other"),
+        ):
+            try:
+                resp = self.session.get(url, timeout=30)
+                resp.raise_for_status()
+            except Exception as exc:
+                log.warning(f"  NASDAQ {kind} listing file failed: {exc}")
+                continue
+            parsed = self._parse_nasdaq_listing_text(resp.text, kind)
+            rows.extend(parsed)
+            log.info(f"  NASDAQ {kind} file: {len(parsed)} listed symbols")
+        if not rows:
+            log.warning("Official NASDAQ listing files returned no symbols.")
+            return []
+        tickers = self._clean_listed_equities(rows)
+        log.info(
+            f"STAGE 1 COMPLETE via NASDAQ listings: {len(rows)} raw symbols -> "
+            f"{len(tickers)} cleaned tickers"
+        )
+        if len(tickers) < MIN_UNIVERSE_SIZE:
+            log.warning(
+                f"NASDAQ listing universe too small ({len(tickers)}); "
+                "trying Finnhub live list."
+            )
+            return []
+        return tickers
+
+    @classmethod
+    def _parse_nasdaq_listing_text(cls, text: str, kind: str) -> List[Dict[str, str]]:
+        """Parse nasdaqlisted.txt / otherlisted.txt into cleaner-ready rows."""
+        if not text:
+            return []
+        lines = text.replace("\r", "").split("\n")
+        rows: List[Dict[str, str]] = []
+        for line in lines[1:]:
+            if not line or line.startswith("File Creation Time"):
+                continue
+            cols = line.split("|")
+            if kind == "nasdaq":
+                if len(cols) < 8:
+                    continue
+                symbol, name, _market, test_issue, _status, _lot, etf, nextshares = (
+                    cols[0], cols[1], cols[2], cols[3], cols[4], cols[5],
+                    cols[6], cols[7],
+                )
+                mic = "XNAS"
+            else:
+                if len(cols) < 7:
+                    continue
+                symbol, name, exchange, _cqs, etf, _lot, test_issue = (
+                    cols[0], cols[1], cols[2], cols[3], cols[4], cols[5],
+                    cols[6],
+                )
+                mic = cls.OTHER_EXCHANGE_MIC.get(str(exchange).strip().upper())
+                if not mic:
+                    continue
+                nextshares = "N"
+            if str(test_issue).strip().upper() == "Y":
+                continue
+            if str(nextshares).strip().upper() == "Y":
+                continue
+            name_l = f" {name.lower()} "
+            if any(fragment in name_l for fragment in cls.SKIP_NAME_FRAGMENTS):
+                continue
+            sec_type = "ETF" if str(etf).strip().upper() == "Y" else "CS"
+            rows.append(
+                {
+                    "ticker": str(symbol).strip().upper(),
+                    "primary_exchange": mic,
+                    "type": sec_type,
+                }
+            )
+        return rows
+
     def _discover_finnhub(self) -> List[str]:
         """Live US listing fallback. Still a full exchange dump, never a watchlist."""
         if not FINNHUB_API_KEY:
             raise PipelineError(
-                "Live universe discovery FAILED on Massive and Finnhub is not "
-                "configured. Do NOT substitute a preset basket."
+                "Live universe discovery FAILED on Massive, official NASDAQ "
+                "listing files, and Finnhub is not configured. Do NOT "
+                "substitute a preset basket."
             )
         log.info("STAGE 1: Universe Discovery -- querying Finnhub /stock/symbol")
         try:
@@ -1934,8 +2272,9 @@ class UniverseDiscovery:
             payload = resp.json()
         except Exception as exc:
             raise PipelineError(
-                f"Live universe discovery FAILED. Sources: Massive then Finnhub. "
-                f"Error: {exc}. Do NOT substitute a preset basket."
+                f"Live universe discovery FAILED. Sources: Massive, NASDAQ "
+                f"listing files, then Finnhub. Error: {exc}. Do NOT substitute "
+                f"a preset basket."
             )
         if not isinstance(payload, list) or not payload:
             raise PipelineError(
@@ -5219,11 +5558,9 @@ class FundamentalsFetcher:
                 if not isinstance(info.get("industry"), str) or is_missing_value(info["industry"]):
                     info["industry"] = "Unknown"
 
-                info["earnings_date"] = normalize_api_scalar(info.get("earnings_date"))
-                if is_missing_value(info["earnings_date"]):
-                    info["earnings_date"] = None
-                else:
-                    info["earnings_date"] = str(info["earnings_date"])
+                info["earnings_date"] = normalize_earnings_date(
+                    info.get("earnings_date")
+                )
 
                 info = self._enrich_fundamentals(ticker, info)
 
@@ -5632,7 +5969,7 @@ class FundamentalsFetcher:
             if isinstance(cal, dict):
                 ed = cal.get("Earnings Date") or cal.get("earningsDate")
                 if ed is not None:
-                    out["earnings_date"] = str(ed)
+                    out["earnings_date"] = normalize_earnings_date(ed)
         except Exception:
             pass
         try:
@@ -5867,13 +6204,14 @@ class InvestorPanel:
             s["fundamentals_sources"] = list(
                 fund.get("fundamentals_sources") or []
             )
-            if fund.get("earnings_date") and not s.get("live_earnings_date"):
-                s["live_earnings_date"] = fund.get("earnings_date")
-            if s.get("live_earnings_date"):
+            earnings_iso = normalize_earnings_date(
+                s.get("live_earnings_date") or fund.get("earnings_date")
+            )
+            if earnings_iso:
+                s["live_earnings_date"] = earnings_iso
                 try:
                     days_to_earnings = (
-                        pd.Timestamp(s["live_earnings_date"]).date()
-                        - today_et()
+                        pd.Timestamp(earnings_iso).date() - today_et()
                     ).days
                 except Exception:
                     days_to_earnings = None
@@ -6053,7 +6391,7 @@ class InvestorPanel:
         # a point-in-time actual-vs-estimate surprise that this feed often does
         # not provide. Imminent unmodelled earnings are explicitly penalized.
         catalyst_score = 50
-        earnings_date = fund.get("earnings_date")
+        earnings_date = normalize_earnings_date(fund.get("earnings_date"))
         if earnings_date:
             try:
                 ed = pd.Timestamp(earnings_date).tz_localize(None)
@@ -6534,7 +6872,7 @@ class OptionsEvaluator:
 
         # Compute earnings-window IV-crush guard
         earnings_dt = None
-        ed_raw = fund.get("earnings_date")
+        ed_raw = normalize_earnings_date(fund.get("earnings_date"))
         if ed_raw:
             try:
                 earnings_dt = pd.Timestamp(ed_raw).date()
@@ -8076,7 +8414,7 @@ def main():
             event = macro.world.earnings_events.get(ticker)
             if event and event.get("date"):
                 info = fundamentals.setdefault(ticker, {})
-                info["earnings_date"] = event["date"]
+                info["earnings_date"] = normalize_earnings_date(event.get("date"))
                 info["earnings_event_source"] = event.get("source", "Finnhub")
         try:
             macro.world.annotate(survivors)

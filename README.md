@@ -7,15 +7,17 @@ entry point is:
 new_stock_scanner_pipeline_claude_opus_41426.py
 ```
 
-The scanner dynamically discovers the live universe, pulls current market data
-and headlines, checks macro regime context against today's world events and
-live market status (VIX, yields, USD, gold, oil, session open/holiday),
-applies execution guards and hard buy rules, ranks survivors, evaluates
-fundamentals/options, and writes auditable outputs. It does not use preset
-ticker baskets, watchlists, yesterday's CSV, mock data, or a pre-selected
-benchmark ETF. News and the earnings calendar annotate names that already
-survived; they never choose the universe. Relative strength is measured
-against the live S&P 500 index fetched that run.
+The scanner dynamically discovers the live universe (Massive first, then
+official NASDAQ Trader listing files, then Finnhub -- never a preset
+basket), pulls current market data and headlines, checks macro regime
+context against today's world events and live market status (VIX, yields,
+USD, gold, oil, session open/holiday), applies execution guards and hard
+buy rules, ranks survivors, evaluates fundamentals/options, and writes
+auditable outputs. It does not use preset ticker baskets, watchlists,
+yesterday's CSV, mock data, or a pre-selected benchmark ETF. News and the
+earnings calendar annotate names that already survived; they never choose
+the universe. Relative strength is measured against the live S&P 500
+index fetched that run.
 
 The output limit is seven; it is not a quota. If no ticker passes every hard
 rule, the scanner abstains and writes a non-actionable near-miss report. It
@@ -44,7 +46,8 @@ ENABLE_EXPERIMENTAL_LSTM=1 python new_stock_scanner_pipeline_claude_opus_41426.p
 
 The script supports these environment variable overrides:
 
-- `MASSIVE_API_KEY` (required for universe discovery)
+- `MASSIVE_API_KEY` (preferred for universe discovery and OHLCV; official
+  NASDAQ listing files are the no-key universe fallback)
 - `MBOUM_API_KEY` (primary OHLCV and fundamentals source when credits remain)
 - `MBOUM_OPTIONS_KEY` (primary options chains when present)
 - `TWELVEDATA_API_KEY` (fallback OHLCV and fundamentals)
@@ -63,6 +66,16 @@ Environment variables and GitHub Actions secrets override the committed
 fallback keys for Massive, TwelveData, and Finnhub. If those secrets are
 empty, the engine uses the keys checked in on this branch so the scan can
 still run. MBOUM keys are not committed and still come from secrets.
+
+This repository is public. Treat the committed Massive/TwelveData/Finnhub
+fallbacks as compromised: rotate them, store replacements only in Actions
+secrets / local env vars, and do not add new keys to source. The engine
+already prefers env/secrets over the embedded table.
+
+Scheduled-event context prefers Finnhub's economic calendar (CPI, NFP,
+FOMC). If that endpoint is plan-blocked, the engine loads the official
+Federal Reserve calendar for FOMC/Beige Book/Fed releases and keeps
+position sizing conservative because BLS/BEA prints are still unverified.
 
 ## Run locally
 

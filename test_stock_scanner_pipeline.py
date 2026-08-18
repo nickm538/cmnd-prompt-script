@@ -421,6 +421,194 @@ class ScannerRegressionTests(unittest.TestCase):
         )
         self.assertEqual(cleaned, ["TEST"])
 
+    def test_nasdaq_listing_parser_keeps_listed_equities_not_warrants(self):
+        nasdaq_text = "\n".join([
+            "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares",
+            "AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N",
+            "QQQ|Invesco QQQ Trust, Series 1|G|N|N|100|Y|N",
+            "AACBR|Artius II Acquisition Inc. - Rights|G|N|N|100|N|N",
+            "AACBU|Artius II Acquisition Inc. - Units|G|N|N|100|N|N",
+            "ZZZZ|Fake Test Company Test Symbol|G|Y|N|100|N|N",
+            "File Creation Time: 0817202618:01|||||||",
+            "",
+        ])
+        other_text = "\n".join([
+            "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol",
+            "IBM|International Business Machines Corporation Common Stock|N|IBM|N|100|N|IBM",
+            "ZXIET|IEX Test Company Test Symbol Three for IEX|V|ZXIET|N|100|Y|ZXIET",
+            "File Creation Time: 0817202618:01||||||",
+            "",
+        ])
+        nasdaq_rows = scanner.UniverseDiscovery._parse_nasdaq_listing_text(
+            nasdaq_text, "nasdaq"
+        )
+        other_rows = scanner.UniverseDiscovery._parse_nasdaq_listing_text(
+            other_text, "other"
+        )
+        cleaned = scanner.UniverseDiscovery._clean_listed_equities(
+            nasdaq_rows + other_rows
+        )
+        self.assertEqual(cleaned, ["AAPL", "IBM", "QQQ"])
+
+    def test_universe_falls_back_to_nasdaq_listings_when_massive_fails(self):
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        symbols = [
+            alphabet[i // 26] + alphabet[i % 26] + "Q"
+            for i in range(scanner.MIN_UNIVERSE_SIZE)
+        ]
+        nasdaq_body = [
+            "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares"
+        ]
+        nasdaq_body.extend(
+            f"{sym}|Example {sym} - Common Stock|Q|N|N|100|N|N"
+            for sym in symbols
+        )
+        nasdaq_body.append("File Creation Time: 0817202618:01|||||||")
+        nasdaq_text = "\n".join(nasdaq_body)
+        other_text = "\n".join([
+            "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol",
+            "File Creation Time: 0817202618:01||||||",
+        ])
+
+        def fake_get(url, **kwargs):
+            url = str(url)
+            if "massive.com" in url:
+                raise RuntimeError("massive down")
+            resp = Mock(status_code=200, text="")
+            resp.raise_for_status = Mock()
+            if "nasdaqlisted" in url:
+                resp.text = nasdaq_text
+            elif "otherlisted" in url:
+                resp.text = other_text
+            else:
+                self.fail(f"unexpected universe URL {url}")
+            return resp
+
+        discovery = scanner.UniverseDiscovery("massive-key")
+        with patch.object(discovery.session, "get", side_effect=fake_get):
+            with patch.object(scanner, "FINNHUB_API_KEY", ""):
+                tickers = discovery.discover()
+        self.assertEqual(len(tickers), scanner.MIN_UNIVERSE_SIZE)
+        self.assertIn(symbols[0], tickers)
+        self.assertIn(symbols[-1], tickers)
+
+    def test_fed_calendar_parser_keeps_fomc_not_speeches(self):
+        payload = {
+            "events": [
+                {
+                    "type": "FOMC",
+                    "title": "FOMC Minutes",
+                    "month": "2026-08",
+                    "days": "19",
+                    "time": "2:00 p.m.",
+                },
+                {
+                    "type": "Speeches",
+                    "title": "Discussion - Vice Chair",
+                    "month": "2026-08",
+                    "days": "18",
+                },
+                {
+                    "type": "Stat",
+                    "title": "G.17 - Industrial Production and Capacity Utilization",
+                    "month": "2026-08",
+                    "days": "18",
+                },
+                {
+                    "type": "Stat",
+                    "title": "H.6 - Money Stock Measures",
+                    "month": "2026-08",
+                    "days": "25",
+                },
+            ]
+        }
+        events = scanner.WorldContext._parse_fed_calendar_events(
+            payload,
+            start=date(2026, 8, 18),
+            end=date(2026, 8, 21),
+        )
+        titles = [row["event"] for row in events]
+        self.assertEqual(
+            titles,
+            [
+                "G.17 - Industrial Production and Capacity Utilization",
+                "FOMC Minutes",
+            ],
+        )
+        self.assertTrue(all(row["high_impact"] for row in events))
+        self.assertTrue(all(row["source"] == "FederalReserve" for row in events))
+
+    def test_economic_calendar_falls_back_to_fed_when_finnhub_forbidden(self):
+        finnhub = Mock(status_code=403, text="plan limit")
+        finnhub.json.return_value = {"error": "403"}
+        fed_payload = {
+            "events": [{
+                "type": "FOMC",
+                "title": "FOMC Meeting",
+                "month": "2026-08",
+                "days": "18-19",
+                "time": "2:00 p.m.",
+            }]
+        }
+        fed = Mock(status_code=200, text="")
+        fed.content = json.dumps(fed_payload).encode("utf-8")
+        session = Mock()
+        session.get.side_effect = (
+            lambda url, **kwargs: fed
+            if "federalreserve.gov" in url
+            else finnhub
+        )
+        ctx = scanner.WorldContext()
+        with patch.object(scanner, "today_et", return_value=date(2026, 8, 18)):
+            with patch.object(scanner, "FINNHUB_API_KEY", "finnhub-key"):
+                ctx._load_economic_calendar(session)
+        self.assertEqual(ctx.feed_status["economic_calendar"], "ok_fed")
+        self.assertEqual(len(ctx.economic_events), 1)
+        self.assertEqual(ctx.economic_events[0]["event"], "FOMC Meeting")
+        self.assertTrue(ctx.economic_events[0]["high_impact"])
+
+    def test_fed_only_economic_calendar_still_caps_position_sizing(self):
+        macro = scanner.MacroRegime()
+        macro.regime_score = 90.0
+        macro.world.event_risk = 10.0
+        macro.world.feed_status["market_news"] = "ok"
+        macro.world.feed_status["economic_calendar"] = "ok_fed"
+        self.assertEqual(macro.position_sizing_scalar(), 0.80)
+
+    def test_yfinance_earnings_date_lists_are_normalized_to_iso(self):
+        with patch.object(scanner, "today_et", return_value=date(2026, 8, 17)):
+            iso = scanner.normalize_earnings_date(
+                [date(2026, 9, 8), date(2026, 9, 10)]
+            )
+            from_index = scanner.normalize_earnings_date(
+                pd.DatetimeIndex(["2026-09-08", "2026-09-10"])
+            )
+        self.assertEqual(iso, "2026-09-08")
+        self.assertEqual(from_index, "2026-09-08")
+
+    def test_holding_window_earnings_from_date_list_blocks_buy(self):
+        with patch.object(scanner, "today_et", return_value=date(2026, 8, 17)):
+            earnings_iso = scanner.normalize_earnings_date(
+                [date(2026, 9, 8)]
+            )
+            days_to = (
+                pd.Timestamp(earnings_iso).date() - date(2026, 8, 17)
+            ).days
+        self.assertEqual(earnings_iso, "2026-09-08")
+        self.assertTrue(0 <= days_to <= scanner.EARNINGS_RISK_WINDOW_DAYS)
+        action = scanner.OutputFormatter.recommended_action(
+            {
+                "hard_buy_pass": True,
+                "panel_composite_score": 69.2,
+                "panel_consensus": 5,
+                "ml_ensemble_score": 0.28,
+                "trade_setup_score": 60.1,
+                "fundamentals_quality": "partial",
+                "flags": ["EARNINGS_IN_HOLDING_WINDOW"],
+            }
+        )
+        self.assertEqual(action, "WAIT: EARNINGS")
+
     def test_engine_has_no_preset_screener_or_spy_etf_fetch(self):
         source = inspect.getsource(scanner)
         self.assertNotIn('get_history("SPY")', source)
@@ -1034,6 +1222,12 @@ class ScannerRegressionTests(unittest.TestCase):
                 {**base, "flags": ["BINARY_EVENT_RISK"]}
             ),
             "WAIT: EVENT RISK",
+        )
+        self.assertEqual(
+            scanner.OutputFormatter.recommended_action(
+                {**base, "flags": ["EARNINGS_IN_HOLDING_WINDOW"]}
+            ),
+            "WAIT: EARNINGS",
         )
         self.assertEqual(
             scanner.OutputFormatter.recommended_action(
