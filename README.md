@@ -17,6 +17,10 @@ benchmark ETF. News and the earnings calendar annotate names that already
 survived; they never choose the universe. Relative strength is measured
 against the live S&P 500 index fetched that run.
 
+The output limit is seven; it is not a quota. If no ticker passes every hard
+rule, the scanner abstains and writes a non-actionable near-miss report. It
+never promotes an 8/10 or 9/10 setup to `BUY` just to fill the table.
+
 ## Local setup
 
 Use Python 3.12 or another current Python 3 release.
@@ -26,6 +30,14 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+The experimental informational LSTM is disabled by default and never
+participates in ranking. To inspect it locally:
+
+```bash
+python -m pip install -r requirements-optional.txt
+ENABLE_EXPERIMENTAL_LSTM=1 python new_stock_scanner_pipeline_claude_opus_41426.py
 ```
 
 ## API configuration
@@ -40,10 +52,12 @@ The script supports these environment variable overrides:
 - `ALPHAVANTAGE_API_KEY`
 
 MBOUM stays the primary market-data source. If the MBOUM plan is out of
-credits, unauthorized, or returning empty history, the engine trips a
-process-local circuit and continues the same scan through Massive, then
+credits, unauthorized, or repeatedly fails at the provider level, the engine
+trips a process-local circuit and continues the same scan through Massive, then
 TwelveData, then Finnhub, then Yahoo v8 / yfinance. Restored MBOUM credits
 are used first again on the next run. No bars or fundamentals are fabricated.
+Ticker-specific no-data responses do not trip a provider for the rest of the
+universe.
 
 Environment variables and GitHub Actions secrets override the committed
 fallback keys for Massive, TwelveData, and Finnhub. If those secrets are
@@ -66,9 +80,10 @@ source .venv/bin/activate
 python new_stock_scanner_pipeline_claude_opus_41426.py
 ```
 
-The scanner calls live financial data APIs and can take several minutes. A full
-live run on the current universe has been verified end-to-end at about 13.5
-minutes, but runtime depends on API latency and universe size.
+The scanner calls live financial data APIs and can take several minutes.
+Runtime depends on universe size, provider latency/rate limits, and how far the
+fallback chain has to travel. The in-process budget reserves time to write an
+auditable status artifact before the GitHub Actions timeout.
 
 ## GitHub scheduled run
 
@@ -104,17 +119,40 @@ Runtime outputs are ignored by git and written to:
   rules
 - `scan_results/near_misses_<timestamp>.json` when no ticker passes all hard
   rules
+- `scan_results/status_<timestamp>.json` when a run stops incomplete
 
-The JSON report includes macro regime snapshots, live headlines, market
-status, pipeline funnel counts, feature importances, and an attestation
-that live data sources were used and that no preset ticker list was loaded.
+The JSON report includes macro regime snapshots, headline/economic/earnings
+feed status, pipeline funnel counts, provider provenance, feature importances,
+date-purged walk-forward diagnostics, calibration metrics, and explicit model
+risk limitations.
+
+## Model-risk boundaries
+
+- Tree-model labels use the next session's open as the feasible entry and the
+  close 20 sessions later as the exit. Validation is grouped by trading date
+  with a 20-session purge, and out-of-sample probabilities are calibrated. A
+  model that does not beat the chronological base-rate forecast abstains at
+  `0.5`.
+- The broad training pool is not selected on today's return. It is still built
+  from securities listed today because the configured providers do not supply
+  a point-in-time delisted universe. The report therefore marks survivorship
+  bias as uncontrolled.
+- `setup_quality_score` (and its backward-compatible
+  `overall_confidence_score` alias) is a transparent heuristic, not a win
+  probability. No scanner can guarantee predictive accuracy or eliminate
+  earnings-gap, liquidity, macro, or geopolitical risk.
+- An earnings date alone is treated as event risk, not a bullish catalyst.
+  Candidates with earnings inside the strategy holding window are held at
+  `WAIT`, and options spanning that event are rejected unless a separately
+  validated event model is added in the future.
 
 ## Operational notes
 
 - Run before the market opens; the scanner uses the latest fully closed daily
   bars.
-- If run during regular trading hours, intraday partial bars are trimmed before
-  screening so volume and freshness checks do not use incomplete data.
+- The official XNYS calendar (including holidays, special closures, and
+  half-days) determines the latest vendor-finalized session. Same-day partial
+  bars are removed even if they appear outside regular trading hours.
 - A day with zero qualifying buys is valid behavior. In that case, the scanner
   writes a near-miss report instead of fabricating candidates.
 - Options candidates require live bid/ask quotes and liquidity checks; otherwise
