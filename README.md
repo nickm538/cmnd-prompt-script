@@ -62,15 +62,10 @@ are used first again on the next run. No bars or fundamentals are fabricated.
 Ticker-specific no-data responses do not trip a provider for the rest of the
 universe.
 
-Environment variables and GitHub Actions secrets override the committed
-fallback keys for Massive, TwelveData, and Finnhub. If those secrets are
-empty, the engine uses the keys checked in on this branch so the scan can
-still run. MBOUM keys are not committed and still come from secrets.
-
-This repository is public. Treat the committed Massive/TwelveData/Finnhub
-fallbacks as compromised: rotate them, store replacements only in Actions
-secrets / local env vars, and do not add new keys to source. The engine
-already prefers env/secrets over the embedded table.
+Massive, TwelveData, and Finnhub API keys must be provided via environment
+variables or GitHub Actions secrets. Each provider is skipped in the fallback
+chain if its key is absent. MBOUM keys (both tiers) are also read from
+environment variables or GitHub Actions secrets only.
 
 Scheduled-event context prefers Finnhub's economic calendar (CPI, NFP,
 FOMC). If that endpoint is plan-blocked, the engine loads the official

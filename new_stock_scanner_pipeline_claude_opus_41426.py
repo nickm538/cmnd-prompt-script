@@ -97,14 +97,14 @@ def _env_or_default(name: str, default: str = "") -> str:
     return value if value else default
 
 
-# Committed fallback keys, in one table so credential reporting can tell a live
-# secret apart from a fallback. MBOUM (both tiers) and AlphaVantage have no
-# fallback on purpose -- MBOUM is the credit-metered primary, and running it on
-# a shared committed key would burn the plan the whole cascade depends on.
+# API keys must be provided via environment variables or GitHub Actions secrets.
+# MBOUM (both tiers) and AlphaVantage have no committed fallback -- MBOUM is the
+# credit-metered primary. Massive, TwelveData, and Finnhub also require env/secrets
+# and have no committed fallback; each provider is skipped if its key is absent.
 EMBEDDED_FALLBACK_KEYS: Dict[str, str] = {
-    "MASSIVE_API_KEY": "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H",
-    "FINNHUB_API_KEY": "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg",
-    "TWELVEDATA_API_KEY": "5e7a5daaf41d46a8966963106ebef210",
+    "MASSIVE_API_KEY": "",
+    "FINNHUB_API_KEY": "",
+    "TWELVEDATA_API_KEY": "",
 }
 
 

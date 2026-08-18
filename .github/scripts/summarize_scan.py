@@ -131,7 +131,7 @@ def _render(report: Dict[str, Any]) -> List[str]:
             "| {insider} | {action} |".format(
                 rank=_cell(row.get("rank")),
                 ticker=_cell(row.get("ticker")),
-                conf=_cell(row.get("overall_confidence")),
+                conf=_cell(row.get("setup_quality")),
                 ml=_cell(row.get("ml_ensemble")),
                 panel=_cell(row.get("panel_composite")),
                 hype=_cell(row.get("hype_score")),
