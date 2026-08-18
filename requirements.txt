@@ -1,11 +1,12 @@
-numpy
-pandas
-requests
-yfinance
-scikit-learn
-massive
-tzdata
+numpy==2.4.4
+pandas==3.0.5
+requests==2.33.1
+yfinance==1.6.0
+scikit-learn==1.9.0
+scipy==1.18.0
+exchange-calendars==4.13.2
+tzdata==2026.3
+xgboost==3.4.1
 
-# Optional ML accelerators used by the scanner when available.
-xgboost
-torch
+# The unvalidated informational LSTM is deliberately not installed in CI.
+# See requirements-optional.txt and ENABLE_EXPERIMENTAL_LSTM.
