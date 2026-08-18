@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -1151,6 +1151,37 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertEqual(report["report_kind"], "no_action")
         self.assertEqual(report["total_survivors"], 0)
         self.assertIn("valid abstention", report["reason"])
+
+    def test_world_news_falls_back_to_massive_when_finnhub_plan_blocks(self):
+        finnhub = Mock(status_code=200, text="plan limit reached")
+        finnhub.json.return_value = {"error": "plan limit reached"}
+        massive = Mock(status_code=200, text="")
+        massive.json.return_value = {
+            "results": [{
+                "title": "Federal Reserve decision moves global markets",
+                "published_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+                "article_url": "https://example.test/article",
+                "publisher": {"name": "Test Wire"},
+            }]
+        }
+        session = Mock()
+        session.get.side_effect = (
+            lambda url, **kwargs: massive
+            if "massive.com" in url
+            else finnhub
+        )
+        ctx = scanner.WorldContext()
+
+        with patch.object(scanner, "FINNHUB_API_KEY", "finnhub-key"):
+            with patch.object(scanner, "MASSIVE_API_KEY", "massive-key"):
+                ctx._load_news(session)
+
+        self.assertEqual(ctx.feed_status["market_news"], "ok")
+        self.assertEqual(ctx.source, "Massive")
+        self.assertEqual(len(ctx.headlines), 1)
+        self.assertEqual(
+            ctx.headlines[0]["provider"], "Massive"
+        )
 
     def test_world_headlines_drop_vendor_related_tickers(self):
         ctx = scanner.WorldContext()

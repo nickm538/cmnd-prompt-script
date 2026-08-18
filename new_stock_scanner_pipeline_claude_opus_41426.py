@@ -881,64 +881,141 @@ class WorldContext:
             log.info(f"    - {note}")
 
     def _load_news(self, session) -> None:
-        if not FINNHUB_API_KEY:
-            self.feed_status["market_news"] = "missing_key"
-            return
-        try:
-            resp = session.get(
-                f"{FINNHUB_BASE_URL}/news",
-                params={"category": "general", "token": FINNHUB_API_KEY},
-                timeout=15,
+        now = now_et_dt()
+        cutoff = now - timedelta(hours=self.NEWS_LOOKBACK_HOURS)
+        rows: List[Dict[str, Any]] = []
+        providers = set()
+        successful_feed = False
+
+        if FINNHUB_API_KEY:
+            try:
+                resp = session.get(
+                    f"{FINNHUB_BASE_URL}/news",
+                    params={
+                        "category": "general",
+                        "token": FINNHUB_API_KEY,
+                    },
+                    timeout=15,
+                )
+                kind = classify_http_error(
+                    resp.status_code, resp.text or ""
+                )
+                payload = resp.json() if resp.status_code == 200 else None
+                if (
+                    resp.status_code == 200
+                    and kind not in {"credit", "auth"}
+                    and isinstance(payload, list)
+                ):
+                    successful_feed = True
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        headline = str(
+                            item.get("headline") or ""
+                        ).strip()
+                        try:
+                            when = datetime.fromtimestamp(
+                                int(item.get("datetime")),
+                                tz=timezone.utc,
+                            ).astimezone(ET_TZ)
+                        except Exception:
+                            continue
+                        if (
+                            not headline
+                            or when < cutoff
+                            or when > now + timedelta(minutes=15)
+                        ):
+                            continue
+                        rows.append({
+                            "headline": headline[:240],
+                            "source": str(
+                                item.get("source") or "Finnhub"
+                            ),
+                            "datetime": when.isoformat(),
+                            "url": str(item.get("url") or ""),
+                            "provider": "Finnhub",
+                        })
+                        providers.add("Finnhub")
+                else:
+                    log.info(
+                        "  Finnhub market news unavailable; trying Massive."
+                    )
+            except Exception as exc:
+                log.debug(f"  Finnhub world news fetch failed: {exc}")
+
+        if MASSIVE_API_KEY:
+            try:
+                resp = session.get(
+                    "https://api.massive.com/v2/reference/news",
+                    params={
+                        "limit": 100,
+                        "order": "desc",
+                        "sort": "published_utc",
+                        "apiKey": MASSIVE_API_KEY,
+                    },
+                    timeout=20,
+                )
+                payload = resp.json() if resp.status_code == 200 else {}
+                items = (
+                    payload.get("results")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if resp.status_code == 200 and isinstance(items, list):
+                    successful_feed = True
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        headline = str(item.get("title") or "").strip()
+                        try:
+                            when = pd.Timestamp(
+                                item.get("published_utc")
+                            )
+                            if when.tzinfo is None:
+                                when = when.tz_localize("UTC")
+                            when = when.tz_convert(ET_TZ).to_pydatetime()
+                        except Exception:
+                            continue
+                        if (
+                            not headline
+                            or when < cutoff
+                            or when > now + timedelta(minutes=15)
+                        ):
+                            continue
+                        publisher = item.get("publisher") or {}
+                        source = (
+                            publisher.get("name")
+                            if isinstance(publisher, dict)
+                            else publisher
+                        )
+                        rows.append({
+                            "headline": headline[:240],
+                            "source": str(source or "Massive"),
+                            "datetime": when.isoformat(),
+                            "url": str(item.get("article_url") or ""),
+                            "provider": "Massive",
+                        })
+                        providers.add("Massive")
+            except Exception as exc:
+                log.debug(f"  Massive world news fetch failed: {exc}")
+
+        deduplicated = {}
+        for row in rows:
+            key = " ".join(
+                str(row.get("headline") or "").lower().split()
             )
-            kind = classify_http_error(resp.status_code, resp.text or "")
-            if kind in ("credit", "auth"):
-                self.feed_status["market_news"] = f"http_{resp.status_code}"
-                log.warning(f"  World news unavailable (HTTP {resp.status_code})")
-                return
-            if resp.status_code != 200:
-                self.feed_status["market_news"] = f"http_{resp.status_code}"
-                return
-            payload = resp.json()
-            if not isinstance(payload, list):
-                self.feed_status["market_news"] = "invalid_payload"
-                return
-            self.feed_status["market_news"] = "ok"
-            cutoff = now_et_dt() - timedelta(hours=self.NEWS_LOOKBACK_HOURS)
-            rows = []
-            seen = set()
-            for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                headline = str(item.get("headline") or "").strip()
-                if not headline:
-                    continue
-                normalized = " ".join(headline.lower().split())
-                if normalized in seen:
-                    continue
-                ts = item.get("datetime")
-                try:
-                    when = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(ET_TZ)
-                except Exception:
-                    # A timeless item cannot support a "current context" claim.
-                    continue
-                if when < cutoff or when > now_et_dt() + timedelta(minutes=15):
-                    continue
-                seen.add(normalized)
-                rows.append({
-                    "headline": headline[:240],
-                    "source": str(item.get("source") or ""),
-                    "datetime": when.isoformat(),
-                    "url": str(item.get("url") or ""),
-                })
-                if len(rows) >= 80:
-                    break
-            rows.sort(key=lambda r: r.get("datetime") or "", reverse=True)
-            self.headlines = rows[:self.MAX_HEADLINES]
-            if self.headlines:
-                self.source = "Finnhub"
-        except Exception as exc:
-            self.feed_status["market_news"] = "error"
-            log.debug(f"  World news fetch failed: {exc}")
+            if key and key not in deduplicated:
+                deduplicated[key] = row
+        ordered = sorted(
+            deduplicated.values(),
+            key=lambda row: row.get("datetime") or "",
+            reverse=True,
+        )
+        self.headlines = ordered[:self.MAX_HEADLINES]
+        self.source = "+".join(sorted(providers))
+        self.feed_status["market_news"] = (
+            "ok" if successful_feed else "unavailable"
+        )
 
     def _load_earnings(self, session) -> None:
         if not FINNHUB_API_KEY:
@@ -1140,7 +1217,7 @@ class WorldContext:
         if self.earnings_soon:
             notes.append(
                 f"Live earnings calendar: {len(self.earnings_soon)} names "
-                f"print within {self.EARNINGS_WINDOW_DAYS} sessions "
+                f"print within {self.EARNINGS_WINDOW_DAYS} calendar days "
                 "(used only to annotate survivors, not to pick names)"
             )
         high_impact_events = [
@@ -1241,36 +1318,68 @@ class WorldContext:
         )
 
     def _company_headlines(self, session, ticker: str, start: str, end: str) -> List[str]:
-        if not FINNHUB_API_KEY or not ticker:
+        if not ticker:
             return []
-        try:
-            resp = session.get(
-                f"{FINNHUB_BASE_URL}/company-news",
-                params={
-                    "symbol": ticker,
-                    "from": start,
-                    "to": end,
-                    "token": FINNHUB_API_KEY,
-                },
-                timeout=12,
-            )
-            if resp.status_code != 200:
-                return []
-            payload = resp.json()
-            if not isinstance(payload, list):
-                return []
-            out = []
-            for item in payload:
-                if not isinstance(item, dict):
-                    continue
-                headline = str(item.get("headline") or "").strip()
-                if headline:
-                    out.append(headline[:200])
-                if len(out) >= 3:
-                    break
-            return out
-        except Exception:
-            return []
+        out: List[str] = []
+        if FINNHUB_API_KEY:
+            try:
+                resp = session.get(
+                    f"{FINNHUB_BASE_URL}/company-news",
+                    params={
+                        "symbol": ticker,
+                        "from": start,
+                        "to": end,
+                        "token": FINNHUB_API_KEY,
+                    },
+                    timeout=12,
+                )
+                payload = resp.json() if resp.status_code == 200 else None
+                if isinstance(payload, list):
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        headline = str(
+                            item.get("headline") or ""
+                        ).strip()
+                        if headline:
+                            out.append(headline[:200])
+                        if len(out) >= 3:
+                            break
+            except Exception:
+                pass
+        if not out and MASSIVE_API_KEY:
+            try:
+                resp = session.get(
+                    "https://api.massive.com/v2/reference/news",
+                    params={
+                        "ticker": ticker,
+                        "published_utc.gte": f"{start}T00:00:00Z",
+                        "published_utc.lte": f"{end}T23:59:59Z",
+                        "limit": 10,
+                        "order": "desc",
+                        "sort": "published_utc",
+                        "apiKey": MASSIVE_API_KEY,
+                    },
+                    timeout=15,
+                )
+                payload = resp.json() if resp.status_code == 200 else {}
+                items = (
+                    payload.get("results")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        headline = str(item.get("title") or "").strip()
+                        if headline:
+                            out.append(headline[:200])
+                        if len(out) >= 3:
+                            break
+            except Exception:
+                pass
+        return list(dict.fromkeys(out))[:3]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
