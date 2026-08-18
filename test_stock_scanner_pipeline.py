@@ -48,7 +48,10 @@ class ScannerRegressionTests(unittest.TestCase):
                 symbol, *args, **kwargs
             )
 
-        idx = pd.bdate_range(end="2026-08-13", periods=260)
+        idx = pd.bdate_range(
+            end=scanner.expected_last_closed_trading_day(),
+            periods=260,
+        )
         frame = pd.DataFrame({"Close": np.linspace(100.0, 130.0, 260)}, index=idx)
 
         def fake_series(symbol, *args, **kwargs):
@@ -1126,7 +1129,9 @@ class ScannerRegressionTests(unittest.TestCase):
             "price": 100.0,
             "rules_passed": 9,
             "rules_failed": 1,
-            "passed_rules": [f"BUY_{i:02d}" for i in range(1, 10)],
+            "passed_rules": [
+                f"BUY_{i:02d}" for i in range(1, 11) if i != 9
+            ],
             "failed_rules": ["BUY_09:Volume"],
             "rsi_14": 55.0,
             "macd_histogram": 0.1,
