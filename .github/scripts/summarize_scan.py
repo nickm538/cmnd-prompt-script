@@ -19,7 +19,12 @@ def _cell(value: Any) -> str:
     """Render a table cell, tolerating missing/None values."""
     if value is None or value == "":
         return "--"
-    return str(value)
+    return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def _text(value: Any) -> str:
+    """Keep untrusted provider text inside one Markdown line."""
+    return str(value or "").replace("\r", " ").replace("\n", " ").strip()
 
 
 def _render(report: Dict[str, Any]) -> List[str]:
@@ -55,16 +60,70 @@ def _render(report: Dict[str, Any]) -> List[str]:
         lines.append("Today's market headlines (context only; not a ticker list):")
         for item in headlines[:5]:
             headline = item.get("headline") if isinstance(item, dict) else item
-            lines.append(f"- {headline}")
+            lines.append(f"- {_text(headline)}")
+    economic_events = [
+        event for event in (world.get("economic_events") or [])
+        if isinstance(event, dict) and event.get("high_impact")
+    ]
+    if economic_events:
+        lines.append("")
+        lines.append("High-impact US macro calendar:")
+        for event in economic_events[:5]:
+            lines.append(
+                f"- {_text(event.get('time'))}: "
+                f"{_text(event.get('event'))}"
+            )
+    if world.get("context_degraded"):
+        statuses = world.get("feed_status") or {}
+        degraded = ", ".join(
+            f"{name}={status}"
+            for name, status in statuses.items()
+            if status != "ok"
+        )
+        lines.append(f"- Context coverage degraded: {_text(degraded)}")
 
     lines.append("")
 
     rows = report.get("top_25") or []
+    near_misses = report.get("near_misses") or []
+    if report.get("report_kind") == "incomplete":
+        lines.append(
+            "Scanner run incomplete: "
+            + _text(report.get("reason") or "unknown failure")
+        )
+        return lines
+    if report.get("report_kind") == "no_action" or (
+        not rows and near_misses
+    ):
+        lines.append(
+            "No actionable candidate passed every hard rule. "
+            "This is a valid abstention, not a failed scan."
+        )
+        if near_misses:
+            lines.append("")
+            lines.append("Closest non-actionable setups:")
+            lines.append("")
+            lines.append("| # | Ticker | Rules | Failed |")
+            lines.append("|---|--------|-------|--------|")
+            for row in near_misses[:7]:
+                failed = row.get("failed") or []
+                if isinstance(failed, list):
+                    failed = ", ".join(str(item) for item in failed)
+                lines.append(
+                    "| {rank} | {ticker} | {rules}/10 | {failed} |".format(
+                        rank=_cell(row.get("rank")),
+                        ticker=_cell(row.get("ticker")),
+                        rules=_cell(row.get("rules_passed")),
+                        failed=_cell(failed),
+                    )
+                )
+        return lines
+
     if not rows:
         lines.append("No candidates passed the pipeline.")
         return lines
 
-    lines.append("| # | Ticker | Conf | ML | Panel | Hype | Exh | Insider | Action |")
+    lines.append("| # | Ticker | Setup | ML | Panel | Hype | Exh | Insider | Action |")
     lines.append("|---|--------|------|----|-------|------|-----|---------|--------|")
     for row in rows[:7]:
         lines.append(
@@ -84,7 +143,8 @@ def _render(report: Dict[str, Any]) -> List[str]:
 
     lines.append("")
     lines.append(
-        "_Conf = overall confidence, Exh = exhaustion (lower is better; "
+        "_Setup is a heuristic quality score, not a win probability. "
+        "Exh = exhaustion (lower is better; "
         "high readings mean the move is already extended)._"
     )
     return lines

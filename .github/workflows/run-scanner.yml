@@ -162,7 +162,19 @@ jobs:
         if: always() && steps.schedule_window.outputs.run_scan == 'true'
         shell: bash
         run: |
-          latest="$(ls -1t scan_results/scan_*.json 2>/dev/null | head -n 1 || true)"
+          latest="$(
+            python - <<'PY'
+          from pathlib import Path
+
+          files = [
+              *Path("scan_results").glob("scan_*.json"),
+              *Path("scan_results").glob("near_misses_*.json"),
+              *Path("scan_results").glob("status_*.json"),
+          ]
+          if files:
+              print(max(files, key=lambda path: path.stat().st_mtime))
+          PY
+          )"
           if [[ -z "$latest" ]]; then
             echo "No scan report was produced -- see the uploaded log artifact." >> "$GITHUB_STEP_SUMMARY"
             exit 0

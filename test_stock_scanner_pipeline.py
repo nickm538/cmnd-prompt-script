@@ -1,8 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import inspect
+import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -45,7 +48,10 @@ class ScannerRegressionTests(unittest.TestCase):
                 symbol, *args, **kwargs
             )
 
-        idx = pd.bdate_range(end="2026-08-13", periods=260)
+        idx = pd.bdate_range(
+            end=scanner.expected_last_closed_trading_day(),
+            periods=260,
+        )
         frame = pd.DataFrame({"Close": np.linspace(100.0, 130.0, 260)}, index=idx)
 
         def fake_series(symbol, *args, **kwargs):
@@ -85,6 +91,8 @@ class ScannerRegressionTests(unittest.TestCase):
         macro = scanner.MacroRegime()
         macro.regime_score = 90.0          # would normally scale to 1.20
         macro.world.event_risk = 10.0
+        macro.world.feed_status["market_news"] = "ok"
+        macro.world.feed_status["economic_calendar"] = "ok"
         self.assertEqual(macro.position_sizing_scalar(), 1.20)
 
         macro.missing_required = ["irx"]
@@ -118,6 +126,16 @@ class ScannerRegressionTests(unittest.TestCase):
         df = _guard_ready_df(expected_day)
 
         self.assertIsNone(scanner.ExecutionGuards._check("TEST", df, now=now))
+
+    def test_execution_guard_rejects_future_or_unfinalized_daily_bar(self):
+        now = datetime(2026, 4, 30, 8, 45, tzinfo=scanner.ET_TZ)
+        frame = _guard_ready_df(date(2026, 4, 30))
+
+        reason = scanner.ExecutionGuards._check(
+            "TEST", frame, now=now
+        )
+
+        self.assertIn("Future/unfinalized bar", reason)
 
     def test_missing_fundamentals_are_not_neutral_boosted(self):
         panel = scanner.InvestorPanel()
@@ -162,7 +180,7 @@ class ScannerRegressionTests(unittest.TestCase):
 
         self.assertEqual(result["option_candidate"], "N")
 
-    def test_rank_pool_backfills_top7_from_live_near_misses(self):
+    def test_rank_pool_never_promotes_near_misses_to_actionable_candidates(self):
         data = {
             f"T{i}": _guard_ready_df(datetime(2026, 4, 29).date())
             for i in range(10)
@@ -196,17 +214,19 @@ class ScannerRegressionTests(unittest.TestCase):
         ]
 
         with patch.object(scanner.HardBuyRules, "near_misses", return_value=near_misses):
-            pool, _ = scanner.HardBuyRules.build_rank_pool(
+            pool, diagnostics = scanner.HardBuyRules.build_rank_pool(
                 data, strict, target_size=7, max_pool_size=7
             )
 
-        self.assertEqual(len(pool), 7)
-        self.assertEqual(pool[0]["ticker"], "T0")
+        self.assertEqual([row["ticker"] for row in pool], ["T0"])
         self.assertTrue(pool[0]["hard_buy_pass"])
-        self.assertTrue(all(p["rules_passed"] >= scanner.MIN_NEAR_MISS_RULES for p in pool))
-        self.assertTrue(any("NEAR_MISS_9_OF_10" in p["flags"] for p in pool[1:]))
+        self.assertEqual(diagnostics, near_misses)
+        self.assertTrue(
+            all(row.get("hard_buy_pass", False) for row in pool),
+            "A hard-rule failure must never enter the buy pool.",
+        )
 
-    def test_panel_can_score_without_filtering_backfill_pool(self):
+    def test_panel_can_score_without_filtering_candidate_pool(self):
         panel = scanner.InvestorPanel()
         survivor = {"ticker": "TEST"}
         data = {"TEST": _guard_ready_df(datetime(2026, 4, 29).date())}
@@ -384,6 +404,8 @@ class ScannerRegressionTests(unittest.TestCase):
     def test_high_live_event_risk_tightens_position_sizing(self):
         macro = scanner.MacroRegime()
         macro.regime_score = 80.0
+        macro.world.feed_status["market_news"] = "ok"
+        macro.world.feed_status["economic_calendar"] = "ok"
         macro.world.event_risk = 80.0
         self.assertLess(macro.position_sizing_scalar(), 1.20)
         macro.world.event_risk = 40.0
@@ -398,6 +420,194 @@ class ScannerRegressionTests(unittest.TestCase):
             ]
         )
         self.assertEqual(cleaned, ["TEST"])
+
+    def test_nasdaq_listing_parser_keeps_listed_equities_not_warrants(self):
+        nasdaq_text = "\n".join([
+            "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares",
+            "AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N",
+            "QQQ|Invesco QQQ Trust, Series 1|G|N|N|100|Y|N",
+            "AACBR|Artius II Acquisition Inc. - Rights|G|N|N|100|N|N",
+            "AACBU|Artius II Acquisition Inc. - Units|G|N|N|100|N|N",
+            "ZZZZ|Fake Test Company Test Symbol|G|Y|N|100|N|N",
+            "File Creation Time: 0817202618:01|||||||",
+            "",
+        ])
+        other_text = "\n".join([
+            "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol",
+            "IBM|International Business Machines Corporation Common Stock|N|IBM|N|100|N|IBM",
+            "ZXIET|IEX Test Company Test Symbol Three for IEX|V|ZXIET|N|100|Y|ZXIET",
+            "File Creation Time: 0817202618:01||||||",
+            "",
+        ])
+        nasdaq_rows = scanner.UniverseDiscovery._parse_nasdaq_listing_text(
+            nasdaq_text, "nasdaq"
+        )
+        other_rows = scanner.UniverseDiscovery._parse_nasdaq_listing_text(
+            other_text, "other"
+        )
+        cleaned = scanner.UniverseDiscovery._clean_listed_equities(
+            nasdaq_rows + other_rows
+        )
+        self.assertEqual(cleaned, ["AAPL", "IBM", "QQQ"])
+
+    def test_universe_falls_back_to_nasdaq_listings_when_massive_fails(self):
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        symbols = [
+            alphabet[i // 26] + alphabet[i % 26] + "Q"
+            for i in range(scanner.MIN_UNIVERSE_SIZE)
+        ]
+        nasdaq_body = [
+            "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares"
+        ]
+        nasdaq_body.extend(
+            f"{sym}|Example {sym} - Common Stock|Q|N|N|100|N|N"
+            for sym in symbols
+        )
+        nasdaq_body.append("File Creation Time: 0817202618:01|||||||")
+        nasdaq_text = "\n".join(nasdaq_body)
+        other_text = "\n".join([
+            "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol",
+            "File Creation Time: 0817202618:01||||||",
+        ])
+
+        def fake_get(url, **kwargs):
+            url = str(url)
+            if "massive.com" in url:
+                raise RuntimeError("massive down")
+            resp = Mock(status_code=200, text="")
+            resp.raise_for_status = Mock()
+            if "nasdaqlisted" in url:
+                resp.text = nasdaq_text
+            elif "otherlisted" in url:
+                resp.text = other_text
+            else:
+                self.fail(f"unexpected universe URL {url}")
+            return resp
+
+        discovery = scanner.UniverseDiscovery("massive-key")
+        with patch.object(discovery.session, "get", side_effect=fake_get):
+            with patch.object(scanner, "FINNHUB_API_KEY", ""):
+                tickers = discovery.discover()
+        self.assertEqual(len(tickers), scanner.MIN_UNIVERSE_SIZE)
+        self.assertIn(symbols[0], tickers)
+        self.assertIn(symbols[-1], tickers)
+
+    def test_fed_calendar_parser_keeps_fomc_not_speeches(self):
+        payload = {
+            "events": [
+                {
+                    "type": "FOMC",
+                    "title": "FOMC Minutes",
+                    "month": "2026-08",
+                    "days": "19",
+                    "time": "2:00 p.m.",
+                },
+                {
+                    "type": "Speeches",
+                    "title": "Discussion - Vice Chair",
+                    "month": "2026-08",
+                    "days": "18",
+                },
+                {
+                    "type": "Stat",
+                    "title": "G.17 - Industrial Production and Capacity Utilization",
+                    "month": "2026-08",
+                    "days": "18",
+                },
+                {
+                    "type": "Stat",
+                    "title": "H.6 - Money Stock Measures",
+                    "month": "2026-08",
+                    "days": "25",
+                },
+            ]
+        }
+        events = scanner.WorldContext._parse_fed_calendar_events(
+            payload,
+            start=date(2026, 8, 18),
+            end=date(2026, 8, 21),
+        )
+        titles = [row["event"] for row in events]
+        self.assertEqual(
+            titles,
+            [
+                "G.17 - Industrial Production and Capacity Utilization",
+                "FOMC Minutes",
+            ],
+        )
+        self.assertTrue(all(row["high_impact"] for row in events))
+        self.assertTrue(all(row["source"] == "FederalReserve" for row in events))
+
+    def test_economic_calendar_falls_back_to_fed_when_finnhub_forbidden(self):
+        finnhub = Mock(status_code=403, text="plan limit")
+        finnhub.json.return_value = {"error": "403"}
+        fed_payload = {
+            "events": [{
+                "type": "FOMC",
+                "title": "FOMC Meeting",
+                "month": "2026-08",
+                "days": "18-19",
+                "time": "2:00 p.m.",
+            }]
+        }
+        fed = Mock(status_code=200, text="")
+        fed.content = json.dumps(fed_payload).encode("utf-8")
+        session = Mock()
+        session.get.side_effect = (
+            lambda url, **kwargs: fed
+            if "federalreserve.gov" in url
+            else finnhub
+        )
+        ctx = scanner.WorldContext()
+        with patch.object(scanner, "today_et", return_value=date(2026, 8, 18)):
+            with patch.object(scanner, "FINNHUB_API_KEY", "finnhub-key"):
+                ctx._load_economic_calendar(session)
+        self.assertEqual(ctx.feed_status["economic_calendar"], "ok_fed")
+        self.assertEqual(len(ctx.economic_events), 1)
+        self.assertEqual(ctx.economic_events[0]["event"], "FOMC Meeting")
+        self.assertTrue(ctx.economic_events[0]["high_impact"])
+
+    def test_fed_only_economic_calendar_still_caps_position_sizing(self):
+        macro = scanner.MacroRegime()
+        macro.regime_score = 90.0
+        macro.world.event_risk = 10.0
+        macro.world.feed_status["market_news"] = "ok"
+        macro.world.feed_status["economic_calendar"] = "ok_fed"
+        self.assertEqual(macro.position_sizing_scalar(), 0.80)
+
+    def test_yfinance_earnings_date_lists_are_normalized_to_iso(self):
+        with patch.object(scanner, "today_et", return_value=date(2026, 8, 17)):
+            iso = scanner.normalize_earnings_date(
+                [date(2026, 9, 8), date(2026, 9, 10)]
+            )
+            from_index = scanner.normalize_earnings_date(
+                pd.DatetimeIndex(["2026-09-08", "2026-09-10"])
+            )
+        self.assertEqual(iso, "2026-09-08")
+        self.assertEqual(from_index, "2026-09-08")
+
+    def test_holding_window_earnings_from_date_list_blocks_buy(self):
+        with patch.object(scanner, "today_et", return_value=date(2026, 8, 17)):
+            earnings_iso = scanner.normalize_earnings_date(
+                [date(2026, 9, 8)]
+            )
+            days_to = (
+                pd.Timestamp(earnings_iso).date() - date(2026, 8, 17)
+            ).days
+        self.assertEqual(earnings_iso, "2026-09-08")
+        self.assertTrue(0 <= days_to <= scanner.EARNINGS_RISK_WINDOW_DAYS)
+        action = scanner.OutputFormatter.recommended_action(
+            {
+                "hard_buy_pass": True,
+                "panel_composite_score": 69.2,
+                "panel_consensus": 5,
+                "ml_ensemble_score": 0.28,
+                "trade_setup_score": 60.1,
+                "fundamentals_quality": "partial",
+                "flags": ["EARNINGS_IN_HOLDING_WINDOW"],
+            }
+        )
+        self.assertEqual(action, "WAIT: EARNINGS")
 
     def test_engine_has_no_preset_screener_or_spy_etf_fetch(self):
         source = inspect.getsource(scanner)
@@ -543,7 +753,7 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(normed["a"].iloc[99], expected, places=9)
         self.assertTrue(np.isfinite(normed.values).all())
 
-    def test_backfill_pool_rejects_broken_trend_and_late_rsi(self):
+    def test_near_miss_diagnostics_are_never_an_actionable_pool(self):
         data = {
             f"T{i}": _guard_ready_df(datetime(2026, 4, 29).date()) for i in range(4)
         }
@@ -577,37 +787,12 @@ class ScannerRegressionTests(unittest.TestCase):
         ]
 
         with patch.object(scanner.HardBuyRules, "near_misses", return_value=near_misses):
-            pool, _ = scanner.HardBuyRules.build_rank_pool(
+            pool, diagnostics = scanner.HardBuyRules.build_rank_pool(
                 data, [], target_size=7, max_pool_size=7
             )
 
-        tickers = [p["ticker"] for p in pool]
-        self.assertIn("T3", tickers)
-        # Failing the trend filter or the RSI sweet spot is not a timing miss,
-        # it is the "already ran / broken chart" entry the strategy refuses.
-        self.assertNotIn("T1", tickers)
-        self.assertNotIn("T2", tickers)
-
-    def test_backfill_pool_rejects_already_extended_move(self):
-        df = _guard_ready_df(datetime(2026, 4, 29).date())
-        nm = {
-            "ticker": "T0",
-            "rules_passed": 9,
-            "rules_failed": 1,
-            "passed_rules": [f"BUY_{j:02d}" for j in range(1, 10)],
-            "failed_rules": ["BUY_05:Crossover"],
-            "return_20d": 0.09, "volume_ratio": 1.6, "rsi_14": 55,
-        }
-        record = scanner.HardBuyRules._candidate_record(
-            "T0", df, rule_result=nm, hard_buy_pass=False
-        )
-
-        self.assertIsNone(scanner.HardBuyRules._backfill_block_reason(nm, record))
-
-        extended = dict(record, flags=list(record["flags"]) + ["EXTENDED_MOVE"])
-        reason = scanner.HardBuyRules._backfill_block_reason(nm, extended)
-        self.assertIsNotNone(reason)
-        self.assertIn("extended", reason)
+        self.assertEqual(pool, [])
+        self.assertEqual(diagnostics, near_misses)
 
     def test_ml_training_pool_is_not_conditioned_on_recent_performance(self):
         # A name whose 63-day return is negative is excluded by the execution
@@ -732,8 +917,9 @@ class ScannerRegressionTests(unittest.TestCase):
                     with patch.object(
                         ranker, "_train_lstm", side_effect=RuntimeError("torch blew up")
                     ):
-                        with patch.object(scanner.log, "error"):
-                            out = ranker.rank(survivors, {}, training_universe={})
+                        with patch.object(scanner, "ENABLE_EXPERIMENTAL_LSTM", True):
+                            with patch.object(scanner.log, "error"):
+                                out = ranker.rank(survivors, {}, training_universe={})
 
         self.assertEqual(len(out), 1)
         self.assertIsNone(out[0]["lstm_score"])
@@ -762,6 +948,7 @@ class ScannerRegressionTests(unittest.TestCase):
         n_days = 252  # MIN_TRADING_DAYS
         dates = pd.bdate_range(end=pd.Timestamp("2026-01-15"), periods=n_days)
         df_data = {
+            "Open": np.linspace(100.0, 120.0, n_days),
             "Close": np.linspace(100.0, 120.0, n_days),
             "Volume": np.full(n_days, 1_000_000),
             "RSI_14": np.full(n_days, 55.0),
@@ -785,9 +972,10 @@ class ScannerRegressionTests(unittest.TestCase):
                     with patch.object(scanner, "LSTM_AVAILABLE", True):
                         # Inject a failure inside the training code by patching torch.optim.Adam
                         with patch("torch.optim.Adam", side_effect=RuntimeError("Adam optimizer failed")):
-                            with patch.object(scanner.log, "error"):
-                                with patch.object(scanner.log, "warning"):
-                                    out = ranker.rank(survivors, all_data, training_universe={})
+                            with patch.object(scanner, "ENABLE_EXPERIMENTAL_LSTM", True):
+                                with patch.object(scanner.log, "error"):
+                                    with patch.object(scanner.log, "warning"):
+                                        out = ranker.rank(survivors, all_data, training_universe={})
 
         self.assertEqual(len(out), 1)
         self.assertIsNone(out[0]["lstm_score"])
@@ -826,6 +1014,368 @@ class ScannerRegressionTests(unittest.TestCase):
         # A 0.5 from a dead model is the absence of a signal, so it is flagged
         # rather than presented as a neutral read on the name.
         self.assertIn("ML_DEGRADED:XGBoost", out[0]["flags"])
+
+    def test_official_xnys_calendar_handles_new_year_and_half_day(self):
+        # New Year's Day 2022 fell on Saturday; XNYS remained open Friday
+        # 2021-12-31. A weekend-observation heuristic incorrectly closed it.
+        self.assertTrue(scanner.is_trading_day(date(2021, 12, 31)))
+
+        before_vendor_finalization = datetime(
+            2026, 11, 27, 14, 0, tzinfo=scanner.ET_TZ
+        )
+        after_vendor_finalization = datetime(
+            2026, 11, 27, 14, 31, tzinfo=scanner.ET_TZ
+        )
+        self.assertEqual(
+            scanner.expected_last_closed_trading_day(
+                before_vendor_finalization
+            ),
+            date(2026, 11, 25),
+        )
+        self.assertEqual(
+            scanner.expected_last_closed_trading_day(
+                after_vendor_finalization
+            ),
+            date(2026, 11, 27),
+        )
+
+    def test_yahoo_treasury_yields_are_not_unconditionally_divided_by_ten(self):
+        self.assertAlmostEqual(
+            scanner.MacroRegime._yield_percent(4.30), 4.30
+        )
+        self.assertAlmostEqual(
+            scanner.MacroRegime._yield_percent(43.0), 4.30
+        )
+        macro = scanner.MacroRegime()
+        macro.snapshot = {
+            "tnx": {"last": 4.30},
+            "irx": {"last": 4.05},
+        }
+        with patch.object(scanner.log, "info"):
+            macro._score_regime()
+        self.assertFalse(
+            any("INVERTED" in note for note in macro.notes)
+        )
+
+    def test_unfinalized_daily_bar_is_trimmed_even_before_market_open(self):
+        frame = pd.DataFrame(
+            {"Close": [100.0, 101.0], "Volume": [1_000, 100]},
+            index=pd.to_datetime(["2026-04-29", "2026-04-30"]),
+        )
+        now = datetime(2026, 4, 30, 8, 45, tzinfo=scanner.ET_TZ)
+
+        trimmed = scanner.trim_to_closed_sessions(frame, now=now)
+
+        self.assertEqual(list(trimmed.index.date), [date(2026, 4, 29)])
+
+    def test_breakout_and_volume_baselines_exclude_signal_bar(self):
+        idx = pd.bdate_range(end="2026-04-29", periods=40)
+        close = np.linspace(90.0, 100.0, len(idx))
+        close[-1] = 110.0
+        volume = np.full(len(idx), 100.0)
+        volume[-1] = 1_000.0
+        frame = pd.DataFrame(
+            {
+                "Open": close,
+                "High": close * 1.01,
+                "Low": close * 0.99,
+                "Close": close,
+                "Volume": volume,
+            },
+            index=idx,
+        )
+
+        out = scanner.TechnicalEngine.compute_all(frame)
+
+        self.assertAlmostEqual(out["Vol_SMA_20"].iloc[-1], 100.0)
+        self.assertAlmostEqual(out["Volume_Ratio"].iloc[-1], 10.0)
+        self.assertAlmostEqual(
+            out["High_Close_20"].iloc[-1], close[-21:-1].max()
+        )
+
+    def test_quick_screen_does_not_select_on_current_three_month_return(self):
+        fetcher = scanner.DataFetcher()
+        losing_but_liquid = {
+            "first_close": 100.0,
+            "last_close": 80.0,
+            "avg_volume_20d": 1_000_000.0,
+            "bars": 60,
+        }
+        with patch.object(
+            fetcher.yahoo, "quick_quote", return_value=losing_but_liquid
+        ):
+            result = fetcher._quick_screen(["TEST"])
+
+        self.assertEqual(result, ["TEST"])
+
+    def test_symbol_level_data_misses_do_not_trip_provider_circuit(self):
+        circuit = scanner.ProviderCircuit.get("provider-test", fail_limit=2)
+        for _ in range(10):
+            circuit.record_symbol_miss()
+
+        self.assertTrue(circuit.available())
+        self.assertEqual(circuit.symbol_misses, 10)
+
+    def test_training_panel_cap_preserves_calendar_span(self):
+        unique_dates = np.array(
+            pd.bdate_range("2025-01-02", periods=100),
+            dtype="datetime64[ns]",
+        )
+        dates = np.repeat(unique_dates, 1_000)
+        tickers = np.tile(
+            np.array([f"T{i:04d}" for i in range(1_000)], dtype=object),
+            len(unique_dates),
+        )
+        X = np.arange(len(dates), dtype=float).reshape(-1, 1)
+        y = (np.arange(len(dates)) % 3 == 0).astype(int)
+
+        X_cap, y_cap, dates_cap, tickers_cap = (
+            scanner.MLRanker._cap_training_panel(
+                X, y, dates, tickers, max_rows=10_000
+            )
+        )
+
+        self.assertEqual(len(X_cap), 10_000)
+        self.assertEqual(len(y_cap), 10_000)
+        self.assertEqual(len(tickers_cap), 10_000)
+        self.assertEqual(len(np.unique(dates_cap)), 100)
+        self.assertEqual(dates_cap.min(), unique_dates.min())
+        self.assertEqual(dates_cap.max(), unique_dates.max())
+
+    def test_walk_forward_splits_are_grouped_and_purged_by_session(self):
+        ranker = scanner.MLRanker()
+        unique_dates = np.array(
+            pd.bdate_range("2025-01-02", periods=120),
+            dtype="datetime64[ns]",
+        )
+        ranker.training_dates_ = np.repeat(unique_dates, 5)
+
+        splits = ranker._purged_walk_forward_splits(
+            len(ranker.training_dates_)
+        )
+
+        self.assertGreaterEqual(len(splits), 2)
+        for train_idx, val_idx in splits:
+            train_dates = ranker.training_dates_[train_idx]
+            val_dates = ranker.training_dates_[val_idx]
+            self.assertLess(train_dates.max(), val_dates.min())
+            train_pos = np.searchsorted(
+                unique_dates, train_dates.max(), side="left"
+            )
+            val_pos = np.searchsorted(
+                unique_dates, val_dates.min(), side="left"
+            )
+            self.assertGreaterEqual(
+                val_pos - train_pos - 1, scanner.HOLDING_HORIZON_DAYS
+            )
+
+    def test_ml_label_uses_next_session_open_not_unattainable_signal_close(self):
+        idx = pd.bdate_range("2025-01-02", periods=100)
+        frame = pd.DataFrame(index=idx)
+        for feature in scanner.MLRanker.FEATURE_COLS:
+            frame[feature] = 1.0
+        frame["Close"] = 100.0
+        frame["Open"] = 100.0
+        frame["Avg_Dollar_Vol_20"] = 10_000_000.0
+        signal_pos = 60
+        frame.iloc[
+            signal_pos + 1, frame.columns.get_loc("Open")
+        ] = 200.0
+        frame.iloc[
+            signal_pos + scanner.HOLDING_HORIZON_DAYS,
+            frame.columns.get_loc("Close"),
+        ] = 205.0
+        ranker = scanner.MLRanker()
+
+        _, labels, _, _ = ranker._build_dataset(
+            [{"ticker": "TEST"}],
+            {"TEST": frame},
+            {"TEST": frame},
+        )
+
+        label_idx = np.flatnonzero(
+            ranker.training_dates_ == np.datetime64(idx[signal_pos])
+        )
+        self.assertEqual(len(label_idx), 1)
+        self.assertEqual(labels[label_idx[0]], 0)
+
+    def test_recommendation_never_bypasses_hard_panel_or_event_gates(self):
+        base = {
+            "hard_buy_pass": True,
+            "panel_composite_score": 80,
+            "panel_consensus": 5,
+            "ml_ensemble_score": 0.8,
+            "trade_setup_score": 90,
+            "option_candidate": "Y",
+            "option_score": 90,
+            "fundamentals_quality": "complete",
+            "flags": [],
+        }
+        self.assertEqual(
+            scanner.OutputFormatter.recommended_action(
+                {**base, "hard_buy_pass": False}
+            ),
+            "WATCHLIST ONLY",
+        )
+        self.assertEqual(
+            scanner.OutputFormatter.recommended_action(
+                {**base, "flags": ["BINARY_EVENT_RISK"]}
+            ),
+            "WAIT: EVENT RISK",
+        )
+        self.assertEqual(
+            scanner.OutputFormatter.recommended_action(
+                {**base, "flags": ["EARNINGS_IN_HOLDING_WINDOW"]}
+            ),
+            "WAIT: EARNINGS",
+        )
+        self.assertEqual(
+            scanner.OutputFormatter.recommended_action(
+                {**base, "panel_consensus": 2}
+            ),
+            "WATCH",
+        )
+
+    def test_sell_monitor_enforces_recorded_or_fallback_hard_stop(self):
+        frame = pd.DataFrame(
+            {
+                "Close": [91.0],
+                "EMA_20": [95.0],
+                "EMA_10": [94.0],
+                "RSI_14": [50.0],
+            },
+            index=pd.to_datetime(["2026-04-29"]),
+        )
+
+        exits = scanner.SellMonitor.check_exits(
+            [{"ticker": "TEST", "entry_price": 100.0}],
+            {"TEST": frame},
+        )
+
+        self.assertEqual(len(exits), 1)
+        self.assertIn("SELL_00", exits[0]["reason"])
+
+    def test_earnings_inside_holding_window_blocks_long_call(self):
+        candidate = {
+            "ticker": "TEST",
+            "price": 100.0,
+            "ml_ensemble_score": 0.8,
+            "panel_composite_score": 80,
+            "return_20d": 0.08,
+            "rsi_14": 55,
+        }
+        expiry = (
+            scanner.today_et() + timedelta(days=35)
+        ).isoformat()
+        chain = [{
+            "expiry": expiry,
+            "strike": 100.0,
+            "bid": 4.9,
+            "ask": 5.1,
+            "mid": 5.0,
+            "oi": 1_000,
+            "volume": 100,
+            "iv": 0.35,
+            "delta": 0.55,
+            "theta": -0.02,
+            "break_even": 105.0,
+            "underlying_price": 100.0,
+        }]
+        fund = {
+            "earnings_date": (
+                scanner.today_et() + timedelta(days=10)
+            ).isoformat()
+        }
+        with patch.object(
+            scanner.OptionsEvaluator, "_fetch_chain_mboum",
+            return_value=chain,
+        ):
+            with patch.object(
+                scanner.OptionsEvaluator, "_fetch_chain_massive",
+                return_value=[],
+            ):
+                with patch.object(
+                    scanner.OptionsEvaluator, "_fetch_chain_yahoo",
+                    return_value=[],
+                ):
+                    with patch.object(
+                        scanner, "MBOUM_OPTIONS_KEY", "test-key"
+                    ):
+                        result = scanner.OptionsEvaluator._find_best_option(
+                            candidate, fund
+                        )
+
+        self.assertEqual(result["option_candidate"], "N")
+
+    def test_missing_context_feed_caps_position_sizing(self):
+        macro = scanner.MacroRegime()
+        macro.regime_score = 90.0
+        macro.world.event_risk = 10.0
+        macro.world.feed_status["market_news"] = "error"
+        macro.world.feed_status["economic_calendar"] = "error"
+
+        self.assertEqual(macro.position_sizing_scalar(), 0.80)
+
+    def test_zero_action_report_is_explicit_and_success_compatible(self):
+        near = [{
+            "near_miss_rank": 1,
+            "ticker": "TEST",
+            "price": 100.0,
+            "rules_passed": 9,
+            "rules_failed": 1,
+            "passed_rules": [
+                f"BUY_{i:02d}" for i in range(1, 11) if i != 9
+            ],
+            "failed_rules": ["BUY_09:Volume"],
+            "rsi_14": 55.0,
+            "macd_histogram": 0.1,
+            "volume_ratio": 1.1,
+            "return_20d": 0.08,
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(scanner, "OUTPUT_DIR", Path(tmp)):
+                scanner.OutputFormatter.save_near_misses(
+                    near, {"Stage 3": 0}
+                )
+                report_path = next(
+                    Path(tmp).glob("near_misses_*.json")
+                )
+                report = json.loads(report_path.read_text())
+
+        self.assertEqual(report["report_kind"], "no_action")
+        self.assertEqual(report["total_survivors"], 0)
+        self.assertIn("valid abstention", report["reason"])
+
+    def test_world_news_falls_back_to_massive_when_finnhub_plan_blocks(self):
+        finnhub = Mock(status_code=200, text="plan limit reached")
+        finnhub.json.return_value = {"error": "plan limit reached"}
+        massive = Mock(status_code=200, text="")
+        massive.json.return_value = {
+            "results": [{
+                "title": "Federal Reserve decision moves global markets",
+                "published_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+                "article_url": "https://example.test/article",
+                "publisher": {"name": "Test Wire"},
+            }]
+        }
+        session = Mock()
+        session.get.side_effect = (
+            lambda url, **kwargs: massive
+            if "massive.com" in url
+            else finnhub
+        )
+        ctx = scanner.WorldContext()
+
+        with patch.object(scanner, "FINNHUB_API_KEY", "finnhub-key"):
+            with patch.object(scanner, "MASSIVE_API_KEY", "massive-key"):
+                ctx._load_news(session)
+
+        self.assertEqual(ctx.feed_status["market_news"], "ok")
+        self.assertEqual(ctx.source, "Massive")
+        self.assertEqual(len(ctx.headlines), 1)
+        self.assertEqual(
+            ctx.headlines[0]["provider"], "Massive"
+        )
 
     def test_world_headlines_drop_vendor_related_tickers(self):
         ctx = scanner.WorldContext()
