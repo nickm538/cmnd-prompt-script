@@ -82,7 +82,7 @@ and at most 110 because the job timeout is 120 minutes. The scanner bounds
 queued work and emits diagnostics on interruption. Active requests still have
 finite provider timeouts, so this is not an instantaneous hard kill deadline.
 `LOG_LEVEL` accepts `INFO` or `DEBUG`. Live runtime depends on coverage, provider
-latency, rate limits, and entitlements; recent runs took around 11–15 minutes.
+latency, rate limits, and entitlements; recent audited runs took around 18–21 minutes.
 
 ## Scoring and action gates
 
