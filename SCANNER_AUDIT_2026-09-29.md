@@ -86,7 +86,7 @@ introduce another production application or a second scanner entry point.
 | Calibration | Calibration/evaluation overlap and changed final model configuration invalidated probability claims | Purged date-block separation, same OOF/final estimators, reliability and base-rate skill diagnostics |
 | Ensemble | Failed 0.5 placeholders diluted valid models; averaging calibrated outputs was mislabeled as calibrated | Exclude failed models; independently calibrate/evaluate the actual aligned raw active ensemble |
 | Equity scoring | Option availability and repeated hype/squeeze momentum rewarded correlated evidence | Separate contract quality; export equity components/weights; compare ML to its own target base rate |
-| Action labels | Strong scores could survive missing issuer calendar or unvalidated model context | Explicit WAIT/WATCH gates for unverified earnings, daily-reset funds and invalid/no-lift ML |
+| Action labels | Strong scores could survive missing issuer calendar or unvalidated model context | Explicit WAIT/WATCH gates for unverified earnings, daily-reset funds and invalid/no-lift ML; missing current features cannot inherit ensemble validation |
 | Options execution | Last prices, missing quote timing/deliverables, or stale underlying prices could look executable | Require bid/ask, timing/delay, synchronized underlying and standard deliverable; unknown metadata rejects; closed-session references WATCH |
 | Options horizon | Calendar-day expiry could precede the trading-session holding window | Expiry after 20 XNYS sessions plus buffer; ask-based breakeven and 100-share premium loss |
 | Exits | Horizon and peak-memory errors; missing data could produce a sale request | Trading-session horizon, retained peak reference and explicit review for absent data |
@@ -136,7 +136,7 @@ results inform engineering choices; none validates this exact scanner.
 
 ## Validation evidence
 
-- Local Python 3.12: **133 tests run: 132 passed, one optional Torch test skipped**. This includes 69 additional regression cases across data, signals, models and output, plus corrections to existing expectations.
+- Local Python 3.12: **134 tests run: 133 passed, one optional Torch test skipped**. This includes 70 additional regression cases across data, signals, models and output, plus corrections to existing expectations.
 - Compiled the scanner and summary script; `git diff --check` passed.
 - Offline cases cover provider circuits, class aliases, incomplete discovery, missing quick quotes, malformed bars, session labels, Wilder calculations, fundamental units, insider dates, date purges, missing labels, ensemble calibration/failures, option timing/deliverables, action vetoes, sizing, strict JSON and empty/repeated exports.
 - Full live GitHub Actions scan: **pending in this audit draft**. Its results will be recorded before delivery. The temporary branch-only validation workflow will be removed after verification.

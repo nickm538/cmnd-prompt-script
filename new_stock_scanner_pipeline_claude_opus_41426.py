@@ -4784,7 +4784,15 @@ class MLRanker:
                 s["ml_score_xgb"] = 0.5
                 s["ml_score_rf"] = 0.5
                 s["ml_ensemble_score"] = 0.5
-            self._assign_probability_context(s, self.ensemble_validation_metrics)
+            # Ensemble-level validation cannot validate a missing current row.
+            # Its 0.5 sentinel is an absence of features, not a model forecast.
+            self._assign_probability_context(
+                s, self.ensemble_validation_metrics if idx is not None else {}
+            )
+            if idx is None:
+                flags = s.setdefault("flags", [])
+                if "ML_CURRENT_FEATURES_UNAVAILABLE" not in flags:
+                    flags.append("ML_CURRENT_FEATURES_UNAVAILABLE")
             s["lstm_score"] = (
                 lstm_scores.get(s["ticker"]) if lstm_scores else None
             )
@@ -5067,6 +5075,22 @@ class MLRanker:
             1.0 - brier / baseline_brier if baseline_brier > 0 else 0.0
         )
         auc = float(roc_auc_score(eval_labels, calibrated_eval))
+        # Descriptive held-out reliability bins accompany proper scores.
+        # Correlated stocks and overlapping horizons prevent interpreting row
+        # counts as independent trials or bin gaps as confidence intervals.
+        bin_ids = np.minimum((calibrated_eval * 10).astype(int), 9)
+        reliability_bins = []
+        for bin_id in range(10):
+            in_bin = bin_ids == bin_id
+            if not in_bin.any():
+                continue
+            reliability_bins.append({
+                "lower": round(bin_id / 10.0, 1),
+                "upper": round((bin_id + 1) / 10.0, 1),
+                "samples": int(in_bin.sum()),
+                "mean_prediction": round(float(calibrated_eval[in_bin].mean()), 6),
+                "observed_frequency": round(float(eval_labels[in_bin].mean()), 6),
+            })
         metrics = {
             "validation_status": (
                 "passed" if auc >= 0.52 and brier_skill > 0.0 else "failed"
@@ -5096,6 +5120,8 @@ class MLRanker:
             "brier": round(brier, 6),
             "baseline_brier": round(baseline_brier, 6),
             "brier_skill": round(brier_skill, 6),
+            "reliability_bins": reliability_bins,
+            "reliability_bin_method": "10 equal-width held-out probability bins; descriptive, no independence or confidence-interval claim",
             "log_loss": round(
                 float(log_loss(eval_labels, calibrated_eval, labels=[0, 1])),
                 6,
@@ -9225,6 +9251,7 @@ def main():
             label = str(reason).split(":", 1)[0]
             guard_counts[label] = guard_counts.get(label, 0) + 1
         diagnostics["execution_guard_rejections"] = guard_counts
+        diagnostics["execution_guard_rejected_tickers"] = dict(guard_rejected)
         stage_counts["Stage 2: Passed Guards"] = len(guarded_data)
 
         if len(guarded_data) == 0:
@@ -9234,11 +9261,19 @@ def main():
         clock.check("Stage 3: Hard Buy Rules")
         strict_survivors, buy_rejected = HardBuyRules.apply(guarded_data)
         rule_counts: Dict[str, int] = {}
+        rule_rejections: Dict[str, List[str]] = {}
+        alternative_archetypes: Dict[str, List[str]] = {}
         for ticker, frame in guarded_data.items():
             rule_result = HardBuyRules._evaluate_all_rules(ticker, frame) or {}
+            if rule_result.get("failed_rules"):
+                rule_rejections[ticker] = list(rule_result["failed_rules"])
+            if rule_result.get("setup_archetypes"):
+                alternative_archetypes[ticker] = list(rule_result["setup_archetypes"])
             for failed in rule_result.get("failed_rules", []):
                 rule_counts[failed] = rule_counts.get(failed, 0) + 1
         diagnostics["hard_rule_failure_counts"] = rule_counts
+        diagnostics["hard_rule_rejected_tickers"] = rule_rejections
+        diagnostics["observed_setup_archetypes"] = alternative_archetypes
         diagnostics["hard_rule_failure_counts_overlap"] = True
         stage_counts["Stage 3: Strict Hard Buy Rules"] = len(strict_survivors)
 

@@ -49,6 +49,11 @@ class ModelIntegrityTests(unittest.TestCase):
         first_eval = np.searchsorted(unique, np.datetime64(metrics["evaluation_first_signal_date"]))
         self.assertGreaterEqual(first_eval - last_fit - 1, scanner.HOLDING_HORIZON_DAYS)
         self.assertEqual(metrics["evaluation_samples"], metrics["evaluation_sessions"] * 7)
+        bins = metrics["reliability_bins"]
+        self.assertEqual(sum(item["samples"] for item in bins), metrics["evaluation_samples"])
+        self.assertTrue(all(0 <= item["mean_prediction"] <= 1 for item in bins))
+        observed_positives = sum(item["samples"] * item["observed_frequency"] for item in bins)
+        self.assertAlmostEqual(observed_positives, metrics["evaluation_samples"] * 3 / 7, places=3)
         self.assertTrue(0 <= result[0] <= 1)
         self.assertFalse(metrics["realized_trade_profitability_validated"])
 
@@ -104,6 +109,24 @@ class ModelIntegrityTests(unittest.TestCase):
         self.assertGreater(useful_score, unavailable_score)
         self.assertEqual(unavailable["score_components"]["validated_ml_lift"], 13)
         self.assertAlmostEqual(sum(useful["score_components"].values()), useful_score, places=4)
+
+    def test_missing_current_features_cannot_inherit_ensemble_validity(self):
+        ranker = scanner.MLRanker()
+        def valid_rf(*_):
+            ranker.validation_metrics["RandomForest"] = {
+                "validation_status": "passed", "calibrated": True,
+                "reference_base_rate": .2,
+            }
+            return np.array([.8])
+        candidates = [{"ticker": "GOOD", "flags": []}, {"ticker": "MISSING", "flags": []}]
+        dataset = (np.zeros((300, 10)), np.arange(300) % 2, np.zeros((1, 10)), ["GOOD"])
+        with patch.object(ranker, "_build_dataset", return_value=dataset), patch.object(ranker, "_train_xgboost", side_effect=scanner._ModelDegradedError("unavailable")), patch.object(ranker, "_train_rf", side_effect=valid_rf), patch.object(scanner, "ENABLE_EXPERIMENTAL_LSTM", False):
+            result = ranker.rank(candidates, {})
+        self.assertTrue(result[0]["ml_probability_usable"])
+        self.assertFalse(result[1]["ml_probability_usable"])
+        self.assertFalse(result[1]["ml_probability_calibrated"])
+        self.assertIsNone(result[1]["ml_probability_lift"])
+        self.assertIn("ML_CURRENT_FEATURES_UNAVAILABLE", result[1]["flags"])
 
     def test_option_availability_and_unsupported_hype_cannot_reorder_equities(self):
         base = {"panel_composite_score": 75, "rules_passed": 10, "ml_probability_usable": False, "flags": []}
