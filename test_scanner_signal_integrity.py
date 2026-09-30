@@ -166,7 +166,7 @@ class SignalIntegrityTests(unittest.TestCase):
 
     def test_insider_epoch_dates_exclude_old_future_and_nonmarket_trades(self):
         today = date(2026, 9, 29)
-        epoch = int(datetime(2026, 9, 28).timestamp())
+        epoch = int(pd.Timestamp("2026-09-28", tz="UTC").timestamp())
         rows = [
             {"startDate": {"raw": epoch}, "transactionText": "Purchase", "shares": 100},
             {"transactionDate": "2026-09-27", "transactionCode": "S", "change": -50},
