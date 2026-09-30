@@ -35,7 +35,7 @@ Baseline commit: `2cebe915284dfbfcc9b68cffe02fdf6b07a0b3d3`.
 | Reported XGB / RF AUC | About 0.621 / 0.659; these are classification metrics, not realized trading returns |
 | News sample | Dominated by shareholder-lawyer solicitations; macro relevance was weak |
 | Context gaps | Finnhub unavailable and Fed-only calendar coverage did not verify BLS/BEA events |
-| Original offline checks | 64 tests passed with one optional Torch test skipped, despite untested runtime defects |
+| Original offline checks | 64 tests run: 63 passed and one optional Torch test skipped, despite untested runtime defects |
 
 The baseline and new live scan occur on different days and may use different
 providers. Changes in candidate counts or scores are not a controlled performance
@@ -143,8 +143,62 @@ results inform engineering choices; none validates this exact scanner.
 - Real installed XGBoost/Random Forest integration: both estimators fit seeded 1,200-row, 240-session synthetic panels. Random-label models must abstain under the stability gate; an engineered predictor exercises both active models and independent ensemble calibration. This verifies execution and gate behavior, not financial predictive power.
 - Compiled the scanner and summary script; `git diff --check` passed.
 - Offline cases cover provider circuits, class aliases, incomplete discovery, missing quick quotes, malformed bars, session labels, Wilder calculations, fundamental units, insider dates, date purges, missing labels, ensemble calibration/failures, option timing/deliverables, action vetoes, sizing, strict JSON and empty/repeated exports.
-- Full live GitHub Actions scan: **pending in this audit draft**. Its results will be recorded before delivery. The temporary branch-only validation workflow will be removed after verification.
+- [Final source live run](https://github.com/nickm538/cmnd-prompt-script/actions/runs/36737727550): **all steps passed**, including 143 regression tests, full CLI execution, strict report/coverage validation, live fundamentals/options compatibility and artifact upload. The CLI step took about **18.0 minutes**. Tested commit: `4d6adc99b3b318a40ffb229d6be7d990723fdeb1`.
+- [Provider-fix live run](https://github.com/nickm538/cmnd-prompt-script/actions/runs/36736126052): the full CLI and enrichment checks also passed, in about 20.4 minutes for the CLI. This run used `b1c8aa75c48ab7a018100728172765bcbcb8d212`, before the additional ML stability gate.
+- Final artifact `11110502830`: downloaded ZIP SHA-256 matches GitHub's digest `b1f224495835f95aad683e12759b00346f821e25b10fdf34f97c9d509109c385`. Independently reconciled strict JSON/CSV rows, coverage denominators and per-symbol rejection maps.
+- Final cleanup removes the temporary audit workflow and updates this document; scanner source and tests remain the exact live-tested blobs. Permanent regression CI remains. No temporary verification workflow is retained.
 - Railway: the connected tools cannot execute a standalone one-time script without deploying a service. No Railway resource was created or changed. GitHub Actions supplies the already-authorized ephemeral runtime and existing secrets.
+
+### September 30 live provider and selection evidence
+
+| Observation | Provider-fix run | Final source run |
+| --- | --- | --- |
+| Live listings discovered | 11,181 | 11,181 |
+| Quick quotes available | 11,031 | 10,749 |
+| Quote misses retained for full cascade | All 150 | All 432 |
+| Price / liquidity screening exclusions | 1,672 / 3,683 | 1,614 / 3,573 |
+| Retained full-history symbols attempted | All 5,826 | All 5,994 |
+| Current histories loaded | 5,308 | 5,426 |
+| Histories unavailable / coverage | 518 / 91.1088% | 568 / 90.5239% |
+| Preferred MBOUM histories | 5,258 | 5,374 |
+| Massive / TwelveData histories | 43 / 7 | 45 / 7 |
+| Histories recovered after quick-quote misses | 14 of 150 | 239 of 432 |
+| Technical calculations / failures | 5,308 / zero | 5,426 / zero |
+| Execution guards passed / rejected | 1,564 / 3,744 | 1,564 / 3,862 |
+| Strict survivors / non-actionable near misses | Zero / 25 | Zero / 25 |
+| Symbols with alternate setup diagnostics | 1,055 | 1,055 |
+
+Both runs accepted strict JSON, reconciled every coverage/rejection denominator,
+and matched the CSV's 25 ticker rows to JSON. Recovering a history does not mean
+that a security qualified as a common equity or a trade. Quote availability
+varied between runs; a quote miss remains eligible for the full cascade.
+
+Both live enrichment checks classified ASX/VEON fundamentals complete under the
+field policy via MBOUM/Massive, and XERS partial via MBOUM/Massive/yfinance.
+MBOUM parsed 10/4/2 option contracts respectively, but none had an auditable
+executable quote context. Massive returned no contracts in this sample.
+These schema checks used observed near misses without promoting them or
+overriding rules. Finnhub earnings/market-status credentials were absent;
+the economic calendar was Fed-only. These context gaps were disclosed.
+
+Rule failures overlap and are not independent evidence. The Bollinger/high
+condition failed for 1,483 of 1,564 guarded names (94.8%), fresh crossover for
+1,384 (88.5%), and volume for 1,278 (81.7%). ASX and VEON missed the fresh
+crossover; XERS missed the RSI rule. These are diagnostic examples, not
+recommendations. Complete exported rule/guard failures explain the zero-action
+outcome and show that this preserved strategy is narrower than all potentially
+profitable setups.
+
+Provider-adjusted-close, split-only and all-adjustment histories are identified
+separately. Provider mix and adjustment basis changed relative to earlier audit
+runs, so counts/signals are not a controlled test of strategy improvement.
+
+The first two audit workflows completed the CLI but failed a temporary validator
+that incorrectly demanded 100% history coverage. The corrected validator checks
+the existing 80% operational floor and complete attempted-symbol accounting;
+it does not hide missing histories or change the production floor.
+The subsequent enrichment check exposed the valid-`Month` false-quota bug,
+which now has regression cases and successful live provider evidence.
 
 ## Remaining limits and next validation requirements
 
