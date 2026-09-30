@@ -10,6 +10,35 @@ import new_stock_scanner_pipeline_claude_opus_41426 as scanner
 
 
 class ModelIntegrityTests(unittest.TestCase):
+    @unittest.skipUnless(scanner.XGB_AVAILABLE, "XGBoost integration dependency unavailable")
+    def test_real_estimators_reject_seeded_noise_and_validate_engineered_signal(self):
+        sessions = scanner.XNYS_CALENDAR.sessions_in_range("2025-06-02", "2026-08-31")[:240]
+        rng = np.random.default_rng(90210)
+        features = rng.normal(size=(len(sessions) * 5, len(scanner.MLRanker.FEATURE_COLS)))
+        current = rng.normal(size=(1, features.shape[1]))
+        current[0, 0] = 2.5
+        cases = [
+            ("noise", rng.binomial(1, .23, len(features))),
+            ("engineered_signal", (features[:, 0] > 1).astype(int)),
+        ]
+        for name, labels in cases:
+            with self.subTest(case=name):
+                ranker = scanner.MLRanker()
+                ranker.training_dates_ = np.repeat(sessions.to_numpy(dtype="datetime64[ns]"), 5)
+                ranker.training_tickers_ = np.tile(np.array(list("ABCDE"), dtype=object), len(sessions))
+                dataset = (features, labels, current, ["SYNTHETIC"])
+                with patch.object(ranker, "_build_dataset", return_value=dataset), patch.object(scanner, "ENABLE_EXPERIMENTAL_LSTM", False):
+                    candidate = ranker.rank([{"ticker": "SYNTHETIC", "flags": []}], {})[0]
+                self.assertTrue(np.isfinite(candidate["ml_ensemble_score"]))
+                if name == "noise":
+                    self.assertEqual(ranker.active_models, [])
+                    self.assertFalse(candidate["ml_probability_usable"])
+                else:
+                    self.assertEqual(ranker.active_models, ["XGBoost", "RandomForest"])
+                    self.assertTrue(candidate["ml_probability_usable"])
+                    self.assertTrue(ranker.probabilities_calibrated)
+                    self.assertFalse(ranker.ensemble_validation_metrics["realized_trade_profitability_validated"])
+
     def test_missing_bars_do_not_extend_horizon_or_invent_next_open(self):
         sessions = scanner.XNYS_CALENDAR.sessions_in_range("2026-01-02", "2026-05-29")[:60]
         frame = pd.DataFrame({"Open": 100., "Close": 100.}, index=sessions)
@@ -36,8 +65,8 @@ class ModelIntegrityTests(unittest.TestCase):
 
     def test_calibration_requires_dates_and_purges_whole_sessions(self):
         ranker = scanner.MLRanker()
-        dates = np.repeat(np.array(pd.bdate_range("2025-01-02", periods=120), dtype="datetime64[ns]"), 7)
-        labels = np.tile([0, 1, 0, 1, 0, 1, 0], 120)
+        dates = np.repeat(np.array(pd.bdate_range("2025-01-02", periods=160), dtype="datetime64[ns]"), 7)
+        labels = np.tile([0, 1, 0, 1, 0, 1, 0], 160)
         probabilities = np.where(labels, 0.8, 0.2)
         ranker._calibrate_probabilities("MissingDates", [probabilities], [labels], np.array([0.7]))
         self.assertEqual(ranker.validation_metrics["MissingDates"]["validation_status"], "unavailable")
@@ -56,6 +85,38 @@ class ModelIntegrityTests(unittest.TestCase):
         self.assertAlmostEqual(observed_positives, metrics["evaluation_samples"] * 3 / 7, places=3)
         self.assertTrue(0 <= result[0] <= 1)
         self.assertFalse(metrics["realized_trade_profitability_validated"])
+
+    def test_positive_point_skill_is_insufficient_when_date_blocks_are_fragile(self):
+        dates = np.repeat(np.array(pd.bdate_range("2025-01-02", periods=80), dtype="datetime64[ns]"), 2)
+        labels = np.tile([0, 1], 80)
+        predictions = np.where(labels, .9, .1)
+        predictions[-40:] = 1 - predictions[-40:]
+        point_skill = 1 - np.mean((labels - predictions) ** 2) / .25
+        self.assertGreater(point_skill, 0)
+        result = scanner.MLRanker._date_block_brier_skill(labels, predictions, dates, .5)
+        self.assertTrue(result["available"])
+        self.assertLess(result["lower"], 0)
+
+    def test_date_block_uncertainty_does_not_gain_confidence_from_duplicate_stocks(self):
+        dates = np.repeat(np.array(pd.bdate_range("2025-01-02", periods=80), dtype="datetime64[ns]"), 2)
+        labels = np.tile([0, 1], 80)
+        predictions = np.where(labels, .9, .1)
+        predictions[-40:] = 1 - predictions[-40:]
+        original = scanner.MLRanker._date_block_brier_skill(labels, predictions, dates, .5)
+        duplicated = scanner.MLRanker._date_block_brier_skill(
+            np.repeat(labels, 25), np.repeat(predictions, 25), np.repeat(dates, 25), .5
+        )
+        self.assertEqual(original["lower"], duplicated["lower"])
+        self.assertEqual(original["upper"], duplicated["upper"])
+        strong = scanner.MLRanker._date_block_brier_skill(labels, labels.astype(float), dates, .5)
+        self.assertEqual(strong["lower"], 1)
+
+    def test_many_cross_sectional_rows_cannot_substitute_for_session_blocks(self):
+        dates = np.repeat(np.array(pd.bdate_range("2025-01-02", periods=30), dtype="datetime64[ns]"), 100)
+        labels = np.arange(len(dates)) % 2
+        result = scanner.MLRanker._date_block_brier_skill(labels, labels.astype(float), dates, .5)
+        self.assertFalse(result["available"])
+        self.assertIsNone(result["lower"])
 
     def test_many_rows_do_not_substitute_for_calibration_history(self):
         ranker = scanner.MLRanker()

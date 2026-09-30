@@ -124,6 +124,12 @@ Calibration and evaluation use separate date blocks with their own purge.
 Evaluation includes base rates, Brier skill, AUC, log loss, and reliability bins.
 The final estimator configuration matches its out-of-fold configuration.
 
+Model skill also requires a positive lower 95% percentile bound from 400
+resamples of whole-session loss totals in circular 20-session blocks. At least
+40 held-out sessions are required. This is an approximate stability filter;
+longer dependence, regime changes and selection effects remain unvalidated.
+It does not establish the actual trade policy's net returns.
+
 Failed/unskilled models cannot dilute a usable model through a neutral 0.5
 placeholder. The actual active raw ensemble is independently calibrated and
 evaluated before its probabilities authorize actions. Candidate

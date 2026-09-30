@@ -5030,6 +5030,74 @@ class MLRanker:
         # row-based fallback is safe.
         return []
 
+    @staticmethod
+    def _date_block_brier_skill(
+        labels: np.ndarray,
+        probabilities: np.ndarray,
+        dates: np.ndarray,
+        baseline_rate: float,
+    ) -> Dict[str, Any]:
+        """Resample whole-session loss totals in circular horizon-size blocks.
+
+        Keeping every stock on a date together avoids treating correlated
+        securities as independent trials. Consecutive blocks retain local
+        dependence from overlapping forward outcomes. The percentile range is
+        an approximate stability filter, not a market-regime or profit proof.
+        """
+        labels = np.asarray(labels, dtype=float)
+        probabilities = np.asarray(probabilities, dtype=float)
+        dates = np.asarray(dates, dtype="datetime64[ns]")
+        sessions, session_index = np.unique(dates, return_inverse=True)
+        block = HOLDING_HORIZON_DAYS
+        result: Dict[str, Any] = {
+            "method": "circular date-block percentile bootstrap of Brier skill",
+            "block_sessions": block,
+            "evaluation_sessions": int(len(sessions)),
+            "resamples": 400,
+            "interval_level": 0.95,
+            "lower": None,
+            "upper": None,
+            "available": False,
+            "limitation": "approximate stationary-block filter; longer dependence, model selection, regime shifts and realized returns remain unvalidated",
+        }
+        if (
+            labels.ndim != 1 or probabilities.ndim != 1 or dates.ndim != 1
+            or len(labels) != len(probabilities) or len(labels) != len(dates)
+            or len(sessions) < 2 * block
+            or not np.isfinite(labels).all() or not np.isfinite(probabilities).all()
+            or np.isnat(dates).any() or not np.isfinite(baseline_rate)
+            or not 0 <= baseline_rate <= 1
+        ):
+            result["reason"] = "requires aligned finite observations and at least two horizon-size session blocks"
+            return result
+        model_totals = np.bincount(
+            session_index, weights=(labels - probabilities) ** 2,
+            minlength=len(sessions),
+        )
+        baseline_totals = np.bincount(
+            session_index, weights=(labels - baseline_rate) ** 2,
+            minlength=len(sessions),
+        )
+        rng = np.random.default_rng(42)
+        blocks_per_sample = math.ceil(len(sessions) / block)
+        starts = rng.integers(0, len(sessions), size=(400, blocks_per_sample))
+        indices = (starts[..., None] + np.arange(block)) % len(sessions)
+        indices = indices.reshape(400, -1)[:, :len(sessions)]
+        baseline_losses = baseline_totals[indices].sum(axis=1)
+        valid = baseline_losses > 0
+        if valid.sum() < 380:
+            result["reason"] = "too many zero-loss baseline resamples"
+            return result
+        skills = 1.0 - model_totals[indices].sum(axis=1)[valid] / baseline_losses[valid]
+        lower, upper = np.quantile(skills, [0.025, 0.975])
+        result.update({
+            "available": True,
+            "lower": round(float(lower), 6),
+            "upper": round(float(upper), 6),
+            "valid_resamples": int(valid.sum()),
+        })
+        return result
+
     def _calibrate_probabilities(
         self,
         label: str,
@@ -5110,6 +5178,9 @@ class MLRanker:
             1.0 - brier / baseline_brier if baseline_brier > 0 else 0.0
         )
         auc = float(roc_auc_score(eval_labels, calibrated_eval))
+        uncertainty = self._date_block_brier_skill(
+            eval_labels, calibrated_eval, dates[eval_mask], base_rate
+        )
         # Descriptive held-out reliability bins accompany proper scores.
         # Correlated stocks and overlapping horizons prevent interpreting row
         # counts as independent trials or bin gaps as confidence intervals.
@@ -5128,7 +5199,10 @@ class MLRanker:
             })
         metrics = {
             "validation_status": (
-                "passed" if auc >= 0.52 and brier_skill > 0.0 else "failed"
+                "passed" if (
+                    auc >= 0.52 and brier_skill > 0.0
+                    and uncertainty["available"] and uncertainty["lower"] > 0
+                ) else "failed"
             ),
             "calibrated": True,
             "oof_samples": int(len(probs)),
@@ -5155,6 +5229,8 @@ class MLRanker:
             "brier": round(brier, 6),
             "baseline_brier": round(baseline_brier, 6),
             "brier_skill": round(brier_skill, 6),
+            "brier_skill_uncertainty": uncertainty,
+            "skill_gate": "AUC >=0.52 and positive Brier skill with a positive lower 95% date-block percentile bound",
             "reliability_bins": reliability_bins,
             "reliability_bin_method": "10 equal-width held-out probability bins; descriptive, no independence or confidence-interval claim",
             "log_loss": round(
