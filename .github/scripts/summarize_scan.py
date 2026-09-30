@@ -82,6 +82,28 @@ def _render(report: Dict[str, Any]) -> List[str]:
         )
         lines.append(f"- Context coverage degraded: {_text(degraded)}")
 
+    diagnostics = report.get("scan_diagnostics") or {}
+    coverage = diagnostics.get("data_coverage") or {}
+    quick = coverage.get("quick_screen") or {}
+    history = coverage.get("full_history") or {}
+    if history:
+        lines.append(
+            "- History coverage: {loaded}/{requested}; unavailable: {unavailable}.".format(
+                loaded=_cell(history.get("loaded")),
+                requested=_cell(history.get("requested")),
+                unavailable=_cell(history.get("unavailable")),
+            )
+        )
+    if quick:
+        lines.append(
+            "- Screening exclusions: price {price}; liquidity {liquidity}; "
+            "unverified quotes retained for fallback {retained}.".format(
+                price=_cell(quick.get("excluded_price")),
+                liquidity=_cell(quick.get("excluded_liquidity")),
+                retained=_cell(quick.get("retained_unverified")),
+            )
+        )
+
     lines.append("")
 
     rows = report.get("top_25") or []
@@ -146,6 +168,12 @@ def _render(report: Dict[str, Any]) -> List[str]:
         "_Setup is a heuristic quality score, not a win probability. "
         "Exh = exhaustion (lower is better; "
         "high readings mean the move is already extended)._"
+    )
+    lines.append(
+        "_ML estimates the 20-session greater-than-5% terminal-return event, "
+        "not the probability of any profit or of an option making money. "
+        "The panel contains coded style heuristics. Targets and sizes are "
+        "standalone plans at the signal close; refresh them at entry._"
     )
     return lines
 

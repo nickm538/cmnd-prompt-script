@@ -29,6 +29,7 @@ import json
 import html
 import logging
 import math
+import re
 import warnings
 import traceback
 import threading
@@ -36,7 +37,9 @@ from collections import Counter
 from datetime import datetime, date, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED,
+)
 from pathlib import Path
 
 import numpy as np
@@ -83,34 +86,26 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ENGINE_NAME = "Live Equity Scanner Engine"
-ENGINE_VERSION = "6.0.1"
+ENGINE_VERSION = "6.1.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION -- API credentials prefer the environment, then committed
-# fallbacks so GitHub Actions can run when a secret is unset. A non-empty
-# env var / repository secret always wins.
+# CONFIGURATION -- API credentials exist only in the runtime environment.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _env_or_default(name: str, default: str = "") -> str:
-    """Use a live env/secret when present; otherwise the committed fallback."""
+    """Read a nonempty runtime value, with an optional non-secret default."""
     value = os.environ.get(name, "").strip()
     return value if value else default
 
 
-# Committed fallback keys, in one table so credential reporting can tell a live
-# secret apart from a fallback. MBOUM (both tiers) and AlphaVantage have no
-# fallback on purpose -- MBOUM is the credit-metered primary, and running it on
-# a shared committed key would burn the plan the whole cascade depends on.
-EMBEDDED_FALLBACK_KEYS: Dict[str, str] = {
-    "MASSIVE_API_KEY": "yGJVMwH5maQwB5mTKqvEpiJpsz5t7g4H",
-    "FINNHUB_API_KEY": "d55b3ohr01qljfdeghm0d55b3ohr01qljfdeghmg",
-    "TWELVEDATA_API_KEY": "5e7a5daaf41d46a8966963106ebef210",
-}
+# This public repository never contains working credentials. Keep the empty
+# table as a compatibility alias for existing callers; all keys are env-only.
+EMBEDDED_FALLBACK_KEYS: Dict[str, str] = {}
 
 
 def _resolve_api_key(name: str) -> str:
-    """Live env/secret first, then the committed fallback for that key."""
-    return _env_or_default(name, EMBEDDED_FALLBACK_KEYS.get(name, ""))
+    """Resolve credentials exclusively from runtime environment/Actions secrets."""
+    return _env_or_default(name)
 
 
 MASSIVE_API_KEY = _resolve_api_key("MASSIVE_API_KEY")
@@ -131,8 +126,9 @@ FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 # Finnhub. MBOUM remains the primary OHLCV / fundamentals / options source
 # when credits remain; an exhausted MBOUM plan falls through Massive ->
 # TwelveData -> Finnhub -> Yahoo/yfinance without fabricating data.
-REQUIRED_API_KEYS = ("MASSIVE_API_KEY",)
+REQUIRED_API_KEYS = ()
 OPTIONAL_API_KEYS = (
+    "MASSIVE_API_KEY",
     "MBOUM_API_KEY",
     "MBOUM_OPTIONS_KEY",
     "TWELVEDATA_API_KEY",
@@ -153,7 +149,8 @@ OUTPUT_DIR = Path("scan_results")
 TARGET_FINAL_CANDIDATES = 7
 MAX_PANEL_CANDIDATES = 60
 MAX_OPTIONS_EVAL_CANDIDATES = 20
-MIN_QUICK_QUOTE_COVERAGE = 0.50
+MIN_QUICK_QUOTE_COVERAGE = 0.50  # diagnostic only; misses continue downstream
+MIN_FULL_HISTORY_COVERAGE = 0.80
 
 # Recommendations are per-name research outputs, not a portfolio optimizer.
 # Cap notional exposure so a very tight technical stop cannot produce more
@@ -173,6 +170,8 @@ ENABLE_EXPERIMENTAL_LSTM = os.getenv(
 _PIPELINE_BUDGET_RAW = os.environ.get("SCAN_BUDGET_MINUTES", "100")
 try:
     PIPELINE_BUDGET_MINUTES = float(_PIPELINE_BUDGET_RAW)
+    if not math.isfinite(PIPELINE_BUDGET_MINUTES) or PIPELINE_BUDGET_MINUTES <= 0:
+        raise ValueError("scan budget must be finite and positive")
 except ValueError:
     PIPELINE_BUDGET_MINUTES = 100.0
 
@@ -219,6 +218,34 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("pipeline")
+
+
+def redact_sensitive_text(value: Any) -> str:
+    """Remove configured key values before provider errors reach artifacts."""
+    text = str(value)
+    for credential in (
+        MASSIVE_API_KEY, ALPHAVANTAGE_API_KEY, MBOUM_API_KEY,
+        MBOUM_OPTIONS_KEY, FINNHUB_API_KEY, TWELVEDATA_API_KEY,
+    ):
+        if credential:
+            text = text.replace(credential, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(\b(?:api_?key|token|authorization)(?:=|%3D|:\s*))[^\s&#\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    return text
+
+
+class _RedactSecretsFilter(logging.Filter):
+    def filter(self, record):
+        record.msg = redact_sensitive_text(record.getMessage())
+        record.args = ()
+        return True
+
+
+for _log_handler in logging.getLogger().handlers:
+    _log_handler.addFilter(_RedactSecretsFilter())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -559,15 +586,28 @@ def _coerce_earnings_dates(value: Any) -> List[date]:
         return [ts.date()]
     except Exception:
         return []
-    """Division with zero/nan protection."""
-    if is_missing_value(b):
+
+
+def safe_div(a, b, default=np.nan):
+    """Division with missing, zero, nonnumeric and nonfinite protection."""
+    if is_missing_value(a) or is_missing_value(b):
         return default
     try:
         if b == 0:
             return default
-        return a / b
-    except Exception:
+        result = a / b
+        return result if np.isfinite(result) else default
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError):
         return default
+
+
+def provider_symbol(ticker: str, provider: str) -> str:
+    """Translate typed common-share class symbols without changing record keys."""
+    if provider.lower() in {"yahoo", "yfinance"} and re.fullmatch(
+        r"[A-Z]{1,5}\.[AB]", ticker
+    ):
+        return ticker.replace(".", "-")
+    return ticker
 
 
 def clamp(val, lo, hi):
@@ -586,70 +626,35 @@ class PipelineBudgetExceeded(PipelineError):
 
 
 def _credential_status(name: str) -> str:
-    """
-    Where this run's key comes from: a live env/Actions secret ("env"), the
-    committed fallback ("embedded"), or nowhere ("absent").
-
-    Resolved from the environment and EMBEDDED_FALLBACK_KEYS on every call --
-    never from the module constants above. Those freeze whatever environment
-    the process started in, so on Actions (where every secret is exported for
-    the job) they would report a live secret as "embedded" and claim a
-    committed fallback exists for keys that have none, such as MBOUM.
-    """
-    if os.environ.get(name, "").strip():
-        return "env"
-    return "embedded" if EMBEDDED_FALLBACK_KEYS.get(name, "") else "absent"
+    """Report runtime credential presence only; never include secret values."""
+    return "env" if os.environ.get(name, "").strip() else "absent"
 
 
 def verify_api_credentials() -> Dict[str, str]:
-    """
-    Confirm every required API credential is available from the environment
-    or from the committed fallback keys.
-    """
-    status = {name: _credential_status(name) for name in REQUIRED_API_KEYS}
-    missing = [name for name, state in status.items() if state == "absent"]
-    if missing:
-        raise PipelineError(
-            "Missing required API credentials: "
-            f"{', '.join(missing)}. Set them as environment variables locally, "
-            "or as repository secrets for the GitHub Actions workflow."
-        )
-
-    for name in OPTIONAL_API_KEYS:
-        status[name] = _credential_status(name)
-
-    if status.get("MBOUM_API_KEY") != "absent":
+    """Keys are optional: official listings and Yahoo are public fallbacks."""
+    status = {
+        name: _credential_status(name)
+        for name in (*REQUIRED_API_KEYS, *OPTIONAL_API_KEYS)
+    }
+    absent = [name for name, state in status.items() if state == "absent"]
+    if absent:
+        log.info("API credentials absent (providers skipped): %s", ", ".join(absent))
+    if status.get("MBOUM_API_KEY") == "env":
         log.info(
-            "MBOUM Pro is the primary OHLCV/fundamentals source. "
-            "If credits are exhausted mid-run, the engine falls back to "
-            "Massive -> TwelveData -> Finnhub -> Yahoo/yfinance without "
-            "fabricating bars."
+            "MBOUM is the primary OHLCV/fundamentals source; exhausted or "
+            "unavailable providers fall through the live cascade."
         )
     else:
         log.warning(
-            "MBOUM_API_KEY is not set -- OHLCV/fundamentals will use "
-            "Massive -> TwelveData -> Finnhub -> Yahoo/yfinance. "
-            "MBOUM remains the primary source on the next run if the key "
-            "is restored with available credits."
+            "MBOUM_API_KEY absent; OHLCV uses configured Massive/TwelveData/"
+            "Finnhub providers, then Yahoo/yfinance."
         )
     if status.get("MBOUM_OPTIONS_KEY") == "absent":
+        log.info("MBOUM options skipped; live quotes fall back to Massive/Yahoo.")
+    if all(state == "absent" for state in status.values()):
         log.warning(
-            "MBOUM_OPTIONS_KEY is not set -- options chains will fall back "
-            "to Massive/Yahoo."
-        )
-    if status.get("TWELVEDATA_API_KEY") == "absent":
-        log.info("TWELVEDATA_API_KEY is not set; TwelveData is skipped in the fallback chain.")
-    elif status.get("TWELVEDATA_API_KEY") == "embedded":
-        log.info(
-            "TwelveData will use the committed fallback key "
-            "(env/Actions secrets still win when set)."
-        )
-    if status.get("FINNHUB_API_KEY") == "absent":
-        log.info("FINNHUB_API_KEY is not set; Finnhub is skipped in the fallback chain.")
-    elif status.get("FINNHUB_API_KEY") == "embedded":
-        log.info(
-            "Finnhub will use the committed fallback key "
-            "(env/Actions secrets still win when set)."
+            "No API keys configured: official listings and public Yahoo remain "
+            "available, with reduced fundamentals/news/options coverage."
         )
     return status
 
@@ -816,12 +821,20 @@ def _normalize_ohlcv_frame(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     out.index = pd.to_datetime(out.index)
     if getattr(out.index, "tz", None) is not None:
         out.index = out.index.tz_convert(ET_TZ).tz_localize(None)
+    out.index = out.index.normalize()
     out = out.sort_index()
     out = out[~out.index.duplicated(keep="last")]
     for col in required:
         out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.dropna(subset=["Close"])
-    out = out[out["Volume"] > 0]
+    out = out.replace([np.inf, -np.inf], np.nan).dropna(subset=list(required))
+    prices = out.loc[:, ["Open", "High", "Low", "Close"]]
+    valid = (
+        (prices > 0).all(axis=1)
+        & (out["Volume"] > 0)
+        & (out["High"] + out["High"].abs() * 1e-9 >= out[["Open", "Close", "Low"]].max(axis=1))
+        & (out["Low"] - out["Low"].abs() * 1e-9 <= out[["Open", "Close", "High"]].min(axis=1))
+    )
+    out = out.loc[valid]
     return out if len(out) > 0 else None
 
 
@@ -842,12 +855,14 @@ class PipelineClock:
     """
 
     def __init__(self, budget_minutes: float = PIPELINE_BUDGET_MINUTES):
-        self.start = time.time()
+        self.start = time.monotonic()
+        if not math.isfinite(float(budget_minutes)) or float(budget_minutes) <= 0:
+            raise ValueError("scan budget must be finite and positive")
         self.budget_seconds = max(float(budget_minutes), 1.0) * 60.0
 
     @property
     def elapsed(self) -> float:
-        return time.time() - self.start
+        return time.monotonic() - self.start
 
     @property
     def remaining(self) -> float:
@@ -883,6 +898,11 @@ class WorldContext:
     EARNINGS_WINDOW_DAYS = 5
     ECONOMIC_WINDOW_DAYS = 3
     MAX_HEADLINES = 12
+    MACRO_NEWS_TERMS = (
+        "wall street", "stock market", "equity market", "treasury",
+        "central bank", "s&p 500", "nasdaq", "economic", " gdp",
+        "unemployment", "consumer price", "bond market",
+    )
     # Classifiers for live headline text. These are event types, never
     # company names or a watchlist -- they only score today's tape.
     RISK_TERMS = (
@@ -925,6 +945,7 @@ class WorldContext:
         self.economic_events: List[Dict[str, Any]] = []
         self.market_status: Dict[str, Any] = {}
         self.source: str = ""
+        self.news_filter_diagnostics: Dict[str, int] = {}
         self.feed_status: Dict[str, str] = {
             "market_news": "not_loaded",
             "earnings_calendar": "not_loaded",
@@ -1075,15 +1096,48 @@ class WorldContext:
             )
             if key and key not in deduplicated:
                 deduplicated[key] = row
+        factual = [
+            row for row in deduplicated.values()
+            if not self._is_promotional_solicitation(row.get("headline") or "")
+        ]
         ordered = sorted(
-            deduplicated.values(),
-            key=lambda row: row.get("datetime") or "",
+            factual,
+            key=lambda row: (
+                any(term in str(row.get("headline") or "").lower()
+                    for term in (*self.RISK_TERMS, *self.MACRO_NEWS_TERMS)),
+                row.get("datetime") or "",
+            ),
             reverse=True,
         )
         self.headlines = ordered[:self.MAX_HEADLINES]
+        self.news_filter_diagnostics = {
+            "fetched_in_window": len(rows),
+            "deduplicated": len(deduplicated),
+            "solicitations_removed": len(deduplicated) - len(factual),
+            "displayed": len(self.headlines),
+        }
         self.source = "+".join(sorted(providers))
         self.feed_status["market_news"] = (
             "ok" if successful_feed else "unavailable"
+        )
+
+    @staticmethod
+    def _is_promotional_solicitation(headline: str) -> bool:
+        """Filter law-firm advertising from the macro overlay only.
+
+        Actual company lawsuit/investigation headlines remain available in
+        company-specific news and catalyst annotations.
+        """
+        text = " ".join(str(headline).lower().split())
+        return bool(
+            re.search(r"\b(?:shareholder|investor) alert\b", text)
+            or "law offices" in text
+            or ("class action" in text and any(
+                word in text for word in ("deadline", "reminds", "contact", "invites", "join")
+            ))
+            or ("law firm" in text and any(
+                word in text for word in ("reminds", "invites", "contact", "alerts")
+            ))
         )
 
     def _load_earnings(self, session) -> None:
@@ -1109,7 +1163,7 @@ class WorldContext:
             if payload.get("error"):
                 self.feed_status["earnings_calendar"] = "provider_error"
                 return
-            rows = payload.get("earningsCalendar") or []
+            rows = payload.get("earningsCalendar")
             if not isinstance(rows, list):
                 self.feed_status["earnings_calendar"] = "invalid_payload"
                 return
@@ -1121,7 +1175,7 @@ class WorldContext:
                     continue
                 sym = str(row.get("symbol") or "").upper()
                 day = str(row.get("date") or "")
-                if not sym or not day or not sym.isalpha() or len(sym) > 5:
+                if not day or not re.fullmatch(r"[A-Z]{1,5}(?:\.[AB])?", sym):
                     continue
                 soon.setdefault(sym, day)
                 events.setdefault(
@@ -1188,7 +1242,7 @@ class WorldContext:
             if payload.get("error"):
                 self.feed_status["economic_calendar"] = "provider_error"
                 return False
-            rows = payload.get("economicCalendar") or []
+            rows = payload.get("economicCalendar")
             if not isinstance(rows, list):
                 self.feed_status["economic_calendar"] = "invalid_payload"
                 return False
@@ -1368,7 +1422,7 @@ class WorldContext:
                 self.feed_status["market_status"] = f"http_{resp.status_code}"
                 return
             payload = resp.json()
-            if isinstance(payload, dict):
+            if isinstance(payload, dict) and isinstance(payload.get("isOpen"), bool):
                 self.feed_status["market_status"] = "ok"
                 self.market_status = {
                     "exchange": payload.get("exchange"),
@@ -1601,6 +1655,9 @@ class WorldContext:
             "notes": list(self.event_notes),
             "market_status": dict(self.market_status),
             "headlines": list(self.headlines),
+            "news_scope": "limited vendor headlines; not comprehensive macro coverage",
+            "news_is_comprehensive": False,
+            "news_filter_diagnostics": dict(self.news_filter_diagnostics),
             "economic_events": list(self.economic_events),
             "earnings_window_days": self.EARNINGS_WINDOW_DAYS,
             "earnings_names_in_window": len(self.earnings_soon),
@@ -2035,6 +2092,7 @@ class UniverseDiscovery:
         "A": "XASE",
         "P": "ARCX",
         "Z": "BATS",
+        "V": "IEXG",
     }
     SKIP_NAME_FRAGMENTS = (
         " - warrant",
@@ -2044,7 +2102,8 @@ class UniverseDiscovery:
         " - unit",
         " warrant",
         " rights",
-        " preferred",
+        " preferred stock",
+        " preferred share",
         " test symbol",
         " test company",
         " nextshares",
@@ -2066,8 +2125,6 @@ class UniverseDiscovery:
         adapter = HTTPAdapter(pool_connections=30, pool_maxsize=30)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        if self.api_key:
-            self.session.headers.update({"X-Massive-Token": self.api_key})
 
     def discover(self) -> List[str]:
         """
@@ -2076,6 +2133,8 @@ class UniverseDiscovery:
         Raises PipelineError on failure.
         """
         log.info("STAGE 1: Universe Discovery -- querying Masssive /stock/symbol")
+        if not self.api_key:
+            return self._discover_without_massive()
 
         data = []
         url = f"{self.MASSIVE_BASE}/reference/tickers"
@@ -2095,12 +2154,19 @@ class UniverseDiscovery:
             pages += 1
             if pages > self.MAX_PAGES:
                 log.warning(
-                    f"Universe discovery stopped at the {self.MAX_PAGES}-page ceiling."
+                    f"Universe discovery exceeded the {self.MAX_PAGES}-page ceiling; "
+                    "discarding the incomplete alphabet prefix and trying listings."
                 )
-                break
+                return self._discover_without_massive()
             if url in seen_urls:
-                log.warning("Universe discovery pagination looped -- stopping.")
-                break
+                log.warning(
+                    "Universe discovery pagination looped; discarding incomplete "
+                    "pages and trying official listings."
+                )
+                return self._discover_without_massive()
+            if not url.startswith("https://api.massive.com/"):
+                log.warning("Universe pagination returned an untrusted host; using listings.")
+                return self._discover_without_massive()
             seen_urls.add(url)
 
             retries = 0
@@ -2177,6 +2243,7 @@ class UniverseDiscovery:
             "listing files"
         )
         rows: List[Dict[str, str]] = []
+        loaded_files = set()
         for url, kind in (
             (self.NASDAQ_LISTED_URL, "nasdaq"),
             (self.OTHER_LISTED_URL, "other"),
@@ -2188,8 +2255,20 @@ class UniverseDiscovery:
                 log.warning(f"  NASDAQ {kind} listing file failed: {exc}")
                 continue
             parsed = self._parse_nasdaq_listing_text(resp.text, kind)
+            expected_header = "Symbol|" if kind == "nasdaq" else "ACT Symbol|"
+            if not resp.text.lstrip().startswith(expected_header):
+                log.warning("  NASDAQ %s listing payload lacks the expected header.", kind)
+                continue
+            loaded_files.add(kind)
             rows.extend(parsed)
             log.info(f"  NASDAQ {kind} file: {len(parsed)} listed symbols")
+        if loaded_files != {"nasdaq", "other"}:
+            log.warning(
+                "Official listing discovery incomplete (%s); refusing an "
+                "exchange-biased universe and trying Finnhub.",
+                ", ".join(sorted(loaded_files)) or "no files",
+            )
+            return []
         if not rows:
             log.warning("Official NASDAQ listing files returned no symbols.")
             return []
@@ -2294,27 +2373,34 @@ class UniverseDiscovery:
 
     @staticmethod
     def _clean_listed_equities(data: List[Dict]) -> List[str]:
-        VALID_MIC = {"XNYS", "XNAS", "XASE", "ARCX", "BATS"}
+        VALID_MIC = {"XNYS", "XNAS", "XASE", "ARCX", "BATS", "IEXG"}
         VALID_TYPES = {
             "CS", "Common Stock", "EQS",
             "ETF", "ETP", "REIT", "MLP", "Closed-End Fund",
+            "ADRC", "ADR", "American Depositary Receipt", "CEF",
         }
         tickers = []
         for item in data:
             if not isinstance(item, dict):
                 continue
             sym = str(item.get("ticker") or item.get("symbol") or item.get("displaySymbol") or "")
+            sym = sym.strip().upper()
             mic = str(item.get("primary_exchange") or item.get("mic") or "")
             sec_type = str(item.get("type") or "")
+            name = str(item.get("name") or item.get("description") or "").lower()
+            if any(fragment in f" {name} " for fragment in UniverseDiscovery.SKIP_NAME_FRAGMENTS):
+                continue
             if mic and mic not in VALID_MIC:
                 continue
             if sec_type and sec_type not in VALID_TYPES:
                 continue
-            if any(c in sym for c in [".", "-", "/", "+"]):
-                continue
-            if len(sym) > 5 or len(sym) == 0:
-                continue
-            if not sym.isalpha():
+            if re.fullmatch(r"[A-Z]{1,5}[.-][AB]", sym):
+                # Restrict suffix admission to explicitly typed common/ADR
+                # stock. Preferred/warrant/rights types never enter this path.
+                if sec_type not in {"CS", "Common Stock", "EQS", "ADRC", "ADR", "American Depositary Receipt"}:
+                    continue
+                sym = sym.replace("-", ".")
+            elif not re.fullmatch(r"[A-Z]{1,5}", sym):
                 continue
             tickers.append(sym.upper())
         return sorted(set(tickers))
@@ -2593,7 +2679,7 @@ class YahooDirectAPI:
 
     def quick_quote(self, symbol: str) -> Optional[Dict]:
         """Get a quick 3-month snapshot for pre-screening."""
-        url = f"{self.BASE_URL}/{symbol}"
+        url = f"{self.BASE_URL}/{provider_symbol(symbol, 'Yahoo')}"
         params = {"range": "3mo", "interval": "1d", "includePrePost": "false"}
 
         try:
@@ -2631,12 +2717,17 @@ class YahooDirectAPI:
             frame = trim_to_closed_sessions(frame)
             if frame is None or len(frame) < 20:
                 return None
+            if pd.Timestamp(frame.index[-1]).date() != expected_last_closed_trading_day():
+                return None
 
             return {
                 "price": float(frame["Close"].iloc[-1]),
                 "first_close": float(frame["Close"].iloc[0]),
                 "last_close": float(frame["Close"].iloc[-1]),
                 "avg_volume_20d": float(frame["Volume"].iloc[-20:].mean()),
+                "avg_dollar_volume_20d": float(
+                    (frame["Close"] * frame["Volume"]).iloc[-20:].mean()
+                ),
                 "bars": len(frame),
             }
 
@@ -2648,7 +2739,7 @@ class YahooDirectAPI:
         circuit = ProviderCircuit.get("Yahoo-OHLCV", fail_limit=40)
         if not circuit.available():
             return None
-        url = f"{self.BASE_URL}/{symbol}"
+        url = f"{self.BASE_URL}/{provider_symbol(symbol, 'Yahoo')}"
         params = {
             "range": range_,
             "interval": "1d",
@@ -2739,6 +2830,25 @@ class MarketDataRouter:
         self.mboum = MboumAPI() if MBOUM_API_KEY else None
         self.yahoo = YahooDirectAPI()
         self._session_local = threading.local()
+        self.clock: Optional[PipelineClock] = None
+        self._massive_recent_window = False
+
+    def _check_request_budget(self, stage: str) -> None:
+        if self.clock is not None:
+            reserve = min(600.0, max(30.0, self.clock.budget_seconds * 0.10))
+            if self.clock.remaining <= reserve:
+                raise PipelineBudgetExceeded(
+                    f"Budget reserve reached before {stage}; stopping new provider calls."
+                )
+
+    @staticmethod
+    def _usable_history(df: Optional[pd.DataFrame]) -> bool:
+        if df is None or len(df) < MIN_TRADING_DAYS:
+            return False
+        try:
+            return pd.Timestamp(df.index[-1]).date() == expected_last_closed_trading_day()
+        except (TypeError, ValueError, IndexError):
+            return False
 
     @property
     def session(self) -> requests.Session:
@@ -2772,6 +2882,7 @@ class MarketDataRouter:
             "Yahoo": self._history_yahoo,
         }
         for label, circuit_name, fail_limit in self.OHLCV_CHAIN:
+            self._check_request_budget(f"{label} history for {symbol}")
             if not self._provider_enabled(label):
                 continue
             circuit = ProviderCircuit.get(circuit_name, fail_limit=fail_limit)
@@ -2779,6 +2890,9 @@ class MarketDataRouter:
                 continue
             try:
                 df = fetchers[label](symbol)
+                df = trim_to_closed_sessions(df)
+            except PipelineBudgetExceeded:
+                raise
             except ProviderExhausted as exc:
                 log.warning(
                     f"  {label} unavailable for OHLCV ({exc.reason}); "
@@ -2790,7 +2904,7 @@ class MarketDataRouter:
                     circuit.record_failure(str(exc))
                 log.debug(f"  {label} history failed for {symbol}: {exc}")
                 continue
-            if df is not None and len(df) >= MIN_TRADING_DAYS:
+            if self._usable_history(df):
                 circuit.record_success()
                 record_data_source_usage("ohlcv", label)
                 df.attrs["source"] = label
@@ -2811,10 +2925,14 @@ class MarketDataRouter:
     def _history_massive(self, symbol: str) -> Optional[pd.DataFrame]:
         circuit = ProviderCircuit.get("Massive-OHLCV", fail_limit=10)
         start, end = _history_window()
-        url = (
-            f"{MASSIVE_BASE_URL}/aggs/ticker/{symbol}/range/1/day/"
-            f"{start.isoformat()}/{end.isoformat()}"
-        )
+        def history_url(start_day):
+            return (
+                f"{MASSIVE_BASE_URL}/aggs/ticker/{symbol}/range/1/day/"
+                f"{start_day.isoformat()}/{end.isoformat()}"
+            )
+        if self._massive_recent_window:
+            start = end - timedelta(days=2 * 365 - 7)
+        url = history_url(start)
         params = {
             "adjusted": "true",
             "sort": "asc",
@@ -2822,13 +2940,23 @@ class MarketDataRouter:
             "apiKey": MASSIVE_API_KEY,
         }
         resp = None
+        retried_entitled_window = self._massive_recent_window
         for attempt in range(3):
+            self._check_request_budget(f"Massive history for {symbol}")
             resp = self.session.get(url, params=params, timeout=20)
             kind = classify_http_error(resp.status_code, resp.text or "")
             if kind == "rate":
                 time.sleep(1.5 * (attempt + 1))
                 continue
             if kind in ("credit", "auth"):
+                if resp.status_code == 403 and not retried_entitled_window:
+                    # The Basic tier can deny a 5y request while still serving
+                    # enough recent history for every production indicator.
+                    recent_start = end - timedelta(days=2 * 365 - 7)
+                    url = history_url(recent_start)
+                    retried_entitled_window = True
+                    self._massive_recent_window = True
+                    continue
                 circuit.trip(f"Massive aggs HTTP {resp.status_code}")
                 raise ProviderExhausted("Massive", f"HTTP {resp.status_code}")
             break
@@ -2870,6 +2998,7 @@ class MarketDataRouter:
         }
         resp = None
         for attempt in range(3):
+            self._check_request_budget(f"TwelveData history for {symbol}")
             resp = self.session.get(
                 f"{TWELVEDATA_BASE_URL}/time_series", params=params, timeout=20
             )
@@ -2950,7 +3079,10 @@ class MarketDataRouter:
         rows = []
         for i, epoch in enumerate(times):
             rows.append({
-                "Date": pd.to_datetime(epoch, unit="s", utc=True),
+                # Daily candles are session labels. Finnhub can return UTC
+                # midnight as well as exchange-open timestamps; preserve the
+                # UTC calendar date instead of shifting midnight to yesterday.
+                "Date": pd.to_datetime(epoch, unit="s", utc=True).tz_localize(None).normalize(),
                 "Open": (payload.get("o") or [None])[i] if i < len(payload.get("o") or []) else None,
                 "High": (payload.get("h") or [None])[i] if i < len(payload.get("h") or []) else None,
                 "Low": (payload.get("l") or [None])[i] if i < len(payload.get("l") or []) else None,
@@ -2971,11 +3103,12 @@ class MarketDataRouter:
             return loaded
         log.info(f"  yfinance last-resort batch for {len(tickers)} remaining tickers")
         for i in range(0, len(tickers), BATCH_SIZE):
+            self._check_request_budget("yfinance batch history")
             batch = tickers[i:i + BATCH_SIZE]
             raw = None
             try:
                 raw = yf.download(
-                    batch,
+                    [provider_symbol(ticker, "yfinance") for ticker in batch],
                     period="5y",
                     interval="1d",
                     auto_adjust=True,
@@ -2989,7 +3122,8 @@ class MarketDataRouter:
                 df = _frame_from_yfinance(raw, ticker) if raw is not None else None
                 if df is None:
                     df = self._history_yfinance_one(ticker)
-                if df is not None and len(df) >= MIN_TRADING_DAYS:
+                df = trim_to_closed_sessions(df)
+                if self._usable_history(df):
                     record_data_source_usage("ohlcv", "yfinance")
                     df.attrs["source"] = "yfinance"
                     df.attrs["adjustment_policy"] = (
@@ -2999,9 +3133,10 @@ class MarketDataRouter:
         return loaded
 
     def _history_yfinance_one(self, symbol: str) -> Optional[pd.DataFrame]:
+        self._check_request_budget(f"yfinance history for {symbol}")
         try:
             raw = yf.download(
-                symbol,
+                provider_symbol(symbol, "yfinance"),
                 period="5y",
                 interval="1d",
                 auto_adjust=True,
@@ -3018,13 +3153,18 @@ def _frame_from_yfinance(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFram
         return None
     df = raw
     if isinstance(df.columns, pd.MultiIndex):
-        level0 = set(df.columns.get_level_values(0))
-        if ticker in level0:
-            df = df[ticker]
-        elif "Close" in level0:
-            df = df.copy()
-            df.columns = df.columns.get_level_values(0)
-        else:
+        vendor_ticker = provider_symbol(ticker, "yfinance")
+        symbol_level = next((
+            level for level in range(df.columns.nlevels)
+            if vendor_ticker in set(df.columns.get_level_values(level))
+        ), None)
+        if symbol_level is None:
+            return None
+        # yfinance exposes either (Ticker, Price) or (Price, Ticker).
+        # Flattening the latter across a batch mixed symbols into duplicate
+        # Close/Open columns; select the requested symbol first.
+        df = df.xs(vendor_ticker, level=symbol_level, axis=1).copy()
+        if isinstance(df.columns, pd.MultiIndex):
             return None
     df = df.rename(columns={c: str(c).title() for c in df.columns})
     if "Close" not in df.columns and "Adj Close" in df.columns:
@@ -3069,16 +3209,63 @@ class DataFetcher:
         self.clock = clock
         self.yahoo = YahooDirectAPI()
         self.router = get_market_router()
+        if clock is not None:
+            self.router.clock = clock
+        self.coverage: Dict[str, Any] = {
+            "universe_size": 0,
+            "quick_screen": {},
+            "full_history": {},
+        }
 
     def _check_budget_reserve(
         self, stage: str, reserve_seconds: float = 10 * 60
     ) -> None:
+        if self.clock is not None:
+            reserve_seconds = min(
+                reserve_seconds, max(30.0, self.clock.budget_seconds * 0.10)
+            )
         if self.clock is not None and self.clock.remaining <= reserve_seconds:
             raise PipelineBudgetExceeded(
                 f"Only {self.clock.remaining / 60:.1f} minutes remain during "
                 f"{stage}; reserving {reserve_seconds / 60:.0f} minutes to "
                 "write diagnostics before the CI timeout."
             )
+
+    def _parallel_results(self, tickers, worker, max_workers, stage):
+        """Bound outstanding work and cancel queued requests on budget expiry.
+
+        Executor context managers wait for every queued future when unwinding.
+        A 10,000-name queue therefore defeated the previous budget guard. Keep
+        at most two worker batches outstanding and stop submitting promptly.
+        Active requests retain their finite provider timeouts.
+        """
+        self._check_budget_reserve(stage)
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        pending = {}
+        items = iter(tickers)
+
+        def submit_more():
+            while len(pending) < 2 * max_workers:
+                self._check_budget_reserve(stage)
+                try:
+                    ticker = next(items)
+                except StopIteration:
+                    return
+                pending[executor.submit(worker, ticker)] = ticker
+
+        try:
+            submit_more()
+            while pending:
+                self._check_budget_reserve(stage)
+                done, _ = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                for future in done:
+                    ticker = pending.pop(future)
+                    yield ticker, future
+                submit_more()
+        finally:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def fetch_ohlcv(self, tickers: List[str]) -> Dict[str, pd.DataFrame]:
         """
@@ -3087,10 +3274,11 @@ class DataFetcher:
           2. Full 5y OHLCV with MBOUM primary and live fallbacks
         """
         log.info(f"PHASE 1: Quick 3-month pre-screen for {len(tickers)} tickers")
+        self.coverage["universe_size"] = len(tickers)
         promising = self._quick_screen(tickers)
         log.info(
-            f"PHASE 1 COMPLETE: {len(promising)} tickers passed quick screen "
-            f"(price >= $5, avg dollar vol > $1M; no current-return selection)"
+            f"PHASE 1 COMPLETE: {len(promising)} tickers retained for full data "
+            "(verified price/liquidity pass plus unavailable quick quotes)"
         )
 
         if not promising:
@@ -3104,176 +3292,190 @@ class DataFetcher:
         return all_data
 
     def _quick_screen(self, tickers: List[str]) -> List[str]:
-        """
-        Parallel quick screen using Yahoo v8 3mo range.
-        Keeps tickers with close >= $5 and avg dollar volume >= $1M.
+        """Exclude only verified illiquid/low-price names; recover quote misses.
 
-        Current-period return is deliberately not used here. Selecting the
-        histories used for model fitting because they happen to be winners
-        today leaks the end of each historical series into every old sample.
-        The positive-63d trade rule remains in ExecutionGuards, but the ML
-        training pool now includes liquid current losers as valid controls.
+        Yahoo is a fast pre-screen, not the arbiter of exchange coverage. A
+        missing/malformed/stale quote remains eligible for the full data chain.
         """
-        promising = []
+        retained = []
+        unavailable = []
+        excluded_price = []
+        excluded_liquidity = []
         checked = 0
         quoted = 0
+        self.coverage["universe_size"] = len(tickers)
 
-        def _check_one(ticker: str) -> Tuple[Optional[str], bool]:
+        def _check_one(ticker: str) -> str:
+            self._check_budget_reserve("quick quote request")
             q = self.yahoo.quick_quote(ticker)
-            if q is None:
-                return None, False
-            price = q["last_close"]
+            if not isinstance(q, dict):
+                return "unavailable"
+            try:
+                price = float(q["last_close"])
+                raw_dv = q.get("avg_dollar_volume_20d")
+                if raw_dv is None:
+                    raw_dv = price * q["avg_volume_20d"]
+                avg_dv = float(raw_dv)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return "unavailable"
+            if not np.isfinite(price) or not np.isfinite(avg_dv) or price <= 0 or avg_dv < 0:
+                return "unavailable"
             if price < 5.0:
-                return None, True
-            avg_dv = price * q["avg_volume_20d"]
+                return "excluded_price"
             if avg_dv < 1_000_000:
-                return None, True
-            return ticker, True
+                return "excluded_liquidity"
+            return "passed"
 
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {
-                executor.submit(_check_one, t): t for t in tickers
-            }
-
-            for future in as_completed(futures):
+        try:
+            for ticker, future in self._parallel_results(
+                tickers, _check_one, 20, "quick screening"
+            ):
                 checked += 1
-                if checked % 100 == 0:
-                    self._check_budget_reserve("quick screening")
+                try:
+                    result = future.result()
+                except PipelineBudgetExceeded:
+                    raise
+                except Exception as exc:
+                    log.debug("  Quick quote failed for %s: %s", ticker, exc)
+                    result = "unavailable"
+                if result == "unavailable":
+                    unavailable.append(ticker)
+                    retained.append(ticker)
+                else:
+                    quoted += 1
+                    if result == "excluded_price":
+                        excluded_price.append(ticker)
+                    elif result == "excluded_liquidity":
+                        excluded_liquidity.append(ticker)
+                    else:
+                        retained.append(ticker)
                 if checked % 500 == 0 or checked == len(tickers):
                     log.info(
-                        f"  Quick screen: {checked}/{len(tickers)} checked, "
-                        f"{len(promising)} promising"
+                        "  Quick screen: %s/%s checked, %s retained (%s unverified)",
+                        checked, len(tickers), len(retained), len(unavailable),
                     )
-                # A single malformed payload must never abort the screen of a
-                # 10,000-name universe.
-                try:
-                    result, had_quote = future.result()
-                except Exception as e:
-                    log.debug(f"  Quick screen failed for {futures[future]}: {e}")
-                    continue
-                if had_quote:
-                    quoted += 1
-                if result:
-                    promising.append(result)
-
-        coverage = quoted / len(tickers) if tickers else 0.0
+        finally:
+            quote_coverage = quoted / len(tickers) if tickers else 0.0
+            self.coverage["quick_screen"] = {
+                "requested": len(tickers),
+                "attempted": checked,
+                "quoted": quoted,
+                "quote_coverage_ratio": round(quote_coverage, 6),
+                "passed": len(retained) - len(unavailable),
+                "retained_unverified": len(unavailable),
+                "retained": len(retained),
+                "excluded_price": len(excluded_price),
+                "excluded_liquidity": len(excluded_liquidity),
+                "unavailable_tickers": sorted(unavailable),
+                "excluded_price_tickers": sorted(excluded_price),
+                "excluded_liquidity_tickers": sorted(excluded_liquidity),
+                "complete": checked == len(tickers),
+            }
         log.info(
-            f"  Quick-quote coverage: {quoted}/{len(tickers)} "
-            f"({coverage:.1%}); {len(promising)} passed price/liquidity."
+            "  Quick quotes: %s/%s (%.1f%%); %s missing quotes retained for full data.",
+            quoted, len(tickers), quote_coverage * 100, len(unavailable),
         )
-        if (
-            len(tickers) >= MIN_UNIVERSE_SIZE
-            and (
-                quoted < MIN_UNIVERSE_SIZE
-                or coverage < MIN_QUICK_QUOTE_COVERAGE
+        if quote_coverage < MIN_QUICK_QUOTE_COVERAGE:
+            log.warning(
+                "  Quick-quote coverage low; recovering every unverified symbol "
+                "through the full live provider cascade."
             )
-        ):
-            raise PipelineError(
-                f"Quick-quote coverage too low ({quoted}/{len(tickers)}, "
-                f"{coverage:.1%}). Refusing to scan a provider-biased subset."
-            )
-        return sorted(promising)
+        return sorted(retained)
 
     def _full_download(self, tickers: List[str]) -> Dict[str, pd.DataFrame]:
-        """Download full history with MBOUM primary and live provider fallbacks."""
+        """Download current, finalized histories with explicit coverage accounting."""
         all_data: Dict[str, pd.DataFrame] = {}
-        failed = 0
         missing: List[str] = []
+        attempted = 0
+        removed_bars = 0
 
-        def _download_one(ticker: str) -> Tuple[str, Optional[pd.DataFrame], str]:
-            df, source = self.router.get_history(ticker)
-            if df is not None and len(df) >= MIN_TRADING_DAYS:
-                return ticker, df, source
-            return ticker, None, source
-
-        with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = {
-                executor.submit(_download_one, t): t for t in tickers
+        def record_coverage():
+            unavailable = sorted(set(tickers) - set(all_data))
+            ratio = len(all_data) / len(tickers) if tickers else 0.0
+            adjustment_policies = Counter(
+                frame.attrs.get("adjustment_policy", "unknown")
+                for frame in all_data.values()
+            )
+            self.coverage["full_history"] = {
+                "requested": len(tickers),
+                "attempted": attempted,
+                "loaded": len(all_data),
+                "unavailable": len(unavailable),
+                "unavailable_tickers": unavailable,
+                "coverage_ratio": round(ratio, 6),
+                "minimum_coverage_ratio": MIN_FULL_HISTORY_COVERAGE,
+                "coverage_degraded": ratio < 1.0,
+                "complete": attempted == len(tickers),
+                "removed_unfinalized_bars": removed_bars,
+                "provider_counts": dict(Counter(
+                    frame.attrs.get("source", "unknown")
+                    for frame in all_data.values()
+                )),
+                "adjustment_policy_counts": dict(adjustment_policies),
+                "adjustment_policy_mixed": len(adjustment_policies) > 1,
             }
 
-            completed = 0
-            for future in as_completed(futures):
-                completed += 1
-                if completed % 25 == 0:
-                    self._check_budget_reserve("full OHLCV download")
-                ticker = futures[future]
+        def _download_one(ticker: str):
+            return self.router.get_history(ticker)
+
+        try:
+            for ticker, future in self._parallel_results(
+                tickers, _download_one, 12, "full OHLCV download"
+            ):
+                attempted += 1
                 try:
-                    ticker, df, _source = future.result()
-                except Exception as e:
-                    log.debug(f"  OHLCV history failed for {ticker}: {e}")
-                    failed += 1
-                    missing.append(ticker)
-                    continue
-                if df is not None:
+                    df, _source = future.result()
+                except PipelineBudgetExceeded:
+                    raise
+                except Exception as exc:
+                    log.debug("  OHLCV history failed for %s: %s", ticker, exc)
+                    df = None
+                if self.router._usable_history(df):
                     all_data[ticker] = df
                 else:
-                    failed += 1
                     missing.append(ticker)
-
-                if completed % 100 == 0 or completed == len(tickers):
-                    sources = ", ".join(
-                        f"{name}={count}"
-                        for name, count in DATA_SOURCE_USAGE["ohlcv"].most_common()
-                    ) or "none yet"
+                if attempted % 100 == 0 or attempted == len(tickers):
                     log.info(
-                        f"  OHLCV download: {completed}/{len(tickers)} done, "
-                        f"{len(all_data)} loaded, {failed} pending/failed "
-                        f"[{sources}]"
+                        "  OHLCV: %s/%s attempted, %s current histories, %s missing",
+                        attempted, len(tickers), len(all_data), len(missing),
                     )
+            if missing:
+                self._check_budget_reserve("yfinance recovery")
+                recovered = self.router.yfinance_batch(missing)
+                for ticker, df in recovered.items():
+                    if self.router._usable_history(df):
+                        all_data[ticker] = df
+            # Apply the common cutoff again at the stage boundary. Provider
+            # acceptance already trims and checks freshness before fallback.
+            for ticker in list(all_data):
+                before = all_data[ticker]
+                after = trim_to_closed_sessions(before)
+                if not self.router._usable_history(after):
+                    del all_data[ticker]
+                    continue
+                removed_bars += len(before) - len(after)
+                all_data[ticker] = after
+        finally:
+            record_coverage()
 
-        if missing:
-            recovered = self.router.yfinance_batch(missing)
-            for ticker, df in recovered.items():
-                all_data[ticker] = df
-            failed = max(0, len(tickers) - len(all_data))
-
-        sources = ", ".join(
-            f"{name}={count}"
-            for name, count in DATA_SOURCE_USAGE["ohlcv"].most_common()
-        ) or "none"
+        ratio = self.coverage["full_history"]["coverage_ratio"]
         log.info(
-            f"Full OHLCV fetch complete: {len(all_data)} tickers with "
-            f">= {MIN_TRADING_DAYS} trading days. "
-            f"{failed} excluded (insufficient history). Sources: {sources}"
+            "Full OHLCV coverage: %s/%s (%.1f%%) current histories, %s unavailable.",
+            len(all_data), len(tickers), ratio * 100, len(tickers) - len(all_data),
         )
-
-        # Operate only on vendor-finalized sessions. Same-day aggregate bars can
-        # appear in pre-market or after-hours payloads too, so checking only
-        # whether RTH is open is insufficient.
-        trimmed = 0
-        cutoff = expected_last_closed_trading_day()
-        for ticker in list(all_data):
-            before = all_data[ticker]
-            after = trim_to_closed_sessions(before)
-            if after is None or len(after) < MIN_TRADING_DAYS:
-                del all_data[ticker]
-                continue
-            if len(after) != len(before):
-                trimmed += len(before) - len(after)
-            all_data[ticker] = after
-        if trimmed:
-            log.info(
-                f"  Removed {trimmed} unfinalized daily bar(s); "
-                f"latest eligible XNYS session is {cutoff}."
-            )
-
-        if len(all_data) == 0:
+        if not all_data:
+            raise PipelineError("No tickers had current sufficient OHLCV data. Pipeline STOPPED.")
+        if ratio < MIN_FULL_HISTORY_COVERAGE:
             raise PipelineError(
-                "No tickers had sufficient OHLCV data. Pipeline STOPPED."
+                f"Full-history coverage too low: {len(all_data)}/{len(tickers)} "
+                f"({ratio:.1%} < {MIN_FULL_HISTORY_COVERAGE:.0%}). Refusing to "
+                "rank a provider-biased subset; see unavailable_tickers diagnostics."
             )
-
-        if len(tickers) > 0:
-            pct = len(all_data) / len(tickers) * 100
-            if len(all_data) < MIN_UNIVERSE_SIZE and pct < 80:
-                raise PipelineError(
-                    f"Only {len(all_data)}/{len(tickers)} ({pct:.0f}%) tickers "
-                    f"have valid data (< 80% threshold). Pipeline STOPPED."
-                )
-            elif pct < 80:
-                log.warning(
-                    f"Proceeding with {len(all_data)} tickers ({pct:.0f}% of universe)"
-                )
-
+        if ratio < 1.0:
+            log.warning(
+                "Data coverage is degraded; %s symbols remain unavailable and are "
+                "explicitly identified in the report.", len(tickers) - len(all_data),
+            )
         return all_data
 
 
@@ -3293,22 +3495,38 @@ class TechnicalEngine:
         return series.ewm(span=period, adjust=False, min_periods=period).mean()
 
     @staticmethod
+    def wilder_average(series: pd.Series, period: int = 14) -> pd.Series:
+        """SMA-seeded Wilder smoothing; never seed with a fabricated zero."""
+        values = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        output = pd.Series(np.nan, index=series.index, dtype=float)
+        seeds = values.rolling(period, min_periods=period).mean()
+        valid_positions = np.flatnonzero(seeds.notna().to_numpy())
+        if not len(valid_positions):
+            return output
+        start = int(valid_positions[0])
+        tail = values.iloc[start:].copy()
+        tail.iloc[0] = seeds.iloc[start]
+        output.iloc[start:] = tail.ewm(alpha=1 / period, adjust=False).mean()
+        return output.where(values.notna())
+
+    @staticmethod
     def rsi(series: pd.Series, period: int = 14) -> pd.Series:
         """Wilder-smoothed RSI."""
         delta = series.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta).where(delta < 0, 0.0)
+        gain = delta.clip(lower=0.0)
+        loss = -delta.clip(upper=0.0)
 
-        avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        avg_gain = TechnicalEngine.wilder_average(gain, period)
+        avg_loss = TechnicalEngine.wilder_average(loss, period)
 
         rs = avg_gain / avg_loss.replace(0, np.nan)
         rsi = 100 - (100 / (1 + rs))
         # Wilder's convention: with no average loss in the window RSI is 100,
         # not undefined. Returning NaN here silently disqualified the strongest
         # uninterrupted uptrends from every RSI-based rule and panel score.
-        no_loss = (avg_loss == 0) & avg_gain.notna()
-        return rsi.mask(no_loss, 100.0)
+        no_loss = (avg_loss == 0) & (avg_gain > 0)
+        flat = (avg_loss == 0) & (avg_gain == 0)
+        return rsi.mask(no_loss, 100.0).mask(flat, 50.0)
 
     @staticmethod
     def macd(series: pd.Series, fast=12, slow=26, signal=9):
@@ -3334,10 +3552,8 @@ class TechnicalEngine:
                    volume: pd.Series, window: int = 20) -> pd.Series:
         """
         Rolling N-day VWAP using typical price (H+L+C)/3 weighted by volume.
-        For daily bars, a rolling 20-day VWAP is the institutional reference
-        used by professional desks (Markert/Almgren) for entry-quality. A
-        rolling(1) implementation collapses to (H+L+C)/3 which is meaningless
-        as a VWAP confirmation signal.
+        This is a daily-bar typical-price proxy, not exchange trade-level VWAP.
+        It cannot establish an intraday execution price or spread.
         """
         tp = (high + low + close) / 3
         tpv = tp * volume
@@ -3354,16 +3570,20 @@ class TechnicalEngine:
         down_move = -low.diff()
         plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
         minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=low.index)
+        plus_dm = plus_dm.where(up_move.notna() & down_move.notna())
+        minus_dm = minus_dm.where(up_move.notna() & down_move.notna())
         tr = pd.concat([
             high - low,
             (high - close.shift(1)).abs(),
             (low - close.shift(1)).abs(),
         ], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-        plus_di = 100 * plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan)
-        minus_di = 100 * minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr.replace(0, np.nan)
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-        return dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        atr = TechnicalEngine.wilder_average(tr, period)
+        plus_di = 100 * TechnicalEngine.wilder_average(plus_dm, period) / atr.replace(0, np.nan)
+        minus_di = 100 * TechnicalEngine.wilder_average(minus_dm, period) / atr.replace(0, np.nan)
+        directional_sum = plus_di + minus_di
+        dx = 100 * (plus_di - minus_di).abs() / directional_sum.replace(0, np.nan)
+        dx = dx.mask((directional_sum == 0) & atr.notna(), 0.0)
+        return TechnicalEngine.wilder_average(dx, period)
 
     @staticmethod
     def compute_all(df: pd.DataFrame) -> pd.DataFrame:
@@ -3437,10 +3657,10 @@ class TechnicalEngine:
         ).max()
 
         # Returns
-        df["Return_1d"] = c.pct_change(1)
-        df["Return_5d"] = c.pct_change(5)
-        df["Return_20d"] = c.pct_change(20)
-        df["Return_63d"] = c.pct_change(63)
+        df["Return_1d"] = c.pct_change(1, fill_method=None)
+        df["Return_5d"] = c.pct_change(5, fill_method=None)
+        df["Return_20d"] = c.pct_change(20, fill_method=None)
+        df["Return_63d"] = c.pct_change(63, fill_method=None)
 
         # Volume ratio
         df["Volume_Ratio"] = v / df["Vol_SMA_20"].replace(0, np.nan)
@@ -3466,7 +3686,7 @@ class TechnicalEngine:
             (h - c.shift(1)).abs(),
             (l - c.shift(1)).abs()
         ], axis=1).max(axis=1)
-        df["ATR_14"] = tr.rolling(window=14, min_periods=14).mean()
+        df["ATR_14"] = TechnicalEngine.wilder_average(tr, 14)
         df["ATR_pct"] = df["ATR_14"] / c.replace(0, np.nan)
 
         # ADX (14) -- trend strength filter (Wilder)
@@ -3502,7 +3722,7 @@ class TechnicalEngine:
         # than a single headline print.
         df["RVOL_5"] = (
             v.rolling(window=5, min_periods=5).mean()
-            / df["Vol_SMA_20"].replace(0, np.nan)
+            / v.shift(5).rolling(window=20, min_periods=20).mean().replace(0, np.nan)
         )
         # Rising OBV confirms the crowd is accumulating, not distributing.
         obv_sma20 = df["OBV"].rolling(window=20, min_periods=20).mean()
@@ -3531,6 +3751,40 @@ class MomentumQuality:
     """
 
     NEUTRAL = 50.0
+
+    @staticmethod
+    def finite_number(value: Any) -> Optional[float]:
+        """Numeric API fields must be finite numbers, not strings or infinity."""
+        value = normalize_api_scalar(value)
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def evidence(last: pd.Series, fund: Optional[Dict] = None) -> Dict:
+        """Expose availability separately from the legacy neutral score."""
+        fund = fund or {}
+        hype_fields = ("RVOL_5", "Volume_Ratio", "Return_20d", "OBV_Trend")
+        count = sum(MomentumQuality.finite_number(last.get(k)) is not None for k in hype_fields)
+        buys = MomentumQuality.finite_number(fund.get("insider_buy_transactions"))
+        sells = MomentumQuality.finite_number(fund.get("insider_sell_transactions"))
+        net = MomentumQuality.finite_number(fund.get("insider_net_purchase_pct"))
+        insider_available = (
+            (net is not None and -1 <= net <= 1)
+            or (buys is not None and sells is not None and buys >= 0 and sells >= 0 and buys + sells > 0)
+        )
+        short_pct = MomentumQuality.finite_number(fund.get("short_pct_float"))
+        return {
+            "hype_data_coverage": count / len(hype_fields),
+            "insider_evidence_available": bool(insider_available),
+            "insider_evidence_quality": fund.get("insider_evidence_quality", "unknown"),
+            "insider_data_asof": fund.get("insider_data_asof"),
+            "short_interest_evidence_available": short_pct is not None and 0 <= short_pct <= 1,
+            "short_interest_asof": fund.get("short_interest_asof"),
+            "short_interest_is_directional_edge": False,
+        }
 
     @staticmethod
     def hype_score(last: pd.Series) -> float:
@@ -3570,9 +3824,8 @@ class MomentumQuality:
         """
         0-100 measure of how stretched the move already is.
 
-        100 means "this has gone vertical and is statistically due to unwind";
-        0 means "the trend has room". Used to penalise, and at the extreme to
-        reject, names that are already peaking.
+        This is an uncalibrated extension diagnostic, not a probability of
+        reversal. Extreme readings trigger the documented anti-chase policy.
         """
         components: List[float] = []
 
@@ -3613,27 +3866,28 @@ class MomentumQuality:
         """
         0-100 conviction score from live insider transaction data.
 
-        Insider *buying* is the highest-signal fundamental input available on a
-        short horizon: officers and directors sell for many reasons but buy for
-        exactly one. Returns a neutral 50 when the provider has no insider
-        record so a data gap neither rewards nor punishes a name.
+        Trades may be routine, planned, or opportunistic. These counts cannot
+        establish that distinction, trade value, or short-horizon predictive
+        edge. Availability and evidence quality are reported separately.
         """
         fund = fund or {}
-        net_pct = normalize_api_scalar(fund.get("insider_net_purchase_pct"))
-        buys = normalize_api_scalar(fund.get("insider_buy_transactions"))
-        sells = normalize_api_scalar(fund.get("insider_sell_transactions"))
+        net_pct = MomentumQuality.finite_number(fund.get("insider_net_purchase_pct"))
+        buys = MomentumQuality.finite_number(fund.get("insider_buy_transactions"))
+        sells = MomentumQuality.finite_number(fund.get("insider_sell_transactions"))
 
         components: List[float] = []
 
-        if not is_missing_value(net_pct):
+        if net_pct is not None and -1 <= net_pct <= 1:
             # Net shares purchased as a fraction of insider holdings. +2% is a
             # strong accumulation signal, -2% is meaningful distribution.
             components.append(50.0 + 50.0 * clamp(float(net_pct) / 0.02, -1.0, 1.0))
 
-        if not is_missing_value(buys) and not is_missing_value(sells):
+        if buys is not None and sells is not None and buys >= 0 and sells >= 0:
             total = float(buys) + float(sells)
             if total > 0:
-                buy_ratio = float(buys) / total
+                # Shrink sparse counts toward neutral: one small purchase is
+                # not 100/100 conviction. The score remains a heuristic.
+                buy_ratio = (float(buys) + 1.0) / (total + 2.0)
                 components.append(100.0 * clamp(buy_ratio, 0.0, 1.0))
 
         if not components:
@@ -3645,13 +3899,12 @@ class MomentumQuality:
         """
         0-100 short-squeeze fuel from live short interest.
 
-        Elevated short interest on a name that is already trending is the
-        classic accelerant behind the sharp short-to-mid-term moves this
-        strategy targets.
+        Short interest describes crowding and squeeze *risk*, not directional
+        edge. The display score does not enter the equity ranking.
         """
         fund = fund or {}
-        short_pct = normalize_api_scalar(fund.get("short_pct_float"))
-        if is_missing_value(short_pct):
+        short_pct = MomentumQuality.finite_number(fund.get("short_pct_float"))
+        if short_pct is None or not 0 <= short_pct <= 1:
             return MomentumQuality.NEUTRAL
         # 0% float short -> 0, 20%+ short -> 100.
         return float(100.0 * clamp(float(short_pct) / 0.20, 0.0, 1.0))
@@ -3690,9 +3943,8 @@ class ExecutionGuards:
         )
         return survivors, rejected
 
-    # Real-money execution thresholds. Setting to $5M avg dollar volume
-    # ensures retail-size positions (typical $5-50K) move <5bp at the
-    # institutional spread, per Almgren-Chriss execution-cost models.
+    # A policy floor, not a guarantee about spread or market impact. Actual
+    # execution still requires current quotes, order size, and participation.
     MIN_DOLLAR_VOLUME = 5_000_000
 
     @staticmethod
@@ -3726,8 +3978,7 @@ class ExecutionGuards:
             # negative label, which is noise rather than signal. These are the
             # same integrity conditions GUARD_A uses, and unlike the 63-day
             # return they say nothing about how the name went on to perform.
-            recent = df.iloc[-30:] if len(df) >= 30 else df
-            if (recent["Volume"] <= 0).all() or recent["Close"].nunique() <= 2:
+            if (df["Volume"] <= 0).all() or df["Close"].nunique() <= 2:
                 continue
             pool[ticker] = df
         return pool
@@ -3741,6 +3992,22 @@ class ExecutionGuards:
             return "GUARD_A: Insufficient data"
 
         last = df.iloc[-1]
+
+        # GUARD_A: Do not infer tradable signals from corrupt numeric bars.
+        recent = df.tail(MIN_TRADING_DAYS)
+        for field in ("Open", "High", "Low", "Close", "Volume"):
+            if field in recent and not np.isfinite(pd.to_numeric(recent[field], errors="coerce")).all():
+                return f"GUARD_A: Non-finite {field} data"
+        if (recent["Close"] <= 0).any() or (recent["Volume"] < 0).any():
+            return "GUARD_A: Non-positive prices or negative volume"
+        if all(field in recent for field in ("Open", "High", "Low")):
+            invalid = (
+                (recent["Low"] <= 0)
+                | (recent["High"] < recent[["Open", "Close", "Low"]].max(axis=1))
+                | (recent["Low"] > recent[["Open", "Close", "High"]].min(axis=1))
+            )
+            if invalid.any():
+                return "GUARD_A: Inconsistent OHLC bar"
 
         # GUARD_A: Data Integrity -- check for holes in the recent history.
         # The window must be measured against the ticker's OWN span: comparing
@@ -3787,15 +4054,14 @@ class ExecutionGuards:
             return "GUARD_A: Stale price (< 3 unique closes in 30 days)"
 
         # GUARD_B: Liquidity -- avg daily dollar volume over 20 days.
-        # $5M minimum gives institutional-grade execution; cheaper names get
-        # routed away on principle (real-money policy).
+        # This minimum is a policy screen; it does not verify today's spread.
         avg_dv = last.get("Avg_Dollar_Vol_20", 0)
-        if pd.isna(avg_dv) or avg_dv < ExecutionGuards.MIN_DOLLAR_VOLUME:
+        if MomentumQuality.finite_number(avg_dv) is None or avg_dv < ExecutionGuards.MIN_DOLLAR_VOLUME:
             return f"GUARD_B: Low liquidity (avg $vol ${avg_dv:,.0f} < ${ExecutionGuards.MIN_DOLLAR_VOLUME:,.0f})"
 
         # GUARD_B: 3-month performance must be positive
         ret_63d = last.get("Return_63d", np.nan)
-        if pd.isna(ret_63d) or ret_63d < 0:
+        if MomentumQuality.finite_number(ret_63d) is None or ret_63d < 0:
             return f"GUARD_B: Negative 3mo return ({ret_63d:.2%})"
 
         # GUARD_B2: Avoid hyper-volatile names (ATR/price > 12%) -- options
@@ -3814,9 +4080,8 @@ class ExecutionGuards:
         # to chase a move that has already gone vertical. A name trading far
         # above its own 50DMA, printing blow-off RSI, or that has spiked
         # violently in the last week/month has, statistically, spent most of
-        # its upside and carries mean-reversion risk that a 20-day hold cannot
-        # absorb. Rejecting these is what keeps the top-7 out of the names that
-        # tank the day after they are discovered.
+        # These cutoffs are risk-policy assumptions. They have not established
+        # that an extended stock must reverse during the holding horizon.
         exhaustion = ExecutionGuards._exhaustion_reason(last)
         if exhaustion:
             return f"GUARD_D: {exhaustion}"
@@ -3968,6 +4233,11 @@ class HardBuyRules:
             "pct_from_52w_high": last.get("Pct_From_52w_High", np.nan),
             "hype_score": round(hype, 1),
             "exhaustion_score": round(exhaustion, 1),
+            "hype_data_coverage": MomentumQuality.evidence(last)["hype_data_coverage"],
+            "setup_archetype": rule_result.get("setup_archetype", "UNCLASSIFIED"),
+            "setup_archetypes": list(rule_result.get("setup_archetypes", [])),
+            "strategy_gate": "strict_10_rule_breakout",
+            "rule_results": dict(rule_result.get("rule_results", {})),
             "rules_passed": rules_passed,
             "rules_failed": rules_failed,
             "passed_rules": list(rule_result.get("passed_rules", [])),
@@ -4050,9 +4320,17 @@ class HardBuyRules:
             return None
 
         last = df.iloc[-1]
-        close = last.get("Close", np.nan)
-        if pd.isna(close):
+        close = MomentumQuality.finite_number(last.get("Close"))
+        if close is None:
             return None
+        last = last.copy()
+        for field in (
+            "SMA_50", "SMA_200", "BB_upper", "High_Close_20", "MACD_line",
+            "MACD_signal", "MACD_histogram", "SMA_10", "SMA_30", "VWAP",
+            "EMA_20", "EMA_50", "RSI_14", "Volume", "Vol_SMA_20",
+        ):
+            number = MomentumQuality.finite_number(last.get(field))
+            last[field] = np.nan if number is None else number
 
         passed_rules = []
         failed_rules = []
@@ -4070,7 +4348,7 @@ class HardBuyRules:
         # BUY_02: 50-Day MA Bullish Slope
         if len(df) >= 6 and not pd.isna(sma50):
             sma50_5ago = df["SMA_50"].iloc[-6]
-            if not pd.isna(sma50_5ago) and sma50 > sma50_5ago:
+            if MomentumQuality.finite_number(sma50_5ago) is not None and sma50 > sma50_5ago:
                 passed_rules.append("BUY_02")
             else:
                 failed_rules.append("BUY_02:Slope")
@@ -4107,7 +4385,8 @@ class HardBuyRules:
                 if len(df) > lb:
                     p10 = df["SMA_10"].iloc[-(lb + 1)]
                     p30 = df["SMA_30"].iloc[-(lb + 1)]
-                    if not pd.isna(p10) and not pd.isna(p30) and p10 <= p30:
+                    if (MomentumQuality.finite_number(p10) is not None
+                            and MomentumQuality.finite_number(p30) is not None and p10 <= p30):
                         cross_ok = True
                         break
         if cross_ok:
@@ -4117,9 +4396,6 @@ class HardBuyRules:
 
         # BUY_06: VWAP Confirmation
         vwap = last.get("VWAP", np.nan)
-        if pd.isna(vwap) and len(df) >= 2:
-            prev = df.iloc[-2]
-            vwap = (prev["High"] + prev["Low"] + prev["Close"]) / 3
         if not pd.isna(vwap) and close > vwap:
             passed_rules.append("BUY_06")
         else:
@@ -4143,7 +4419,11 @@ class HardBuyRules:
         # BUY_09: Volume Surge
         vol = last.get("Volume", 0)
         vol_sma = last.get("Vol_SMA_20", np.nan)
-        if not pd.isna(vol_sma) and vol_sma > 0 and vol >= 1.25 * vol_sma:
+        if (
+            MomentumQuality.finite_number(vol_sma) is not None
+            and MomentumQuality.finite_number(vol) is not None
+            and vol_sma > 0 and vol >= 1.25 * vol_sma
+        ):
             passed_rules.append("BUY_09")
         else:
             failed_rules.append("BUY_09:Volume")
@@ -4154,6 +4434,22 @@ class HardBuyRules:
         else:
             failed_rules.append("BUY_10:Penny")
 
+        # Diagnose the narrow strategy without silently loosening the BUY gate.
+        # These labels are descriptive; alternative archetypes are watch-only
+        # until their own entry/exit and cost assumptions are validated.
+        archetypes = []
+        trend = "BUY_01" in passed_rules and "BUY_02" in passed_rules
+        breakout = "BUY_03" in passed_rules
+        recent_cross = "BUY_05" in passed_rules
+        if trend and breakout:
+            archetypes.append("FRESH_CROSS_BREAKOUT" if recent_cross else "TREND_CONTINUATION_BREAKOUT")
+        sma20 = MomentumQuality.finite_number(last.get("SMA_20"))
+        atr = MomentumQuality.finite_number(last.get("ATR_14"))
+        if trend and not breakout and sma20 is not None and atr is not None and atr > 0:
+            if abs(close - sma20) <= 2 * atr:
+                archetypes.append("TREND_PULLBACK")
+        if not trend and not pd.isna(sma50) and close > sma50 and "BUY_02" in passed_rules:
+            archetypes.append("EARLY_TREND_REVERSAL")
         return {
             "ticker": ticker,
             "price": close,
@@ -4161,6 +4457,11 @@ class HardBuyRules:
             "rules_failed": len(failed_rules),
             "passed_rules": passed_rules,
             "failed_rules": failed_rules,
+            "rule_results": {f"BUY_{i:02d}": f"BUY_{i:02d}" in passed_rules for i in range(1, 11)},
+            "setup_archetype": archetypes[0] if archetypes else "NO_DEFINED_SETUP",
+            "setup_archetypes": archetypes,
+            "strategy_gate": "strict_10_rule_breakout",
+            "strict_policy_excluded": len(failed_rules) > 0,
             "rsi_14": rsi if not pd.isna(rsi) else None,
             "macd_histogram": macd_hist if not pd.isna(macd_hist) else None,
             "volume_ratio": last.get("Volume_Ratio", np.nan),
@@ -4173,129 +4474,30 @@ class HardBuyRules:
     def _evaluate(
         ticker: str, df: pd.DataFrame
     ) -> Tuple[bool, str, List[str]]:
-        """
-        Evaluate all 10 hard buy rules on the most recent row.
-        Returns (passed_all, failing_rule_name, flags_list).
-        """
-        flags = []
+        """One rule evaluator drives admission and the report diagnostics."""
+        result = HardBuyRules._evaluate_all_rules(ticker, df)
+        if result is None:
+            return False, "BUY_DATA: Required data unavailable", []
+        if result["failed_rules"]:
+            return False, result["failed_rules"][0], []
         last = df.iloc[-1]
-        close = last["Close"]
-
-        # ── BUY_01: Trend Filter ─────────────────────────────────────
-        # Close > SMA(200) AND SMA(50) > SMA(200)
-        sma50 = last.get("SMA_50", np.nan)
-        sma200 = last.get("SMA_200", np.nan)
-        if pd.isna(sma50) or pd.isna(sma200):
-            return False, "BUY_01: SMA data unavailable", flags
-        if not (close > sma200 and sma50 > sma200):
-            return False, "BUY_01: Trend Filter failed", flags
-
-        # ── BUY_02: 50-Day MA Bullish Slope ──────────────────────────
-        # SMA(50) today > SMA(50) 5 sessions ago
-        if len(df) < 6:
-            return False, "BUY_02: Insufficient data", flags
-        sma50_5ago = df["SMA_50"].iloc[-6]
-        if pd.isna(sma50_5ago) or sma50 <= sma50_5ago:
-            return False, "BUY_02: SMA(50) slope not positive", flags
-
-        # ── BUY_03: Bollinger Breakout OR 20-Day High Close ──────────
-        bb_upper = last.get("BB_upper", np.nan)
-        high_close_20 = last.get("High_Close_20", np.nan)
-        bb_break = not pd.isna(bb_upper) and close > bb_upper
-        high_20_break = not pd.isna(high_close_20) and close >= high_close_20
-
-        if not (bb_break or high_20_break):
-            return False, "BUY_03: No BB breakout or 20d high", flags
-
-        # Flag marginal BB break
-        if bb_break and not pd.isna(bb_upper) and bb_upper > 0:
-            margin = (close - bb_upper) / bb_upper
-            if margin < 0.001:
+        close = float(last["Close"])
+        flags = []
+        bb_upper = MomentumQuality.finite_number(last.get("BB_upper"))
+        if bb_upper is not None and bb_upper > 0 and close > bb_upper:
+            if (close - bb_upper) / bb_upper < 0.001:
                 flags.append("MARGINAL_BB_BREAK")
-
-        # ── BUY_04: MACD Bullish ─────────────────────────────────────
-        macd_line = last.get("MACD_line", np.nan)
-        macd_signal = last.get("MACD_signal", np.nan)
-        macd_hist = last.get("MACD_histogram", np.nan)
-        if pd.isna(macd_line) or pd.isna(macd_signal) or pd.isna(macd_hist):
-            return False, "BUY_04: MACD data unavailable", flags
-        if not (macd_line > macd_signal and macd_hist > 0):
-            return False, "BUY_04: MACD not bullish", flags
-
-        # Flag weak MACD on a price-normalized basis; a raw $0.01 histogram
-        # means something entirely different on a $5 and a $500 security.
-        macd_hist_pct = last.get("MACD_hist_pct", np.nan)
-        if (
-            not pd.isna(macd_hist_pct)
-            and 0 < macd_hist_pct < 0.0005
-        ):
+        histogram = MomentumQuality.finite_number(last.get("MACD_hist_pct"))
+        if histogram is not None and 0 < histogram < 0.0005:
             flags.append("WEAK_MACD")
-
-        # ── BUY_05: Short-Term MA Crossover (10/30 within 5 sessions) ─
-        sma10_today = last.get("SMA_10", np.nan)
-        sma30_today = last.get("SMA_30", np.nan)
-        if pd.isna(sma10_today) or pd.isna(sma30_today):
-            return False, "BUY_05: SMA(10)/SMA(30) data unavailable", flags
-
-        if sma10_today <= sma30_today:
-            return False, "BUY_05: SMA(10) not above SMA(30)", flags
-
-        # Check if crossover happened within last 5 sessions
-        crossover_recent = False
-        for lookback in [1, 2, 3, 4, 5]:
-            if len(df) > lookback:
-                prev_sma10 = df["SMA_10"].iloc[-(lookback + 1)]
-                prev_sma30 = df["SMA_30"].iloc[-(lookback + 1)]
-                if not pd.isna(prev_sma10) and not pd.isna(prev_sma30):
-                    if prev_sma10 <= prev_sma30:
-                        crossover_recent = True
-                        break
-
-        if not crossover_recent:
-            return False, "BUY_05: Crossover not within last 5 sessions", flags
-
-        # Flag tight crossover
-        if sma30_today > 0 and abs(sma10_today - sma30_today) / sma30_today < 0.005:
-            flags.append("TIGHT_CROSSOVER")
-
-        # ── BUY_06: VWAP Confirmation ────────────────────────────────
-        vwap = last.get("VWAP", np.nan)
-        if pd.isna(vwap):
-            # Fallback: use previous session VWAP
-            if len(df) >= 2:
-                prev = df.iloc[-2]
-                vwap = (prev["High"] + prev["Low"] + prev["Close"]) / 3
-        if pd.isna(vwap) or close <= vwap:
-            return False, "BUY_06: Price below VWAP", flags
-
-        # ── BUY_07: EMA Stack ────────────────────────────────────────
-        ema20 = last.get("EMA_20", np.nan)
-        ema50 = last.get("EMA_50", np.nan)
-        if pd.isna(ema20) or pd.isna(ema50) or ema20 <= ema50:
-            return False, "BUY_07: EMA(20) not above EMA(50)", flags
-
-        # ── BUY_08: RSI Sweet Spot ───────────────────────────────────
-        rsi = last.get("RSI_14", np.nan)
-        if pd.isna(rsi) or not (40 <= rsi <= 70):
-            return False, "BUY_08: RSI outside 40-70 range", flags
-
-        # ── BUY_09: Volume Surge ─────────────────────────────────────
-        vol = last["Volume"]
-        vol_sma20 = last.get("Vol_SMA_20", np.nan)
-        if pd.isna(vol_sma20) or vol_sma20 == 0:
-            return False, "BUY_09: Volume SMA unavailable", flags
-        if vol < 1.25 * vol_sma20:
-            return False, "BUY_09: Volume below 1.25x average", flags
-
-        # Flag volume spike with no price move
-        ret_1d = last.get("Return_1d", np.nan)
-        if not pd.isna(ret_1d) and abs(ret_1d) < 0.005:
+        sma10 = MomentumQuality.finite_number(last.get("SMA_10"))
+        sma30 = MomentumQuality.finite_number(last.get("SMA_30"))
+        if sma10 is not None and sma30 is not None and sma30 > 0:
+            if abs(sma10 - sma30) / sma30 < 0.005:
+                flags.append("TIGHT_CROSSOVER")
+        ret_1d = MomentumQuality.finite_number(last.get("Return_1d"))
+        if ret_1d is not None and abs(ret_1d) < 0.005:
             flags.append("VOLUME_SPIKE_NO_MOVE")
-
-        # ── BUY_10: No Penny Stocks ──────────────────────────────────
-        if close < 5.0:
-            return False, "BUY_10: Penny stock", flags
-
         return True, "", flags
 
 
@@ -4349,6 +4551,12 @@ class MLRanker:
         self.training_tickers_: np.ndarray = np.array([], dtype=object)
         self.validation_metrics: Dict[str, Dict[str, Any]] = {}
         self.probabilities_calibrated: bool = False
+        self.active_models: List[str] = []
+        self.model_probabilities_calibrated: bool = False
+        self.ensemble_validation_metrics: Dict[str, Any] = {}
+        self._oof_by_model: Dict[str, Dict[str, np.ndarray]] = {}
+        self._current_raw_by_model: Dict[str, np.ndarray] = {}
+        self.model_specs: Dict[str, Dict[str, Any]] = {}
 
     def _finalize_feature_importances(self) -> None:
         """Average the per-model importances into the reported blend."""
@@ -4381,11 +4589,23 @@ class MLRanker:
         """
         log.info(f"STAGE 4: ML Ranking -- {len(survivors)} survivors")
 
+        self.degraded_models = []
+        self.validation_metrics = {}
+        self.active_models = []
+        self.probabilities_calibrated = False
+        self.model_probabilities_calibrated = False
+        self.ensemble_validation_metrics = {}
+        self._oof_by_model = {}
+        self._current_raw_by_model = {}
+        self.model_specs = {}
+        self._importances_by_model = {}
+        self.feature_importances = {}
+
         if len(survivors) < 1:
             return survivors
 
         # Build training dataset from broad universe; score the survivors.
-        train_pool = training_universe if training_universe else all_data
+        train_pool = training_universe if training_universe is not None else all_data
         X_train, y_train, X_current, current_tickers = self._build_dataset(
             survivors, all_data, train_pool
         )
@@ -4403,6 +4623,7 @@ class MLRanker:
                 s["ml_score_xgb"] = 0.5
                 s["ml_score_rf"] = 0.5
                 s["ml_ensemble_score"] = 0.5
+                self._assign_probability_context(s, {})
                 s["lstm_score"] = None
                 flags = s.setdefault("flags", [])
                 if isinstance(flags, list):
@@ -4463,7 +4684,8 @@ class MLRanker:
             for label in ("XGBoost", "RandomForest")
             if label not in self.degraded_models
         ]
-        self.probabilities_calibrated = bool(
+        self.active_models = active_models
+        self.model_probabilities_calibrated = bool(
             active_models
             and all(
                 (self.validation_metrics.get(label) or {}).get("calibrated")
@@ -4471,8 +4693,50 @@ class MLRanker:
             )
         )
 
-        # Ensemble
-        ensemble_scores = (xgb_scores + rf_scores) / 2
+        # A failed model contributes no evidence: do not average its 0.5
+        # placeholder into an otherwise usable probability. Validate the exact
+        # combined forecaster on aligned, historical OOF rows before calling
+        # the ensemble calibrated.
+        available_scores = {
+            "XGBoost": xgb_scores, "RandomForest": rf_scores
+        }
+        ensemble_scores = (
+            np.mean([available_scores[name] for name in active_models], axis=0)
+            if active_models else np.full(len(X_current), 0.5)
+        )
+        if len(active_models) == 1:
+            self.ensemble_validation_metrics = dict(
+                self.validation_metrics.get(active_models[0]) or {}
+            )
+            self.ensemble_validation_metrics["source"] = active_models[0]
+        elif len(active_models) == 2 and all(
+            name in self._oof_by_model and name in self._current_raw_by_model
+            for name in active_models
+        ):
+            first, second = [self._oof_by_model[name] for name in active_models]
+            common, left, right = np.intersect1d(
+                first["indices"], second["indices"], return_indices=True
+            )
+            if len(common) and np.array_equal(
+                first["labels"][left], second["labels"][right]
+            ) and np.array_equal(first["dates"][left], second["dates"][right]):
+                raw_oof = (first["probabilities"][left] + second["probabilities"][right]) / 2
+                raw_current = np.mean(
+                    [self._current_raw_by_model[name] for name in active_models], axis=0
+                )
+                ensemble_scores = self._calibrate_probabilities(
+                    "Ensemble", [raw_oof], [first["labels"][left]],
+                    raw_current, [first["dates"][left]],
+                )
+                self.ensemble_validation_metrics = dict(
+                    self.validation_metrics.get("Ensemble") or {}
+                )
+                if self.ensemble_validation_metrics.get("validation_status") != "passed":
+                    ensemble_scores[:] = 0.5
+        self.probabilities_calibrated = bool(
+            self.ensemble_validation_metrics.get("validation_status") == "passed"
+            and self.ensemble_validation_metrics.get("calibrated")
+        )
 
         # Check score spread
         spread = ensemble_scores.max() - ensemble_scores.min()
@@ -4520,6 +4784,7 @@ class MLRanker:
                 s["ml_score_xgb"] = 0.5
                 s["ml_score_rf"] = 0.5
                 s["ml_ensemble_score"] = 0.5
+            self._assign_probability_context(s, self.ensemble_validation_metrics)
             s["lstm_score"] = (
                 lstm_scores.get(s["ticker"]) if lstm_scores else None
             )
@@ -4541,6 +4806,30 @@ class MLRanker:
 
         log.info("STAGE 4 COMPLETE: ML scores assigned")
         return survivors
+
+    def _assign_probability_context(self, candidate: Dict, metrics: Dict) -> None:
+        """Keep an unavailable 0.5 sentinel distinct from predictive evidence."""
+        usable = bool(
+            metrics.get("validation_status") == "passed"
+            and metrics.get("calibrated")
+        )
+        reference = metrics.get("reference_base_rate") if usable else None
+        probability = candidate.get("ml_ensemble_score")
+        lift = (
+            float(probability) - float(reference)
+            if usable and reference is not None and np.isfinite(probability)
+            else None
+        )
+        candidate["ml_probability_usable"] = usable and lift is not None
+        candidate["ml_probability_calibrated"] = bool(usable)
+        candidate["ml_reference_base_rate"] = reference
+        candidate["ml_probability_lift"] = lift
+        candidate["ml_active_models"] = list(self.active_models)
+        candidate["ml_target_definition"] = (
+            f"next-session open to session +{HOLDING_HORIZON_DAYS} close "
+            f"return > {ML_TARGET_RETURN:.1%}; excludes strategy exits and costs"
+        )
+        candidate["ml_realized_trade_profitability_validated"] = False
 
     @staticmethod
     def _cap_training_rows(
@@ -4693,21 +4982,10 @@ class MLRanker:
                 if splits:
                     return splits
 
-        # Synthetic/unit-test compatibility when callers provide no dates.
-        try:
-            splitter = TimeSeriesSplit(
-                n_splits=n_splits, gap=purge_sessions
-            )
-            return list(splitter.split(np.arange(n_rows)))
-        except (TypeError, ValueError):
-            splitter = TimeSeriesSplit(n_splits=n_splits)
-            out = []
-            for train_idx, val_idx in splitter.split(np.arange(n_rows)):
-                if len(train_idx) > purge_sessions:
-                    train_idx = train_idx[:-purge_sessions]
-                if len(train_idx):
-                    out.append((train_idx, val_idx))
-            return out
+        # A panel row is not a trading session. Insufficient real history or
+        # missing date metadata means validation is unavailable, never that a
+        # row-based fallback is safe.
+        return []
 
     def _calibrate_probabilities(
         self,
@@ -4715,21 +4993,28 @@ class MLRanker:
         oof_probabilities: List[np.ndarray],
         oof_labels: List[np.ndarray],
         current_probabilities: np.ndarray,
+        oof_dates: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
         """Platt-calibrate on historical OOF predictions and report skill."""
-        if not oof_probabilities or not oof_labels:
+        if not oof_probabilities or not oof_labels or not oof_dates:
             self.validation_metrics[label] = {
                 "validation_status": "unavailable",
                 "calibrated": False,
-                "reason": "no usable walk-forward folds",
+                "reason": "no usable date-stamped walk-forward predictions",
             }
             return np.asarray(current_probabilities, dtype=float)
 
         probs = np.concatenate(oof_probabilities).astype(float)
         labels = np.concatenate(oof_labels).astype(int)
-        finite = np.isfinite(probs) & np.isfinite(labels)
+        dates = np.concatenate(oof_dates).astype("datetime64[ns]")
+        if len(dates) != len(probs) or len(labels) != len(probs):
+            raise _ModelDegradedError("unaligned calibration dates/predictions/labels")
+        finite = np.isfinite(probs) & np.isfinite(labels) & ~np.isnat(dates)
         probs = np.clip(probs[finite], 1e-6, 1 - 1e-6)
         labels = labels[finite]
+        dates = dates[finite]
+        order = np.argsort(dates, kind="stable")
+        probs, labels, dates = probs[order], labels[order], dates[order]
         if len(probs) < 200 or np.unique(labels).size < 2:
             self.validation_metrics[label] = {
                 "validation_status": "unavailable",
@@ -4739,10 +5024,24 @@ class MLRanker:
             }
             return np.asarray(current_probabilities, dtype=float)
 
-        split = max(int(len(probs) * 0.70), 100)
-        split = min(split, len(probs) - 50)
-        fit_probs, fit_labels = probs[:split], labels[:split]
-        eval_probs, eval_labels = probs[split:], labels[split:]
+        unique_dates = np.unique(dates)
+        split = int(len(unique_dates) * 0.70)
+        # Keep whole signal dates together and exclude calibration labels whose
+        # outcome windows overlap the evaluation period. Thousands of panel
+        # rows on one day do not create thousands of independent observations.
+        fit_end = split - HOLDING_HORIZON_DAYS
+        if fit_end < 20 or len(unique_dates) - split < 20:
+            self.validation_metrics[label] = {
+                "validation_status": "unavailable", "calibrated": False,
+                "oof_samples": int(len(probs)),
+                "oof_sessions": int(len(unique_dates)),
+                "reason": "insufficient sessions for purged calibration/evaluation",
+            }
+            return np.asarray(current_probabilities, dtype=float)
+        fit_mask = dates < unique_dates[fit_end]
+        eval_mask = dates >= unique_dates[split]
+        fit_probs, fit_labels = probs[fit_mask], labels[fit_mask]
+        eval_probs, eval_labels = probs[eval_mask], labels[eval_mask]
         if (
             np.unique(fit_labels).size < 2
             or np.unique(eval_labels).size < 2
@@ -4775,7 +5074,16 @@ class MLRanker:
             "calibrated": True,
             "oof_samples": int(len(probs)),
             "evaluation_samples": int(len(eval_labels)),
-            "base_rate": round(float(eval_labels.mean()), 6),
+            "oof_sessions": int(len(unique_dates)),
+            "calibration_sessions": int(len(np.unique(dates[fit_mask]))),
+            "evaluation_sessions": int(len(np.unique(dates[eval_mask]))),
+            "purge_sessions": HOLDING_HORIZON_DAYS,
+            "calibration_last_signal_date": str(dates[fit_mask].max())[:10],
+            "evaluation_first_signal_date": str(dates[eval_mask].min())[:10],
+            "reference_base_rate": round(float(labels.mean()), 6),
+            "evaluation_baseline_base_rate": round(base_rate, 6),
+            "evaluation_base_rate": round(float(eval_labels.mean()), 6),
+            "base_rate": round(base_rate, 6),
             "roc_auc": round(auc, 6),
             "balanced_accuracy": round(
                 float(
@@ -4792,6 +5100,9 @@ class MLRanker:
                 float(log_loss(eval_labels, calibrated_eval, labels=[0, 1])),
                 6,
             ),
+            "realized_trade_profitability_validated": False,
+            "validation_target": "20-session endpoint >5%; excludes exits, costs, and point-in-time events",
+            "sampling_limitation": "overlapping outcomes and correlated securities; rows are not independent trials",
         }
         self.validation_metrics[label] = metrics
         log.info(
@@ -4868,7 +5179,14 @@ class MLRanker:
         result so that no single model can abort the whole scan.
         """
         try:
-            return trainer(X_train, y_train, X_current)
+            scores = np.asarray(trainer(X_train, y_train, X_current), dtype=float)
+            if (
+                scores.ndim != 1 or len(scores) != len(X_current)
+                or not np.isfinite(scores).all()
+                or (scores < 0).any() or (scores > 1).any()
+            ):
+                raise _ModelDegradedError("invalid model score shape or probability values")
+            return scores
         except _ModelDegradedError as exc:
             log.warning(
                 f"  {label} skipped ({exc}) -- scoring every survivor "
@@ -4935,7 +5253,7 @@ class MLRanker:
             # the horizon close; using close[t] as entry gives the model a fill
             # that was already gone when this script issued the signal.
             horizon = HOLDING_HORIZON_DAYS
-            fwd_ret = close.shift(-horizon) / entry_open.shift(-1) - 1
+            fwd_ret = self._forward_session_returns(df, horizon)
             label = pd.Series(
                 np.where(
                     fwd_ret.notna(),
@@ -4945,12 +5263,12 @@ class MLRanker:
                 index=df.index,
             )
 
-            train_section = feat_df.iloc[:-horizon]
-            label_section = label.iloc[:-horizon]
+            train_section = feat_df
+            label_section = label
             eligible_section = (
                 (close >= 5.0) &
                 (avg_dv >= ExecutionGuards.MIN_DOLLAR_VOLUME)
-            ).iloc[:-horizon].fillna(False)
+            ).fillna(False)
 
             valid = train_section.loc[eligible_section].dropna()
             valid_labels = label_section.loc[valid.index].dropna()
@@ -4978,8 +5296,10 @@ class MLRanker:
                 feat_df = df[self.FEATURE_COLS].copy()
             except KeyError:
                 continue
+            if feat_df.empty:
+                continue
             current_feat = feat_df.iloc[-1].values
-            if not np.any(np.isnan(current_feat)):
+            if np.isfinite(current_feat).all():
                 current_rows.append(current_feat)
                 current_tickers.append(ticker)
 
@@ -5023,6 +5343,33 @@ class MLRanker:
 
         return X_train, y_train, X_current, current_tickers
 
+    @staticmethod
+    def _forward_session_returns(df: pd.DataFrame, horizon: int) -> pd.Series:
+        """Use exact XNYS entry/exit sessions, not the next available bars.
+
+        Missing stock bars must not shift an endpoint beyond the validation
+        purge, or manufacture a later entry fill. An absent exact entry open
+        or horizon close leaves the historical outcome unknown.
+        """
+        if df.empty:
+            return pd.Series(index=df.index, dtype=float)
+        signal_days = pd.DatetimeIndex(pd.to_datetime(df.index)).tz_localize(None).normalize()
+        calendar_first = pd.Timestamp(XNYS_CALENDAR.first_session).tz_localize(None).normalize()
+        calendar_last = pd.Timestamp(XNYS_CALENDAR.last_session).tz_localize(None).normalize()
+        start, end = max(signal_days.min(), calendar_first), min(signal_days.max(), calendar_last)
+        if start > end:
+            return pd.Series(np.nan, index=df.index, dtype=float)
+        sessions = XNYS_CALENDAR.sessions_in_range(start, end)
+        sessions = pd.DatetimeIndex(sessions).tz_localize(None).normalize()
+        prices = df[["Open", "Close"]].copy()
+        prices.index = signal_days
+        prices = prices.reindex(sessions)
+        entry = prices["Open"].shift(-1)
+        outcome = prices["Close"].shift(-horizon) / entry.where(entry > 0) - 1.0
+        result = outcome.reindex(signal_days)
+        result.index = df.index
+        return result.replace([np.inf, -np.inf], np.nan)
+
     def _train_xgboost(
         self, X_train: np.ndarray, y_train: np.ndarray, X_current: np.ndarray
     ) -> np.ndarray:
@@ -5040,11 +5387,17 @@ class MLRanker:
 
         scale_pos_weight = self._scale_pos_weight(y_train)
         model = xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
+            # Fixed regularized specification: OOF calibration and the final
+            # model must describe the same estimator. Choosing a replacement
+            # after inspecting evaluation accuracy invalidates that evidence.
+            n_estimators=150,
+            max_depth=4,
+            learning_rate=0.03,
+            subsample=0.7,
+            colsample_bytree=0.6,
+            reg_alpha=1.0,
+            reg_lambda=2.0,
+            n_jobs=max(1, min(4, os.cpu_count() or 1)),
             eval_metric="logloss",
             scale_pos_weight=scale_pos_weight,
             random_state=42,
@@ -5060,6 +5413,8 @@ class MLRanker:
         train_accs = []
         oof_probabilities: List[np.ndarray] = []
         oof_labels: List[np.ndarray] = []
+        oof_indices: List[np.ndarray] = []
+        oof_dates: List[np.ndarray] = []
         skipped_folds = 0
         for train_idx, val_idx in splits:
             if np.unique(y_train[train_idx]).size < 2:
@@ -5079,6 +5434,8 @@ class MLRanker:
             )
             oof_probabilities.append(val_prob)
             oof_labels.append(y_train[val_idx].astype(int))
+            oof_indices.append(val_idx)
+            oof_dates.append(self.training_dates_[val_idx])
 
         if skipped_folds:
             log.warning(
@@ -5100,28 +5457,16 @@ class MLRanker:
                 "training set without validation accuracy."
             )
 
-        if avg_train > 0.90 and avg_val < 0.60:
-            log.warning(
-                "  XGBoost overfitting detected. Increasing regularization."
-            )
-            model = xgb.XGBClassifier(
-                n_estimators=150,
-                max_depth=4,
-                learning_rate=0.03,
-                subsample=0.7,
-                colsample_bytree=0.6,
-                reg_alpha=1.0,
-                reg_lambda=2.0,
-                eval_metric="logloss",
-                scale_pos_weight=scale_pos_weight,
-                random_state=42,
-                verbosity=0,
-            )
-
         # Final fit on all training data with the full-panel class prior.
         model.set_params(scale_pos_weight=scale_pos_weight)
         model.fit(X_train, y_train)
         self.xgb_model = model
+        self.model_specs["XGBoost"] = {
+            name: model.get_params().get(name) for name in (
+                "n_estimators", "max_depth", "learning_rate", "subsample",
+                "colsample_bytree", "reg_alpha", "reg_lambda", "random_state", "n_jobs",
+            )
+        }
 
         # Feature importances
         self._importances_by_model["xgboost"] = {
@@ -5130,8 +5475,16 @@ class MLRanker:
         }
 
         probs = model.predict_proba(X_current)[:, 1]
+        self._current_raw_by_model["XGBoost"] = probs.copy()
+        if oof_probabilities:
+            self._oof_by_model["XGBoost"] = {
+                "indices": np.concatenate(oof_indices),
+                "dates": np.concatenate(oof_dates),
+                "labels": np.concatenate(oof_labels),
+                "probabilities": np.concatenate(oof_probabilities),
+            }
         calibrated = self._calibrate_probabilities(
-            "XGBoost", oof_probabilities, oof_labels, probs
+            "XGBoost", oof_probabilities, oof_labels, probs, oof_dates
         )
         return np.clip(calibrated, 0.0, 1.0)
 
@@ -5164,6 +5517,8 @@ class MLRanker:
         val_balanced_accs = []
         oof_probabilities: List[np.ndarray] = []
         oof_labels: List[np.ndarray] = []
+        oof_indices: List[np.ndarray] = []
+        oof_dates: List[np.ndarray] = []
         skipped_folds = 0
         for train_idx, val_idx in splits:
             if np.unique(y_train[train_idx]).size < 2:
@@ -5178,6 +5533,8 @@ class MLRanker:
             )
             oof_probabilities.append(val_prob)
             oof_labels.append(y_train[val_idx].astype(int))
+            oof_indices.append(val_idx)
+            oof_dates.append(self.training_dates_[val_idx])
 
         if skipped_folds:
             log.warning(
@@ -5198,6 +5555,11 @@ class MLRanker:
         # Final fit
         model.fit(X_train, y_train)
         self.rf_model = model
+        self.model_specs["RandomForest"] = {
+            name: model.get_params().get(name) for name in (
+                "n_estimators", "max_depth", "min_samples_leaf", "class_weight", "random_state", "n_jobs",
+            )
+        }
 
         # Merge feature importances
         self._importances_by_model["random_forest"] = {
@@ -5206,8 +5568,16 @@ class MLRanker:
         }
 
         probs = model.predict_proba(X_current)[:, 1]
+        self._current_raw_by_model["RandomForest"] = probs.copy()
+        if oof_probabilities:
+            self._oof_by_model["RandomForest"] = {
+                "indices": np.concatenate(oof_indices),
+                "dates": np.concatenate(oof_dates),
+                "labels": np.concatenate(oof_labels),
+                "probabilities": np.concatenate(oof_probabilities),
+            }
         calibrated = self._calibrate_probabilities(
-            "RandomForest", oof_probabilities, oof_labels, probs
+            "RandomForest", oof_probabilities, oof_labels, probs, oof_dates
         )
         return np.clip(calibrated, 0.0, 1.0)
 
@@ -5255,8 +5625,7 @@ class MLRanker:
 
             # Forward return labels on the same horizon/threshold as the
             # tree ensemble so all three models optimise the same objective.
-            entry_open = df["Open"].shift(-1)
-            fwd_ret = close.shift(-HOLDING_HORIZON_DAYS) / entry_open - 1
+            fwd_ret = self._forward_session_returns(df, HOLDING_HORIZON_DAYS)
             labels = pd.Series(
                 np.where(
                     fwd_ret.notna(),
@@ -5268,7 +5637,9 @@ class MLRanker:
 
             # Build sequences for training
             for i in range(SEQ_LEN, len(values) - HOLDING_HORIZON_DAYS):
-                seq = values[i - SEQ_LEN : i]
+                # labels[i] starts at open[i+1], so its feature sequence must
+                # include the signal close at i, exactly as current inference.
+                seq = values[i - SEQ_LEN + 1 : i + 1]
                 if not np.any(np.isnan(seq)) and not pd.isna(labels.iloc[i]):
                     train_X.append(seq)
                     train_y.append(labels.iloc[i])
@@ -5401,6 +5772,39 @@ class FundamentalsFetcher:
         "net-share-purchase-activity",
         "insider-transactions",
     )
+    SCORING_FIELDS = (
+        "earnings_growth", "revenue_growth", "return_on_equity",
+        "debt_to_equity", "free_cash_flow", "peg_ratio",
+        "shares_float", "inst_ownership_pct", "analyst_count",
+    )
+    CORE_SCORING_FIELDS = SCORING_FIELDS[:5]
+    FUND_QUOTE_TYPES = {"ETF", "ETP", "ETN", "MUTUALFUND"}
+
+    @staticmethod
+    def _ratio(value: Any, percent_points: bool = False) -> Any:
+        """Provider-specific units, never guess from the value's magnitude."""
+        scalar = normalize_api_scalar(value)
+        if isinstance(scalar, str) and scalar.endswith("%"):
+            number = MomentumQuality.finite_number(scalar[:-1])
+            return np.nan if number is None else number / 100.0
+        number = MomentumQuality.finite_number(value)
+        return np.nan if number is None else number / 100.0 if percent_points else number
+
+    @classmethod
+    def _coverage(cls, info: Dict) -> float:
+        if str(info.get("quote_type") or "").upper() in cls.FUND_QUOTE_TYPES:
+            return 1.0  # Corporate financial ratios do not apply to funds.
+        return sum(MomentumQuality.finite_number(info.get(k)) is not None for k in cls.SCORING_FIELDS) / len(cls.SCORING_FIELDS)
+
+    @classmethod
+    def instrument_risk_flags(cls, info: Dict) -> List[str]:
+        """Only explicit verified fund descriptions establish product risk."""
+        if str(info.get("quote_type") or "").upper() not in cls.FUND_QUOTE_TYPES:
+            return []
+        name = str(info.get("name") or "")
+        if re.search(r"\b(?:[2-9]x|ultra(?:pro|short)?|inverse|leveraged)\b", name, re.I):
+            return ["DAILY_RESET_LEVERAGE_RISK"]
+        return []
 
     def __init__(self, massive_key: str):
         self.massive_key = massive_key or MASSIVE_API_KEY
@@ -5438,7 +5842,7 @@ class FundamentalsFetcher:
                     if MBOUM_API_KEY and ProviderCircuit.get("MBOUM-fundamentals").available():
                         modules = self.mboum.get_modules(
                             ticker,
-                            list(self.CORE_MODULES) + list(self.INSIDER_MODULES),
+                            list(self.CORE_MODULES) + list(self.INSIDER_MODULES) + ["price"],
                         )
                 except ProviderExhausted:
                     modules = {}
@@ -5446,6 +5850,7 @@ class FundamentalsFetcher:
                 fin = modules.get("financial-data", {})
                 stats = modules.get("default-key-statistics", {})
                 profile = modules.get("asset-profile", {})
+                price_module = modules.get("price", {})
                 cal = modules.get("calendar-events", {})
                 missing_modules = [
                     m for m in self.CORE_MODULES
@@ -5468,12 +5873,14 @@ class FundamentalsFetcher:
 
                 info = {
                     "name": normalize_api_scalar(
-                        profile.get("longName", profile.get("shortName", ticker))
+                        price_module.get("longName") or price_module.get("shortName")
+                        or profile.get("longName") or profile.get("shortName") or ticker
                     ),
                     "sector": normalize_api_scalar(profile.get("sector", "Unknown")),
                     "industry": normalize_api_scalar(profile.get("industry", "Unknown")),
-                    "quote_type": normalize_api_scalar(profile.get("quoteType")),
-                    "market_cap": _raw(stats, "marketCap"),
+                    "quote_type": normalize_api_scalar(price_module.get("quoteType") or profile.get("quoteType")),
+                    "quote_type_source": "MBOUM" if price_module.get("quoteType") or profile.get("quoteType") else None,
+                    "market_cap": normalize_api_scalar(price_module.get("marketCap") or stats.get("marketCap")),
                     "pe_ratio": _raw(stats, "trailingPE"),
                     "forward_pe": _raw(stats, "forwardPE"),
                     "peg_ratio": _raw(stats, "pegRatio"),
@@ -5481,7 +5888,7 @@ class FundamentalsFetcher:
                     "profit_margin": _raw(stats, "profitMargins"),
                     "revenue_growth": _raw(fin, "revenueGrowth"),
                     "earnings_growth": _raw(fin, "earningsGrowth"),
-                    "debt_to_equity": _raw(fin, "debtToEquity"),
+                    "debt_to_equity": self._ratio(fin.get("debtToEquity"), percent_points=True),
                     "free_cash_flow": _raw(fin, "freeCashflow"),
                     "return_on_equity": _raw(fin, "returnOnEquity"),
                     "52w_high": _raw(stats, "fiftyTwoWeekHigh"),
@@ -5496,14 +5903,16 @@ class FundamentalsFetcher:
                     # short-to-mid-term moves this strategy targets.
                     "short_pct_float": _raw(stats, "shortPercentOfFloat"),
                     "short_ratio": _raw(stats, "shortRatio"),
+                    "short_interest_asof": _raw(stats, "dateShortInterest"),
+                    "earnings_growth_basis": "quarterly_yoy",
+                    "revenue_growth_basis": "quarterly_yoy",
                     "earnings_date": None,
                     "fundamentals_quality": "complete" if not missing_modules else "partial",
                     "missing_fundamental_modules": missing_modules,
                 }
 
-                # Live insider activity. Officers and directors sell for many
-                # reasons but buy for exactly one, so net insider purchasing is
-                # the highest-signal fundamental input on a short horizon.
+                # Insider data is context; routine/planned trades are not
+                # distinguished by these feeds and no predictive claim is made.
                 info.update(
                     FundamentalsFetcher._extract_insider_activity(modules)
                 )
@@ -5511,12 +5920,7 @@ class FundamentalsFetcher:
                 # Extract earnings date from calendar
                 earnings = cal.get("earnings", {})
                 ed_list = earnings.get("earningsDate", [])
-                if ed_list:
-                    ed = ed_list[0] if isinstance(ed_list, list) else ed_list
-                    if isinstance(ed, dict):
-                        info["earnings_date"] = ed.get("fmt")
-                    elif isinstance(ed, str):
-                        info["earnings_date"] = ed
+                info["earnings_date"] = normalize_earnings_date(ed_list)
 
                 # Supplement with Massive metrics (PE, beta, 52w range).
                 # NOTE: previous code passed a literal "{symbol}" template
@@ -5526,7 +5930,7 @@ class FundamentalsFetcher:
                     snap_url = f"https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
                     r = self.massive_session.get(
                         snap_url,
-                        params={"apiKey": MASSIVE_API_KEY},
+                        params={"apiKey": self.massive_key},
                         timeout=15,
                     )
                     if r.status_code == 200:
@@ -5549,7 +5953,8 @@ class FundamentalsFetcher:
                     pass
 
                 for field in numeric_fields:
-                    info[field] = normalize_api_scalar(info.get(field, np.nan))
+                    number = MomentumQuality.finite_number(info.get(field, np.nan))
+                    info[field] = np.nan if number is None else number
 
                 if not isinstance(info.get("name"), str) or is_missing_value(info["name"]):
                     info["name"] = ticker
@@ -5613,27 +6018,18 @@ class FundamentalsFetcher:
         return results
 
     def _needs_fundamental_enrichment(self, info: Dict) -> bool:
-        if info.get("fundamentals_quality") in {"failed", "partial"}:
-            return True
         quote_type = str(info.get("quote_type") or "").upper()
-        if quote_type in {"ETF", "ETP", "MUTUALFUND"}:
+        if quote_type in self.FUND_QUOTE_TYPES:
             return False
         if not isinstance(info.get("sector"), str) or info.get("sector") in {"", "Unknown"}:
             return True
         if is_missing_value(info.get("market_cap")):
             return True
-        scoring_fields = (
-            "earnings_growth",
-            "revenue_growth",
-            "return_on_equity",
-            "debt_to_equity",
-            "free_cash_flow",
-        )
         available = sum(
-            not is_missing_value(info.get(field))
-            for field in scoring_fields
+            MomentumQuality.finite_number(info.get(field)) is not None
+            for field in self.CORE_SCORING_FIELDS
         )
-        if available < 2:
+        if available < 4:
             return True
         return False
 
@@ -5645,17 +6041,31 @@ class FundamentalsFetcher:
             }:
                 continue
             current = dst.get(key)
+            if key in self.SCORING_FIELDS or key in {"market_cap", "short_pct_float", "short_ratio"}:
+                numeric = MomentumQuality.finite_number(value)
+                if numeric is None:
+                    continue
+                value = numeric
+                if MomentumQuality.finite_number(current) is None:
+                    current = np.nan
             if key in {"name", "sector", "industry"}:
-                if not isinstance(current, str) or current in {"", "Unknown"} or is_missing_value(current):
+                if (not isinstance(current, str) or current in {"", "Unknown"}
+                        or is_missing_value(current) or (key == "name" and current == dst.get("ticker"))):
                     if isinstance(value, str) and value and value != "Unknown":
                         dst[key] = value
                 continue
             if is_missing_value(current) and not is_missing_value(value):
                 dst[key] = value
+                if key == "quote_type" and src.get("quote_type_source"):
+                    dst["quote_type_source"] = src["quote_type_source"]
+                if key in {"earnings_growth", "revenue_growth"}:
+                    basis_key = f"{key}_basis"
+                    dst[basis_key] = src.get(basis_key, "unknown")
         return dst
 
     def _enrich_fundamentals(self, ticker: str, info: Dict) -> Dict:
         """Fill missing MBOUM fields from Massive / TwelveData / Finnhub / yfinance."""
+        info["ticker"] = ticker
         sources = list(info.get("fundamentals_sources") or [])
         mboum_complete = (
             info.get("fundamentals_quality") == "complete"
@@ -5664,8 +6074,10 @@ class FundamentalsFetcher:
         if mboum_complete:
             record_data_source_usage("fundamentals", "MBOUM")
             info["fundamentals_sources"] = ["MBOUM"]
+            info["fundamental_data_coverage"] = self._coverage(info)
+            info["instrument_risk_flags"] = self.instrument_risk_flags(info)
             return info
-        if MBOUM_API_KEY and info.get("fundamentals_quality") in {"complete", "partial"}:
+        if MBOUM_API_KEY and any(MomentumQuality.finite_number(info.get(k)) is not None for k in self.SCORING_FIELDS):
             sources.append("MBOUM")
             record_data_source_usage("fundamentals", "MBOUM")
 
@@ -5676,9 +6088,9 @@ class FundamentalsFetcher:
             ("yfinance", self._fundamentals_yfinance),
         )
         for label, fn in enrichers:
-            if not self._needs_fundamental_enrichment(info) and not is_missing_value(
-                info.get("insider_buy_transactions")
-            ):
+            if (not self._needs_fundamental_enrichment(info)
+                    and (str(info.get("quote_type") or "").upper() in self.FUND_QUOTE_TYPES
+                         or not is_missing_value(info.get("insider_buy_transactions")))):
                 break
             try:
                 extra = fn(ticker)
@@ -5707,15 +6119,23 @@ class FundamentalsFetcher:
         if not self._needs_fundamental_enrichment(info):
             info["fundamentals_quality"] = "complete"
             info["missing_fundamental_modules"] = []
-        elif info.get("fundamentals_quality") == "failed" and sources:
+        elif sources or any(MomentumQuality.finite_number(info.get(k)) is not None for k in self.SCORING_FIELDS):
             info["fundamentals_quality"] = "partial"
+        else:
+            info["fundamentals_quality"] = "failed"
+        info["fundamental_data_coverage"] = self._coverage(info)
+        info["instrument_risk_flags"] = self.instrument_risk_flags(info)
+        info["fundamental_ratio_units"] = "decimal_ratio"
+        short_date = self._insider_date(info.get("short_interest_asof"))
+        info["short_interest_asof"] = short_date.isoformat() if short_date else None
         return info
 
     def _fundamentals_massive(self, ticker: str) -> Dict:
-        if not MASSIVE_API_KEY:
+        circuit = ProviderCircuit.get("Massive-fundamentals")
+        if not self.massive_key or not circuit.available():
             return {}
         url = f"https://api.massive.com/v3/reference/tickers/{ticker}"
-        r = self.massive_session.get(url, params={"apiKey": MASSIVE_API_KEY}, timeout=15)
+        r = self.massive_session.get(url, params={"apiKey": self.massive_key}, timeout=15)
         kind = classify_http_error(r.status_code, r.text or "")
         if kind in ("credit", "auth"):
             ProviderCircuit.get("Massive-fundamentals").trip(f"HTTP {r.status_code}")
@@ -5725,8 +6145,12 @@ class FundamentalsFetcher:
         results = (r.json() or {}).get("results") or {}
         if not isinstance(results, dict):
             return {}
+        kind = str(results.get("type") or "").upper()
+        quote_type = kind if kind in self.FUND_QUOTE_TYPES else "EQUITY" if kind in {"CS", "ADRC", "REIT"} else None
         return {
             "name": results.get("name") or ticker,
+            "quote_type": quote_type,
+            "quote_type_source": "Massive" if quote_type else None,
             "industry": results.get("sic_description") or "Unknown",
             "market_cap": normalize_api_scalar(results.get("market_cap")),
             "shares_outstanding": normalize_api_scalar(
@@ -5747,6 +6171,10 @@ class FundamentalsFetcher:
                 params={"symbol": ticker, "apikey": TWELVEDATA_API_KEY},
                 timeout=15,
             )
+            profile_error = classify_http_error(prof.status_code, prof.text or "")
+            if profile_error in ("credit", "auth"):
+                circuit.trip(f"profile HTTP {prof.status_code}")
+                raise ProviderExhausted("TwelveData", f"profile HTTP {prof.status_code}")
             payload = prof.json() if prof.status_code == 200 else {}
             if payload.get("status") == "error":
                 kind = classify_http_error(
@@ -5760,12 +6188,22 @@ class FundamentalsFetcher:
                 out["name"] = payload.get("name") or ticker
                 out["sector"] = payload.get("sector") or "Unknown"
                 out["industry"] = payload.get("industry") or "Unknown"
+                instrument_type = str(payload.get("type") or "").upper()
+                if instrument_type in self.FUND_QUOTE_TYPES:
+                    out["quote_type"] = instrument_type
+                    out["quote_type_source"] = "TwelveData"
 
+            if not ProviderCircuit.get("TwelveData-statistics").available():
+                return out
             stats_resp = session.get(
                 f"{TWELVEDATA_BASE_URL}/statistics",
                 params={"symbol": ticker, "apikey": TWELVEDATA_API_KEY},
                 timeout=15,
             )
+            stats_error = classify_http_error(stats_resp.status_code, stats_resp.text or "")
+            if stats_error in ("credit", "auth"):
+                ProviderCircuit.get("TwelveData-statistics").trip(f"HTTP {stats_resp.status_code}")
+                return out  # A paid statistics endpoint must not erase profile data.
             stats_payload = stats_resp.json() if stats_resp.status_code == 200 else {}
             if stats_payload.get("status") == "error":
                 kind = classify_http_error(
@@ -5773,8 +6211,8 @@ class FundamentalsFetcher:
                     str(stats_payload.get("message") or ""),
                 )
                 if kind in ("credit", "auth"):
-                    circuit.trip(str(stats_payload.get("message") or ""))
-                    raise ProviderExhausted("TwelveData", str(stats_payload.get("message") or ""))
+                    ProviderCircuit.get("TwelveData-statistics").trip(str(stats_payload.get("message") or ""))
+                    return out
             statistics = stats_payload.get("statistics") or {}
             val = statistics.get("valuations_metrics") or {}
             fin = statistics.get("financials") or {}
@@ -5794,28 +6232,40 @@ class FundamentalsFetcher:
                     inc.get("quarterly_revenue_growth") or inc.get("revenue_growth")
                 ),
                 "earnings_growth": normalize_api_scalar(
-                    inc.get("quarterly_earnings_growth") or inc.get("earnings_growth")
+                    inc.get("quarterly_earnings_growth_yoy")
+                    if inc.get("quarterly_earnings_growth_yoy") is not None
+                    else inc.get("quarterly_earnings_growth") or inc.get("earnings_growth")
                 ),
                 "free_cash_flow": normalize_api_scalar(
-                    cf.get("free_cash_flow") or cf.get("levered_free_cash_flow")
+                    cf.get("levered_free_cash_flow_ttm")
+                    if cf.get("levered_free_cash_flow_ttm") is not None
+                    else cf.get("free_cash_flow") or cf.get("levered_free_cash_flow")
                 ),
-                "debt_to_equity": normalize_api_scalar(bs.get("debt_to_equity")),
+                "debt_to_equity": self._ratio(
+                    bs.get("total_debt_to_equity_mrq")
+                    if bs.get("total_debt_to_equity_mrq") is not None else bs.get("debt_to_equity"),
+                    percent_points=True,
+                ),
                 "shares_outstanding": normalize_api_scalar(stock.get("shares_outstanding")),
                 "shares_float": normalize_api_scalar(stock.get("float_shares")),
                 "avg_volume": normalize_api_scalar(
                     stock.get("avg_90_volume") or stock.get("avg_10_volume")
                 ),
                 "short_ratio": normalize_api_scalar(stock.get("short_ratio")),
-                "short_pct_float": normalize_api_scalar(
-                    stock.get("short_percent_of_shares_outstanding")
-                ),
+                "short_pct_outstanding": normalize_api_scalar(stock.get("short_percent_of_shares_outstanding")),
                 "inst_ownership_pct": normalize_api_scalar(
                     stock.get("percent_held_by_institutions")
                 ),
                 "52w_high": normalize_api_scalar(px.get("fifty_two_week_high")),
                 "52w_low": normalize_api_scalar(px.get("fifty_two_week_low")),
                 "beta": normalize_api_scalar(px.get("beta")),
+                "earnings_growth_basis": "quarterly_yoy",
+                "revenue_growth_basis": "quarterly_yoy",
             })
+            short_shares = MomentumQuality.finite_number(stock.get("shares_short"))
+            float_shares = MomentumQuality.finite_number(stock.get("float_shares"))
+            if short_shares is not None and float_shares is not None and float_shares > 0:
+                out["short_pct_float"] = short_shares / float_shares
             if out:
                 circuit.record_success()
         except ProviderExhausted:
@@ -5831,14 +6281,17 @@ class FundamentalsFetcher:
         session = get_market_router().session
         out: Dict[str, Any] = {}
 
-        def _get(path: str, extra: Optional[Dict] = None) -> Dict:
+        def _get(path: str, extra: Optional[Dict] = None, endpoint_circuit: Optional[ProviderCircuit] = None) -> Dict:
+            endpoint_circuit = endpoint_circuit or circuit
+            if not endpoint_circuit.available():
+                return {}
             params = {"symbol": ticker, "token": FINNHUB_API_KEY}
             if extra:
                 params.update(extra)
             resp = session.get(f"{FINNHUB_BASE_URL}{path}", params=params, timeout=15)
             kind = classify_http_error(resp.status_code, resp.text or "")
             if kind in ("credit", "auth"):
-                circuit.trip(f"{path} HTTP {resp.status_code}")
+                endpoint_circuit.trip(f"{path} HTTP {resp.status_code}")
                 raise ProviderExhausted("Finnhub", f"HTTP {resp.status_code}")
             if resp.status_code != 200:
                 return {}
@@ -5846,16 +6299,7 @@ class FundamentalsFetcher:
             return payload if isinstance(payload, dict) else {}
 
         def _pct(val):
-            num = normalize_api_scalar(val)
-            if is_missing_value(num):
-                return num
-            try:
-                num = float(num)
-            except (TypeError, ValueError):
-                return num
-            if abs(num) > 1.5:
-                return num / 100.0
-            return num
+            return self._ratio(val, percent_points=True)
 
         profile = _get("/stock/profile2")
         if profile:
@@ -5883,56 +6327,50 @@ class FundamentalsFetcher:
                 "52w_high": normalize_api_scalar(metric.get("52WeekHigh")),
                 "52w_low": normalize_api_scalar(metric.get("52WeekLow")),
                 "profit_margin": _pct(metric.get("netProfitMarginTTM")),
-                "revenue_growth": _pct(metric.get("revenueGrowthTTMYoy")),
-                "earnings_growth": _pct(metric.get("epsGrowthTTMYoy")),
+                "revenue_growth": _pct(
+                    metric.get("revenueGrowthQuarterlyYoy")
+                    if metric.get("revenueGrowthQuarterlyYoy") is not None else metric.get("revenueGrowthTTMYoy")
+                ),
+                "earnings_growth": _pct(
+                    metric.get("epsGrowthQuarterlyYoy")
+                    if metric.get("epsGrowthQuarterlyYoy") is not None else metric.get("epsGrowthTTMYoy")
+                ),
                 "return_on_equity": _pct(metric.get("roeTTM")),
+                "debt_to_equity": self._ratio(
+                    metric.get("totalDebt/totalEquityQuarterly")
+                    if metric.get("totalDebt/totalEquityQuarterly") is not None else metric.get("totalDebt/totalEquityAnnual")
+                ),
                 "free_cash_flow": normalize_api_scalar(
                     metric.get("freeCashFlowTTM") or metric.get("freeCashFlowAnnual")
                 ),
                 "short_pct_float": _pct(
-                    metric.get("shortInterestPercentFloat") or metric.get("shortPercentOutstanding")
+                    metric.get("shortInterestPercentFloat")
                 ),
+                "short_pct_outstanding": _pct(metric.get("shortPercentOutstanding")),
                 "short_ratio": normalize_api_scalar(metric.get("shortRatio")),
+                "earnings_growth_basis": "quarterly_yoy" if metric.get("epsGrowthQuarterlyYoy") is not None else "ttm_yoy",
+                "revenue_growth_basis": "quarterly_yoy" if metric.get("revenueGrowthQuarterlyYoy") is not None else "ttm_yoy",
             })
 
-        insider = _get("/stock/insider-transactions")
+        try:
+            insider = _get("/stock/insider-transactions", endpoint_circuit=ProviderCircuit.get("Finnhub-insider"))
+        except ProviderExhausted:
+            insider = {}
+            out["insider_feed_status"] = "plan_unavailable"
+        except Exception:
+            insider = {}
+            out["insider_feed_status"] = "unavailable"
+            ProviderCircuit.get("Finnhub-insider").record_failure("insider request failed")
         rows = insider.get("data") if isinstance(insider, dict) else None
-        if isinstance(rows, list) and rows:
-            buys = sells = 0
-            net_shares = 0.0
-            cutoff = today_et() - timedelta(days=183)
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                tx_date = row.get("transactionDate") or row.get("filingDate")
-                try:
-                    if pd.Timestamp(tx_date).date() < cutoff:
-                        continue
-                except Exception:
-                    # Without a date this cannot support a current-conviction
-                    # claim, so do not count it.
-                    continue
-                code = str(row.get("transactionCode") or "").upper()
-                change = normalize_api_scalar(row.get("change"))
-                if code == "P":
-                    buys += 1
-                    if not is_missing_value(change):
-                        net_shares += abs(float(change))
-                elif code == "S":
-                    sells += 1
-                    if not is_missing_value(change):
-                        net_shares -= abs(float(change))
-            if buys or sells:
-                out["insider_buy_transactions"] = float(buys)
-                out["insider_sell_transactions"] = float(sells)
-                out["insider_net_shares"] = net_shares
+        if isinstance(rows, list):
+            out.update(self._summarize_insider_transactions(rows))
         if out:
             circuit.record_success()
         return out
 
     def _fundamentals_yfinance(self, ticker: str) -> Dict:
         try:
-            tk = yf.Ticker(ticker)
+            tk = yf.Ticker(provider_symbol(ticker, "yfinance"))
             raw = tk.info or {}
         except Exception:
             return {}
@@ -5940,6 +6378,8 @@ class FundamentalsFetcher:
             return {}
         out = {
             "name": raw.get("longName") or raw.get("shortName") or ticker,
+            "quote_type": raw.get("quoteType"),
+            "quote_type_source": "yfinance" if raw.get("quoteType") else None,
             "sector": raw.get("sector") or "Unknown",
             "industry": raw.get("industry") or "Unknown",
             "market_cap": normalize_api_scalar(raw.get("marketCap")),
@@ -5950,7 +6390,7 @@ class FundamentalsFetcher:
             "profit_margin": normalize_api_scalar(raw.get("profitMargins")),
             "revenue_growth": normalize_api_scalar(raw.get("revenueGrowth")),
             "earnings_growth": normalize_api_scalar(raw.get("earningsGrowth")),
-            "debt_to_equity": normalize_api_scalar(raw.get("debtToEquity")),
+            "debt_to_equity": self._ratio(raw.get("debtToEquity"), percent_points=True),
             "free_cash_flow": normalize_api_scalar(raw.get("freeCashflow")),
             "return_on_equity": normalize_api_scalar(raw.get("returnOnEquity")),
             "52w_high": normalize_api_scalar(raw.get("fiftyTwoWeekHigh")),
@@ -5963,6 +6403,9 @@ class FundamentalsFetcher:
             "target_price": normalize_api_scalar(raw.get("targetMeanPrice")),
             "short_pct_float": normalize_api_scalar(raw.get("shortPercentOfFloat")),
             "short_ratio": normalize_api_scalar(raw.get("shortRatio")),
+            "short_interest_asof": raw.get("dateShortInterest"),
+            "earnings_growth_basis": "quarterly_yoy",
+            "revenue_growth_basis": "quarterly_yoy",
         }
         try:
             cal = tk.calendar
@@ -5974,21 +6417,86 @@ class FundamentalsFetcher:
             pass
         try:
             txns = tk.insider_transactions
-            if txns is not None and len(txns) > 0:
-                text_col = "Text" if "Text" in txns.columns else None
-                buys = sells = 0
-                if text_col:
-                    for text in txns[text_col].astype(str).str.lower():
-                        if "purchase" in text or "buy" in text:
-                            buys += 1
-                        elif "sale" in text or "sold" in text:
-                            sells += 1
-                if buys or sells:
-                    out["insider_buy_transactions"] = float(buys)
-                    out["insider_sell_transactions"] = float(sells)
+            if isinstance(txns, pd.DataFrame):
+                out.update(self._summarize_insider_transactions(txns.to_dict("records")))
         except Exception:
             pass
         return out
+
+    @staticmethod
+    def _insider_date(value: Any) -> Optional[date]:
+        value = normalize_api_scalar(value)
+        if is_missing_value(value):
+            return None
+        try:
+            if isinstance(value, (int, float, np.number)):
+                magnitude = abs(float(value))
+                unit = "ns" if magnitude >= 1e17 else "ms" if magnitude >= 1e11 else "s"
+                stamp = pd.Timestamp(value, unit=unit, tz="UTC")
+            else:
+                stamp = pd.Timestamp(value)
+            return stamp.date() if not pd.isna(stamp) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _summarize_insider_transactions(rows: List[Dict]) -> Dict:
+        """Only dated, recent open-market purchases/sales support conviction."""
+        end = today_et()
+        cutoff = end - timedelta(days=183)
+        buys = sells = 0
+        net_shares = 0.0
+        shares_available = False
+        dates = []
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            tx_date = None
+            for key in ("transactionDate", "startDate", "Start Date", "Transaction Date", "filingDate"):
+                if key in row:
+                    tx_date = FundamentalsFetcher._insider_date(row.get(key))
+                    if tx_date is not None:
+                        break
+            if tx_date is None or not cutoff <= tx_date <= end:
+                continue
+            filing = FundamentalsFetcher._insider_date(row.get("filingDate"))
+            if filing is not None and filing > end:
+                continue
+            code = str(row.get("transactionCode") or "").upper()
+            text = str(row.get("transactionText") or row.get("Text") or "").lower()
+            if code == "P" or (not code and re.search(r"\b(?:purchase|buy)\b", text)):
+                direction = 1
+            elif code == "S" or (not code and re.search(r"\b(?:sale|sold|sell)\b", text)):
+                direction = -1
+            else:
+                continue  # Awards, gifts, and option exercises are not buys.
+            shares = None
+            for key in ("change", "shares", "Shares"):
+                if key in row:
+                    shares = MomentumQuality.finite_number(row.get(key))
+                    if shares is not None:
+                        break
+            owner = str(row.get("name") or row.get("filerName") or row.get("Insider") or "")
+            identity = (tx_date.isoformat(), filing, direction, owner, shares, text)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            dates.append(tx_date)
+            buys += direction == 1
+            sells += direction == -1
+            if shares is not None:
+                shares_available = True
+                net_shares += direction * abs(shares)
+        return {
+            "insider_buy_transactions": float(buys),
+            "insider_sell_transactions": float(sells),
+            "insider_net_shares": net_shares if shares_available else np.nan,
+            "insider_evidence_quality": "dated_open_market" if dates else "no_classified_trades",
+            "insider_data_asof": max(dates).isoformat() if dates else None,
+            "insider_period": "183 calendar days",
+            "insider_feed_status": "ok",
+        }
 
     @staticmethod
     def _extract_insider_activity(modules: Dict) -> Dict:
@@ -6006,10 +6514,12 @@ class FundamentalsFetcher:
             "insider_buy_transactions": np.nan,
             "insider_sell_transactions": np.nan,
             "insider_period": None,
+            "insider_evidence_quality": "unknown",
         }
 
         net = modules.get("net-share-purchase-activity")
         if isinstance(net, dict) and net:
+            out["insider_evidence_quality"] = "aggregate_unverified"
             out["insider_net_purchase_pct"] = normalize_api_scalar(
                 net.get("netPercentInsiderShares")
             )
@@ -6026,34 +6536,15 @@ class FundamentalsFetcher:
             if isinstance(period, str) and period:
                 out["insider_period"] = period
 
-        # Fall back to counting the raw filings when the aggregate is absent.
-        if is_missing_value(out["insider_buy_transactions"]):
-            txns = modules.get("insider-transactions")
-            rows = txns.get("transactions") if isinstance(txns, dict) else None
-            if isinstance(rows, list) and rows:
-                buys = sells = 0
-                cutoff = today_et() - timedelta(days=183)
-                for row in rows:
-                    if not isinstance(row, dict):
-                        continue
-                    tx_date = (
-                        row.get("startDate")
-                        or row.get("transactionDate")
-                        or row.get("filingDate")
-                    )
-                    try:
-                        if pd.Timestamp(tx_date).date() < cutoff:
-                            continue
-                    except Exception:
-                        continue
-                    text = str(row.get("transactionText", "")).lower()
-                    if "purchase" in text or "buy" in text:
-                        buys += 1
-                    elif "sale" in text or "sold" in text or "sell" in text:
-                        sells += 1
-                if buys or sells:
-                    out["insider_buy_transactions"] = float(buys)
-                    out["insider_sell_transactions"] = float(sells)
+        # Prefer identifiable open-market filings to an aggregate that may
+        # contain compensation awards and that cannot be dated per trade.
+        txns = modules.get("insider-transactions")
+        rows = txns.get("transactions") if isinstance(txns, dict) else None
+        if isinstance(rows, list):
+            summary = FundamentalsFetcher._summarize_insider_transactions(rows)
+            if summary["insider_buy_transactions"] + summary["insider_sell_transactions"] > 0:
+                out.update(summary)
+                out["insider_net_purchase_pct"] = np.nan
 
         return out
 
@@ -6077,15 +6568,16 @@ class InvestorPanel:
         self._rs_universe_returns: Optional[np.ndarray] = None
 
     def set_universe_returns(self, all_data: Dict[str, pd.DataFrame]) -> None:
-        """Cache 63-day returns of the broad guarded universe for true
-        IBD-style RS-rank percentile (vs prior heuristic absolute thresholds)."""
+        """Cache broad-universe 63-session return ranks, not IBD's proprietary RS."""
+        self._rs_universe_returns = None
         rets = []
         for df in all_data.values():
             try:
                 if len(df) >= 64:
                     last = df["Close"].iloc[-1]
                     base = df["Close"].iloc[-64]
-                    if base and base > 0 and pd.notna(last) and pd.notna(base):
+                    if (MomentumQuality.finite_number(base) is not None and base > 0
+                            and MomentumQuality.finite_number(last) is not None):
                         rets.append(float(last / base - 1.0))
             except Exception:
                 continue
@@ -6093,13 +6585,44 @@ class InvestorPanel:
             self._rs_universe_returns = np.array(rets)
 
     def rs_percentile(self, ret_63d: float) -> float:
-        """Return the IBD-style RS rank percentile (0-100) of a 3-month
+        """Return a cross-sectional percentile (0-100) of a 3-month
         return vs the live universe. Falls back to 50 if uncalibrated."""
         if self._rs_universe_returns is None or len(self._rs_universe_returns) < 50:
             return 50.0
         if ret_63d is None or pd.isna(ret_63d):
             return 50.0
-        return float((self._rs_universe_returns < ret_63d).mean() * 100.0)
+        less = (self._rs_universe_returns < ret_63d).sum()
+        equal = np.isclose(self._rs_universe_returns, ret_63d, rtol=1e-10, atol=1e-12).sum()
+        less -= ((self._rs_universe_returns < ret_63d) & np.isclose(self._rs_universe_returns, ret_63d, rtol=1e-10, atol=1e-12)).sum()
+        return float((less + 0.5 * equal) / len(self._rs_universe_returns) * 100.0)
+
+    def _benchmark_excess(self, df: pd.DataFrame, sessions: int) -> Optional[float]:
+        """Compare identical signal/base dates; do not shift a missing index bar."""
+        if self.benchmark_data is None or len(df) <= sessions:
+            return None
+        try:
+            stock_index = pd.to_datetime(df.index)
+            bench = self.benchmark_data["Close"].copy()
+            bench_index = pd.to_datetime(bench.index)
+            if getattr(stock_index, "tz", None) is not None:
+                stock_index = stock_index.tz_convert(ET_TZ).tz_localize(None)
+            if getattr(bench_index, "tz", None) is not None:
+                bench_index = bench_index.tz_convert(ET_TZ).tz_localize(None)
+            bench.index = bench_index.normalize()
+            bench = bench[~bench.index.duplicated(keep="last")]
+            stock_end = stock_index[-1].normalize()
+            stock_start = stock_index[-sessions - 1].normalize()
+            values = [
+                MomentumQuality.finite_number(df["Close"].iloc[-1]),
+                MomentumQuality.finite_number(df["Close"].iloc[-sessions - 1]),
+                MomentumQuality.finite_number(bench.get(stock_end)),
+                MomentumQuality.finite_number(bench.get(stock_start)),
+            ]
+            if any(v is None or v <= 0 for v in values):
+                return None
+            return float(values[0] / values[1] - values[2] / values[3])
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
 
     def load_benchmark(self):
         """Load a live market INDEX for relative strength.
@@ -6184,6 +6707,7 @@ class InvestorPanel:
             s["insider_buy_transactions"] = fund.get("insider_buy_transactions", np.nan)
             s["insider_sell_transactions"] = fund.get("insider_sell_transactions", np.nan)
             s["short_pct_float"] = fund.get("short_pct_float", np.nan)
+            s.update(MomentumQuality.evidence(df.iloc[-1], fund))
 
             flags = s.get("flags")
             if isinstance(flags, list):
@@ -6198,6 +6722,21 @@ class InvestorPanel:
             s["name"] = fund.get("name", ticker)
             s["sector"] = fund.get("sector", "Unknown")
             s["market_cap"] = fund.get("market_cap", np.nan)
+            s["quote_type"] = fund.get("quote_type")
+            s["quote_type_source"] = fund.get("quote_type_source")
+            s["fundamental_data_coverage"] = fund.get("fundamental_data_coverage", FundamentalsFetcher._coverage(fund))
+            technical_fields = ("SMA_50", "SMA_200", "EMA_20", "EMA_50", "Volume_Ratio", "Return_1d", "Return_63d", "ATR_pct", "OBV", "High_Close_20", "BB_upper")
+            tech_coverage = sum(MomentumQuality.finite_number(df.iloc[-1].get(k)) is not None for k in technical_fields) / len(technical_fields)
+            benchmark_coverage = sum(self._benchmark_excess(df, n) is not None for n in (20, 63, 126)) / 3.0
+            s["panel_data_coverage"] = round(0.60 * tech_coverage + 0.25 * s["fundamental_data_coverage"] + 0.15 * benchmark_coverage, 3)
+            s["panel_is_independent_expert_consensus"] = False
+            s["benchmark_excess_20d"] = self._benchmark_excess(df, 20)
+            s["benchmark_excess_63d"] = self._benchmark_excess(df, 63)
+            s["benchmark_excess_126d"] = self._benchmark_excess(df, 126)
+            s["instrument_risk_flags"] = list(fund.get("instrument_risk_flags", FundamentalsFetcher.instrument_risk_flags(fund)))
+            for instrument_flag in s["instrument_risk_flags"]:
+                if instrument_flag not in s.setdefault("flags", []):
+                    s["flags"].append(instrument_flag)
             s["fundamentals_quality"] = fund.get(
                 "fundamentals_quality", "unknown"
             )
@@ -6329,23 +6868,11 @@ class InvestorPanel:
                 pullback_score = 35
 
         # 5. Relative Strength vs live SPX (10%)
-        rs_score = 60
-        if self.benchmark_data is not None and len(self.benchmark_data) >= 126 and len(df) >= 126:
-            bench_close = self.benchmark_data["Close"]
-            stock_ret_1m = (close / df["Close"].iloc[-21]) - 1 if len(df) >= 21 else 0
-            stock_ret_3m = (close / df["Close"].iloc[-63]) - 1 if len(df) >= 63 else 0
-            stock_ret_6m = (close / df["Close"].iloc[-126]) - 1 if len(df) >= 126 else 0
-
-            spy_ret_1m = (bench_close.iloc[-1] / bench_close.iloc[-21]) - 1 if len(bench_close) >= 21 else 0
-            spy_ret_3m = (bench_close.iloc[-1] / bench_close.iloc[-63]) - 1 if len(bench_close) >= 63 else 0
-            spy_ret_6m = (bench_close.iloc[-1] / bench_close.iloc[-126]) - 1 if len(bench_close) >= 126 else 0
-
-            outperform_count = sum([
-                stock_ret_1m > spy_ret_1m,
-                stock_ret_3m > spy_ret_3m,
-                stock_ret_6m > spy_ret_6m,
-            ])
-            excess = (stock_ret_3m - spy_ret_3m)
+        rs_score = 50
+        excess_returns = [self._benchmark_excess(df, n) for n in (20, 63, 126)]
+        if all(value is not None for value in excess_returns):
+            outperform_count = sum(value > 0 for value in excess_returns)
+            excess = excess_returns[1]
             if outperform_count == 3 and excess > 0.10:
                 rs_score = 95
             elif outperform_count >= 2:
@@ -6367,15 +6894,10 @@ class InvestorPanel:
         close = last["Close"]
 
         # 1. Macro Alignment (25%) -- sector momentum as proxy
-        macro_score = 60
-        sector = fund.get("sector", "Unknown")
+        macro_score = 50
         # Use relative strength vs the live SPX index as macro proxy
-        if self.benchmark_data is not None and len(df) >= 63:
-            stock_ret = (close / df["Close"].iloc[-63]) - 1
-            spy_ret = (
-                self.benchmark_data["Close"].iloc[-1] / self.benchmark_data["Close"].iloc[-63] - 1
-            ) if len(self.benchmark_data) >= 63 else 0
-            excess = stock_ret - spy_ret
+        excess = self._benchmark_excess(df, 63)
+        if excess is not None:
             if excess > 0.15:
                 macro_score = 90
             elif excess > 0.05:
@@ -6411,19 +6933,20 @@ class InvestorPanel:
                 pass
 
         # 3. Risk/Reward Asymmetry (25%)
-        rr_score = 55
+        rr_score = 50
         sma50 = last.get("SMA_50", np.nan)
-        if not pd.isna(sma50) and sma50 > 0:
-            # Support at SMA50; resistance at recent high
-            support = sma50
-            if len(df) >= 50:
-                resistance = df["Close"].iloc[-50:].max()
-            else:
-                resistance = close * 1.1
-            risk = (close - support) / close if close > support else 0.05
-            reward = (resistance - close) / close if resistance > close else 0.02
-            rr_ratio = reward / max(risk, 0.01)
-            if rr_ratio >= 3:
+        if not pd.isna(sma50) and 0 < sma50 < close and len(df) >= 50:
+            # Historical resistance is observable only when above this close.
+            # A breakout to a new high has no observed upside ceiling here;
+            # leave this component neutral instead of inventing a 2% target.
+            resistance = df["Close"].iloc[-50:].max()
+            rr_ratio = (
+                (resistance - close) / max(close - sma50, close * 0.01)
+                if resistance > close else None
+            )
+            if rr_ratio is None:
+                pass
+            elif rr_ratio >= 3:
                 rr_score = 95
             elif rr_ratio >= 2:
                 rr_score = 80
@@ -6444,25 +6967,9 @@ class InvestorPanel:
             else:
                 flow_score = 40
 
-        # 5. Position Sizing Confidence (10%) -- empirical Kelly proxy
-        # built from the stock's own rolling win-rate and payoff ratio over
-        # the last 60 sessions. Replaces the prior circular self-average
-        # which contained zero new information.
+        # Daily sign counts are not the 20-session strategy's trade outcomes.
+        # They cannot estimate Kelly sizing or add independent evidence.
         sizing_score = 50.0
-        if len(df) >= 63:
-            recent = df["Return_1d"].iloc[-60:].dropna()
-            if len(recent) >= 30:
-                wins = recent[recent > 0]
-                losses = recent[recent < 0]
-                w = len(wins) / max(len(recent), 1)
-                avg_win = wins.mean() if len(wins) else 0.0
-                avg_loss = abs(losses.mean()) if len(losses) else 1.0
-                payoff = avg_win / max(avg_loss, 1e-6)
-                # Kelly fraction: f* = w - (1-w)/payoff. Cap, then map to 0-100.
-                kelly = w - (1 - w) / max(payoff, 1e-6)
-                kelly_capped = clamp(kelly, -0.5, 0.5)
-                # Map [-0.5, 0.5] -> [0, 100]; positive Kelly = positive edge.
-                sizing_score = clamp(50 + kelly_capped * 100, 0, 100)
         # Pull macro regime in as additional weight (Druckenmiller is the
         # macro guy -- if regime is risk-off, even great names get marked down)
         if self.macro is not None:
@@ -6526,40 +7033,32 @@ class InvestorPanel:
         dte = fund.get("debt_to_equity", np.nan)
         fcf = fund.get("free_cash_flow", np.nan)
         if not is_missing_value(dte):
-            if dte < 30:
+            if dte < 0:
+                bs_score = 35  # Negative equity is not exceptionally low debt.
+            elif dte < 0.30:
                 bs_score = 90
-            elif dte < 80:
+            elif dte < 0.80:
                 bs_score = 75
-            elif dte < 150:
+            elif dte < 1.50:
                 bs_score = 55
             else:
                 bs_score = 35
         if not is_missing_value(fcf) and fcf > 0:
             bs_score = min(100, bs_score + 10)
 
-        # 5. Story Clarity (10%) -- analyst coverage as proxy
-        story_score = 55
-        analysts = fund.get("analyst_count", np.nan)
-        if not is_missing_value(analysts):
-            if analysts >= 20:
-                story_score = 90
-            elif analysts >= 10:
-                story_score = 75
-            elif analysts >= 5:
-                story_score = 60
-            else:
-                story_score = 45
+        # Analyst count measures coverage, not story clarity or trading edge.
+        story_score = 50
 
         # ETF adjustment only when explicitly identified; unknown fundamentals
         # must not receive neutral GARP credit in a real-money scan.
         sector = fund.get("sector", "Unknown")
         quote_type = str(fund.get("quote_type", "")).upper()
-        if quote_type in {"ETF", "ETP", "MUTUALFUND"}:
+        if quote_type in FundamentalsFetcher.FUND_QUOTE_TYPES:
             # Assign neutral fundamental scores for ETFs
             eg_score = 60
             peg_score = 60
             rev_score = 60
-        elif sector in {"Unknown", ""} or fund.get("fundamentals_quality") == "failed":
+        elif fund.get("fundamentals_quality") == "failed":
             eg_score = min(eg_score, 35)
             peg_score = min(peg_score, 35)
             rev_score = min(rev_score, 35)
@@ -6644,7 +7143,7 @@ class InvestorPanel:
             # Stop loss distance (below SMA50)
             if not pd.isna(sma50) and sma50 > 0:
                 stop_dist = (close - sma50) / close
-                if stop_dist < 0.05:
+                if 0 < stop_dist < 0.05:
                     entry_score = min(100, entry_score + 5)
                 elif stop_dist > 0.10:
                     entry_score = max(0, entry_score - 10)
@@ -6653,10 +7152,11 @@ class InvestorPanel:
         # Minervini explicitly requires RS Rank >= 70 IBD-style. We compute
         # the percentile of this name's 3-month return vs the live universe
         # (replaces previous absolute thresholds which mis-fire across regimes).
-        rs_rank_score = 60
+        rs_rank_score = 50
         ret_63d = last.get("Return_63d", np.nan)
         ret_20d = last.get("Return_20d", np.nan)
-        if not pd.isna(ret_63d):
+        if (not pd.isna(ret_63d) and self._rs_universe_returns is not None
+                and len(self._rs_universe_returns) >= 50):
             pct = self.rs_percentile(float(ret_63d))
             # Map IBD-style: >=85 elite, >=70 strong, >=50 average, <30 weak
             if pct >= 90:
@@ -6672,7 +7172,7 @@ class InvestorPanel:
             else:
                 rs_rank_score = 30
 
-        # 5. Earnings Acceleration (10%)
+        # 5. Earnings Growth Level (10%); a single growth rate is not acceleration.
         ea_score = 55
         eg = fund.get("earnings_growth", np.nan)
         if not is_missing_value(eg):
@@ -6712,8 +7212,10 @@ class InvestorPanel:
         # A: Annual Earnings (15%)
         a_score = 55
         roe = fund.get("return_on_equity", np.nan)
-        if not is_missing_value(roe) and roe > 0:
-            if roe > 0.25:
+        if not is_missing_value(roe):
+            if roe <= 0:
+                a_score = 35
+            elif roe > 0.25:
                 a_score = 90
             elif roe > 0.15:
                 a_score = 75
@@ -6827,6 +7329,110 @@ class OptionsEvaluator:
     MAX_SPREAD_PCT = 12.0
     MIN_OPEN_INTEREST = 150
     MIN_VOLUME = 20
+    EXIT_BUFFER_SESSIONS = 3
+    MAX_QUOTE_DELAY_MINUTES = 15
+    QUOTE_STALENESS_MINUTES = 5
+
+    @staticmethod
+    def _numeric(value: Any) -> float:
+        try:
+            number = float(normalize_api_scalar(value))
+            return number if np.isfinite(number) else np.nan
+        except (TypeError, ValueError):
+            return np.nan
+
+    @staticmethod
+    def _timestamp_utc(value: Any) -> Optional[pd.Timestamp]:
+        """Decode provider epoch seconds/ms/us/ns without inventing a date."""
+        try:
+            value = normalize_api_scalar(value)
+            if is_missing_value(value):
+                return None
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                if not np.isfinite(value) or value <= 0:
+                    return None
+                unit = "ns" if value > 1e17 else "us" if value > 1e14 else "ms" if value > 1e11 else "s"
+                stamp = pd.to_datetime(value, unit=unit, utc=True)
+            else:
+                stamp = pd.Timestamp(value)
+                if stamp.tzinfo is None:
+                    return None
+                stamp = stamp.tz_convert("UTC")
+            return None if pd.isna(stamp) else stamp
+        except Exception:
+            return None
+
+    @staticmethod
+    def _quote_context(contract: Dict, now: Optional[datetime] = None) -> Dict:
+        """Separate current executable evidence from last-session references.
+
+        A recent trade timestamp is never a substitute for a bid/ask timestamp.
+        Overnight/holiday quotes can describe a contract but must be refreshed
+        after the options session opens before becoming a call-buy signal.
+        """
+        now = now or now_et_dt()
+        now = now.replace(tzinfo=ET_TZ) if now.tzinfo is None else now.astimezone(ET_TZ)
+        quote_at = OptionsEvaluator._timestamp_utc(contract.get("quote_timestamp"))
+        underlying_at = OptionsEvaluator._timestamp_utc(contract.get("underlying_timestamp"))
+        result = {"valid": False, "actionable": False, "status": "missing_quote_timestamp"}
+        if quote_at is None:
+            return result
+        if underlying_at is None:
+            result["status"] = "missing_underlying_timestamp"
+            return result
+        now_stamp = pd.Timestamp(now).tz_convert("UTC")
+        if max(quote_at, underlying_at) > now_stamp + pd.Timedelta(minutes=2):
+            result["status"] = "future_quote_timestamp"
+            return result
+        delay = str(contract.get("quote_timeframe") or "UNKNOWN").upper()
+        underlying_delay = str(contract.get("underlying_timeframe") or "UNKNOWN").upper()
+        if delay not in {"REAL-TIME", "REALTIME", "DELAYED"} or underlying_delay not in {"REAL-TIME", "REALTIME", "DELAYED"}:
+            result["status"] = "unverified_quote_delay"
+            return result
+        today = now.date()
+        market_open = market_close = None
+        if is_trading_day(today):
+            market_open = XNYS_CALENDAR.session_open(pd.Timestamp(today))
+            market_close = XNYS_CALENDAR.session_close(pd.Timestamp(today))
+        if market_open is not None and market_open <= now_stamp < market_close:
+            quote_age = pd.Timedelta(minutes=OptionsEvaluator.QUOTE_STALENESS_MINUTES + (OptionsEvaluator.MAX_QUOTE_DELAY_MINUTES if delay == "DELAYED" else 0))
+            underlying_age = pd.Timedelta(minutes=OptionsEvaluator.QUOTE_STALENESS_MINUTES + (OptionsEvaluator.MAX_QUOTE_DELAY_MINUTES if underlying_delay == "DELAYED" else 0))
+            if quote_at < max(now_stamp - quote_age, market_open) or underlying_at < max(now_stamp - underlying_age, market_open):
+                result["status"] = "stale_intraday_quote"
+                return result
+            result.update(valid=True, actionable=True, status="current_session_quote")
+        else:
+            expected_day = today if market_close is not None and now_stamp >= market_close else previous_trading_day(today + timedelta(days=1) if not is_trading_day(today) else today)
+            expected_close = XNYS_CALENDAR.session_close(pd.Timestamp(expected_day))
+            cutoff = expected_close - pd.Timedelta(minutes=OptionsEvaluator.MAX_QUOTE_DELAY_MINUTES + OptionsEvaluator.QUOTE_STALENESS_MINUTES)
+            if min(quote_at, underlying_at) < cutoff or quote_at.tz_convert(ET_TZ).date() != expected_day:
+                result["status"] = "stale_closed_session_quote"
+                return result
+            result.update(valid=True, actionable=False, status="latest_session_reference_requote_required")
+        result["quote_timestamp"] = quote_at.isoformat()
+        result["underlying_timestamp"] = underlying_at.isoformat()
+        result["quote_timeframe"] = delay
+        return result
+
+    @staticmethod
+    def _minimum_expiry_date(now: Optional[datetime] = None) -> date:
+        """Expiration must follow the tradable 20-session thesis plus buffer."""
+        now = now or now_et_dt()
+        now = now.replace(tzinfo=ET_TZ) if now.tzinfo is None else now.astimezone(ET_TZ)
+        day = now.date()
+        if is_trading_day(day):
+            opened = XNYS_CALENDAR.session_open(pd.Timestamp(day)).tz_convert(ET_TZ)
+            if pd.Timestamp(now) >= opened:
+                day += timedelta(days=1)
+        required = HOLDING_HORIZON_DAYS + OptionsEvaluator.EXIT_BUFFER_SESSIONS
+        found = 0
+        while found < required:
+            if is_trading_day(day):
+                found += 1
+                if found == required:
+                    return day
+            day += timedelta(days=1)
+        return day
 
     @staticmethod
     def evaluate(
@@ -6894,6 +7500,21 @@ class OptionsEvaluator:
             "option_moneyness_pct": None,
             "option_score": 0.0,
             "option_source": None,
+            "option_actionable": False,
+            "option_quote_status": "unavailable",
+            "option_quote_timestamp": None,
+            "option_underlying_timestamp": None,
+            "option_quote_timeframe": None,
+            "option_contract_symbol": None,
+            "option_shares_per_contract": None,
+            "option_ask": None,
+            "option_max_loss_per_contract": None,
+            "option_underlying_price": None,
+            "option_delta_source": None,
+            "option_minimum_expiry": OptionsEvaluator._minimum_expiry_date().isoformat(),
+            "option_rejection_counts": {},
+            "option_rejection_reason": None,
+            "option_data_status": {},
         }
 
         try:
@@ -6908,44 +7529,84 @@ class OptionsEvaluator:
                         option_source = "MBOUM"
                 except ProviderExhausted:
                     chain_data = []
-            if not chain_data:
+            def _has_auditable_contract(chain: List[Dict]) -> bool:
+                return any(
+                    OptionsEvaluator._quote_context(contract).get("valid")
+                    and contract.get("contract_type") == "call"
+                    and normalize_api_scalar(contract.get("shares_per_contract")) == 100
+                    for contract in chain
+                )
+
+            if chain_data:
+                result["option_data_status"]["MBOUM"] = (
+                    "auditable_quotes" if _has_auditable_contract(chain_data)
+                    else "unverified_quote_metadata"
+                )
+            if not chain_data or not _has_auditable_contract(chain_data):
                 chain_data = OptionsEvaluator._fetch_chain_massive(ticker)
                 option_source = "Massive" if chain_data else option_source
-            if not chain_data:
+                result["option_data_status"]["Massive"] = (
+                    "auditable_quotes" if chain_data and _has_auditable_contract(chain_data)
+                    else "unverified_or_unavailable"
+                )
+            if not chain_data or not _has_auditable_contract(chain_data):
                 chain_data = OptionsEvaluator._fetch_chain_yahoo(ticker)
                 option_source = "Yahoo" if chain_data else option_source
+                result["option_data_status"]["Yahoo"] = (
+                    "auditable_quotes" if chain_data and _has_auditable_contract(chain_data)
+                    else "unverified_or_unavailable"
+                )
 
             if not chain_data:
+                result["option_rejection_reason"] = "No auditable bid/ask and underlying metadata from available providers"
                 return result
             if option_source:
                 record_data_source_usage("options", option_source)
 
             profile = OptionsEvaluator._target_profile(candidate)
             today = today_et()
+            minimum_expiry = OptionsEvaluator._minimum_expiry_date()
             best_contract = None
             best_score = -1.0
 
+            def reject(reason: str) -> None:
+                counts = result["option_rejection_counts"]
+                counts[reason] = counts.get(reason, 0) + 1
+
             for contract in chain_data:
+                quote_context = OptionsEvaluator._quote_context(contract)
+                if not quote_context["valid"]:
+                    reject(quote_context["status"])
+                    continue
+                if (
+                    contract.get("contract_type") != "call"
+                    or normalize_api_scalar(contract.get("shares_per_contract")) != 100
+                    or contract.get("adjusted") is not False
+                    or not contract.get("contract_symbol")
+                ):
+                    reject("unverified_or_nonstandard_contract")
+                    continue
                 exp_str = contract.get("expiry", "")
-                strike = normalize_api_scalar(contract.get("strike"))
-                bid = normalize_api_scalar(contract.get("bid"))
-                ask = normalize_api_scalar(contract.get("ask"))
-                oi = normalize_api_scalar(contract.get("oi"))
-                vol = normalize_api_scalar(contract.get("volume"))
-                iv = normalize_api_scalar(contract.get("iv"))
-                delta = normalize_api_scalar(contract.get("delta"))
-                theta = normalize_api_scalar(contract.get("theta"))
-                mid = normalize_api_scalar(contract.get("mid"))
-                break_even = normalize_api_scalar(contract.get("break_even"))
-                contract_underlying = normalize_api_scalar(contract.get("underlying_price"))
-                underlying_price = (
-                    contract_underlying
-                    if (
-                        not is_missing_value(contract_underlying)
-                        and contract_underlying > 0
-                    )
-                    else current_price
-                )
+                strike = OptionsEvaluator._numeric(contract.get("strike"))
+                bid = OptionsEvaluator._numeric(contract.get("bid"))
+                ask = OptionsEvaluator._numeric(contract.get("ask"))
+                oi = OptionsEvaluator._numeric(contract.get("oi"))
+                vol = OptionsEvaluator._numeric(contract.get("volume"))
+                iv = OptionsEvaluator._numeric(contract.get("iv"))
+                delta = OptionsEvaluator._numeric(contract.get("delta"))
+                delta_source = "provider_greek"
+                theta = OptionsEvaluator._numeric(contract.get("theta"))
+                mid = OptionsEvaluator._numeric(contract.get("mid"))
+                break_even = OptionsEvaluator._numeric(contract.get("break_even"))
+                contract_underlying = OptionsEvaluator._numeric(contract.get("underlying_price"))
+                underlying_price = contract_underlying
+                try:
+                    if not all(np.isfinite(float(value)) and float(value) > 0 for value in (strike, underlying_price, bid, ask)):
+                        reject("invalid_contract_price")
+                        continue
+                except (TypeError, ValueError):
+                    reject("invalid_contract_price")
+                    continue
 
                 try:
                     exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
@@ -6954,6 +7615,10 @@ class OptionsEvaluator:
 
                 dte = (exp_date - today).days
                 if dte < OptionsEvaluator.MIN_DTE or dte > OptionsEvaluator.MAX_DTE:
+                    reject("outside_dte_window")
+                    continue
+                if exp_date < minimum_expiry:
+                    reject("expires_before_thesis_and_buffer")
                     continue
 
                 # Avoid an unmodelled earnings event inside the equity holding
@@ -6979,8 +7644,10 @@ class OptionsEvaluator:
                 )
                 if not has_live_quote:
                     continue
-                if is_missing_value(mid):
-                    mid = (bid + ask) / 2
+                # Midpoint is a reference, not an assured fill. Recompute it
+                # from the same two quote sides; vendor midpoint/break-even
+                # fields can refer to a different snapshot.
+                mid = (bid + ask) / 2
                 if mid <= 0:
                     continue
 
@@ -6988,11 +7655,12 @@ class OptionsEvaluator:
                 if pd.isna(spread_pct) or spread_pct < 0 or spread_pct > OptionsEvaluator.MAX_SPREAD_PCT:
                     continue
 
-                if is_missing_value(iv) or iv <= 0 or iv > 3.0:
+                if is_missing_value(iv) or not np.isfinite(iv) or iv <= 0 or iv > 3.0:
                     continue
-                model_iv = max(iv, 0.20)
+                model_iv = iv
 
                 if is_missing_value(delta) and underlying_price and underlying_price > 0:
+                    delta_source = "European_Black_Scholes_estimate_r_5pct_q_zero"
                     delta = OptionsEvaluator._bs_delta(
                         underlying_price, strike, dte / 365.0, model_iv
                     )
@@ -7001,8 +7669,10 @@ class OptionsEvaluator:
                 if delta < OptionsEvaluator.MIN_DELTA or delta > OptionsEvaluator.MAX_DELTA:
                     continue
 
-                if is_missing_value(break_even) and underlying_price and underlying_price > 0:
-                    break_even = strike + mid
+                if ask + 1e-8 < max(underlying_price - strike, 0.0):
+                    reject("quote_below_intrinsic_value")
+                    continue
+                break_even = strike + ask
 
                 contract_score = OptionsEvaluator._score_contract(
                     profile=profile,
@@ -7010,7 +7680,7 @@ class OptionsEvaluator:
                     strike=strike,
                     dte=dte,
                     delta=delta,
-                    mid=mid,
+                    mid=ask,
                     spread_pct=spread_pct,
                     oi=oi,
                     vol=vol,
@@ -7030,13 +7700,18 @@ class OptionsEvaluator:
                         if break_even and underlying_price and underlying_price > 0 else np.nan
                     )
                     best_contract = {
-                        "option_candidate": "Y",
+                        "option_candidate": "Y" if quote_context["actionable"] else "WATCH",
+                        "option_actionable": bool(quote_context["actionable"]),
                         "option_strike": strike,
                         "option_expiry": exp_str,
                         "option_delta": round(delta, 3),
                         "option_dte": dte,
                         "option_bid_ask_spread": round(spread_pct, 1),
                         "option_mid": round(mid, 2),
+                        "option_ask": round(ask, 4),
+                        "option_max_loss_per_contract": round(ask * 100.0, 2),
+                        "option_underlying_price": round(underlying_price, 4),
+                        "option_delta_source": delta_source,
                         "option_break_even": round(break_even, 2) if break_even else None,
                         "option_break_even_pct": (
                             round(break_even_pct * 100, 1)
@@ -7050,14 +7725,25 @@ class OptionsEvaluator:
                         ),
                         "option_score": round(contract_score, 1),
                         "option_source": option_source,
+                        "option_contract_symbol": contract.get("contract_symbol"),
+                        "option_shares_per_contract": 100,
+                        "option_quote_status": quote_context["status"],
+                        "option_quote_timestamp": quote_context["quote_timestamp"],
+                        "option_underlying_timestamp": quote_context["underlying_timestamp"],
+                        "option_quote_timeframe": quote_context["quote_timeframe"],
                     }
 
             if best_contract:
-                return best_contract
+                result.update(best_contract)
+                return result
 
         except Exception as e:
             log.debug(f"  Options error for {ticker}: {e}")
 
+        if result["option_rejection_counts"]:
+            result["option_rejection_reason"] = ", ".join(sorted(result["option_rejection_counts"]))
+        elif result["option_rejection_reason"] is None:
+            result["option_rejection_reason"] = "No contract passed quote, liquidity, horizon, and event guards"
         return result
 
     @staticmethod
@@ -7085,8 +7771,11 @@ class OptionsEvaluator:
                 or normalize_api_scalar(quote.get("postMarketPrice"))
                 or normalize_api_scalar(quote.get("preMarketPrice"))
             )
-            if (not underlying_price or is_missing_value(underlying_price)) and not is_missing_value(quote_price):
+            if not is_missing_value(quote_price) and quote_price > 0:
                 underlying_price = quote_price
+            # The daily signal close is not a synchronized option underlying.
+            # Quote timestamps below are required before a contract is usable.
+            underlying_timestamp = quote.get("regularMarketTime")
 
             today = datetime.now(ET_TZ).date()
             min_date = today + timedelta(days=OptionsEvaluator.MIN_DTE - 2)
@@ -7160,6 +7849,14 @@ class OptionsEvaluator:
                             else None
                         ),
                         "underlying_price": underlying_price,
+                        "underlying_timestamp": underlying_timestamp,
+                        "underlying_timeframe": quote.get("timeframe", "UNKNOWN"),
+                        "quote_timestamp": call.get("quoteTime") or call.get("quoteTimestamp"),
+                        "quote_timeframe": call.get("quoteTimeframe", "UNKNOWN"),
+                        "contract_type": "call",
+                        "contract_symbol": call.get("contractSymbol"),
+                        "shares_per_contract": 100 if call.get("contractSize") == "REGULAR" else None,
+                        "adjusted": False if call.get("contractSize") == "REGULAR" else None,
                     })
 
             return contracts
@@ -7251,6 +7948,14 @@ class OptionsEvaluator:
                     "theta": normalize_api_scalar(greeks.get("theta")),
                     "break_even": normalize_api_scalar(opt.get("break_even_price")),
                     "underlying_price": normalize_api_scalar(underlying.get("price")),
+                    "underlying_timestamp": underlying.get("last_updated"),
+                    "underlying_timeframe": underlying.get("timeframe", "UNKNOWN"),
+                    "quote_timestamp": quote.get("last_updated"),
+                    "quote_timeframe": quote.get("timeframe", "UNKNOWN"),
+                    "contract_type": details.get("contract_type"),
+                    "contract_symbol": details.get("ticker"),
+                    "shares_per_contract": normalize_api_scalar(details.get("shares_per_contract")),
+                    "adjusted": bool(details.get("additional_underlyings")) or normalize_api_scalar(details.get("shares_per_contract")) != 100,
                 })
 
             return contracts
@@ -7261,7 +7966,7 @@ class OptionsEvaluator:
     def _fetch_chain_yahoo(ticker: str) -> List[Dict]:
         """Fetch options chain from yfinance-backed Yahoo data."""
         try:
-            ticker_obj = yf.Ticker(ticker)
+            ticker_obj = yf.Ticker(provider_symbol(ticker, "yfinance"))
             expirations = ticker_obj.options or []
             contracts = []
             underlying_price = None
@@ -7315,6 +8020,16 @@ class OptionsEvaluator:
                             else None
                         ),
                         "underlying_price": underlying_price,
+                        # yfinance exposes lastTradeDate, not a bid/ask update
+                        # timestamp. Do not relabel that trade as a live quote.
+                        "underlying_timestamp": None,
+                        "underlying_timeframe": "UNKNOWN",
+                        "quote_timestamp": None,
+                        "quote_timeframe": "UNKNOWN",
+                        "contract_type": "call",
+                        "contract_symbol": call.get("contractSymbol"),
+                        "shares_per_contract": 100 if call.get("contractSize") == "REGULAR" else None,
+                        "adjusted": False if call.get("contractSize") == "REGULAR" else None,
                     })
 
             return contracts
@@ -7346,7 +8061,12 @@ class OptionsEvaluator:
         ret_20d = normalize_api_scalar(candidate.get("return_20d"))
         rsi = normalize_api_scalar(candidate.get("rsi_14"))
 
-        ml = ml if not is_missing_value(ml) else 0.5
+        lift = normalize_api_scalar(candidate.get("ml_probability_lift"))
+        ml = (
+            clamp(0.5 + float(lift) / 0.40, 0.0, 1.0)
+            if candidate.get("ml_probability_usable") and not is_missing_value(lift) and np.isfinite(lift)
+            else 0.5
+        )
         panel = (panel / 100.0) if not is_missing_value(panel) else 0.60
         ret_20d = ret_20d if not is_missing_value(ret_20d) else 0.0
         rsi = rsi if not is_missing_value(rsi) else 55.0
@@ -7444,7 +8164,9 @@ class OptionsEvaluator:
 
         theta_score = 0.55
         if not is_missing_value(theta):
-            theta_score = 1.0 - clamp(abs(theta) / 0.15, 0.0, 1.0)
+            # Dollar theta is not comparable across a $1 and a $100 premium.
+            # Score daily erosion as a fraction of the conservative entry cost.
+            theta_score = 1.0 - clamp(abs(theta) / max(mid, 1e-9) / 0.03, 0.0, 1.0)
 
         raw_score = (
             0.22 * delta_fit +
@@ -7471,12 +8193,11 @@ class OptionsEvaluator:
 
     @staticmethod
     def _trade_setup_score(candidate: Dict) -> float:
-        """
-        Blend stock, macro-panel, ML, hard-rule breadth, and option quality.
+        """Transparent equity setup quality, separate from contract quality.
 
-        Strategy bias: reward live insider buying and genuine crowd/momentum
-        interest, but penalise names that have already gone vertical so the
-        book is not built on runners that are peaking.
+        Weights are heuristic and do not estimate expected return. Price/volume
+        hype and short interest remain context, not additional confirmations of
+        momentum already measured by the panel and historical feature model.
         """
         ml = normalize_api_scalar(candidate.get("ml_ensemble_score"))
         panel = normalize_api_scalar(candidate.get("panel_composite_score"))
@@ -7491,7 +8212,16 @@ class OptionsEvaluator:
         squeeze = normalize_api_scalar(candidate.get("squeeze_score"))
         exhaustion = normalize_api_scalar(candidate.get("exhaustion_score"))
 
-        ml = ml if not is_missing_value(ml) else 0.5
+        lift = normalize_api_scalar(candidate.get("ml_probability_lift"))
+        ml_usable = bool(candidate.get("ml_probability_usable"))
+        # The positive target's base rate is usually far below 50%. Compare
+        # the validated calibrated probability with its own historical target
+        # rate rather than rewarding an unavailable 0.5 placeholder.
+        ml_component = (
+            clamp(0.5 + float(lift) / 0.40, 0.0, 1.0)
+            if ml_usable and not is_missing_value(lift) and np.isfinite(lift)
+            else 0.5
+        )
         panel = (panel / 100.0) if not is_missing_value(panel) else 0.60
         rule_component = (
             clamp(rules_passed / 10.0, 0.0, 1.0)
@@ -7506,26 +8236,11 @@ class OptionsEvaluator:
             clamp((math.log10(max(avg_dollar_volume, 1.0)) - 6.0) / 3.0, 0.0, 1.0)
             if not is_missing_value(avg_dollar_volume) else 0.0
         )
-        option_component = (
-            (option_score / 100.0)
-            if candidate.get("option_candidate") == "Y" and not is_missing_value(option_score)
-            else 0.0
-        )
-
-        hype_component = (
-            clamp(hype / 100.0, 0.0, 1.0)
-            if not is_missing_value(hype) else MomentumQuality.NEUTRAL / 100.0
-        )
-        squeeze_component = (
-            clamp(squeeze / 100.0, 0.0, 1.0)
-            if not is_missing_value(squeeze) else MomentumQuality.NEUTRAL / 100.0
-        )
-        # Insider conviction dominates, with short-interest fuel as a kicker.
+        insider_supported = bool(candidate.get("insider_evidence_available")) and candidate.get("insider_evidence_quality") == "dated_open_market"
         insider_component = (
-            clamp(insider / 100.0, 0.0, 1.0)
-            if not is_missing_value(insider) else MomentumQuality.NEUTRAL / 100.0
+            clamp((insider - MomentumQuality.NEUTRAL) / (100.0 - MomentumQuality.NEUTRAL), 0.0, 1.0)
+            if insider_supported and not is_missing_value(insider) else 0.0
         )
-        conviction_component = 0.75 * insider_component + 0.25 * squeeze_component
 
         # Anti-chase: nothing is subtracted at or below the neutral reading,
         # then the penalty ramps up to 18 points for fully parabolic names.
@@ -7540,10 +8255,10 @@ class OptionsEvaluator:
         flags = candidate.get("flags", [])
         if isinstance(flags, str):
             flags = [f for f in flags.split(", ") if f]
-        risk_flags = [
+        risk_flags = sorted(set(
             f for f in flags
             if f not in OptionsEvaluator.INFORMATIONAL_FLAGS
-        ]
+        ))
         flag_penalty = 0.015 * len(risk_flags)
         binary_event_penalty = (
             0.12 if "BINARY_EVENT_RISK" in risk_flags else 0.0
@@ -7554,27 +8269,31 @@ class OptionsEvaluator:
             else 0.0
         )
 
-        score = clamp(
-            0.24 * panel +
-            0.24 * ml +
-            0.14 * rule_component +
-            0.08 * momentum_component +
-            0.10 * hype_component +
-            0.10 * conviction_component +
-            0.04 * liquidity_component +
-            0.06 * option_component -
-            exhaustion_penalty -
-            flag_penalty -
-            binary_event_penalty -
-            fundamentals_penalty,
-            0.0,
-            1.0,
-        )
+        weights = {
+            "panel": 0.34, "validated_ml_lift": 0.26, "eligibility": 0.14,
+            "momentum": 0.08, "dated_insider_evidence": 0.08, "liquidity": 0.10,
+        }
+        factors = {
+            "panel": panel, "validated_ml_lift": ml_component,
+            "eligibility": rule_component, "momentum": float(momentum_component),
+            "dated_insider_evidence": insider_component, "liquidity": liquidity_component,
+        }
+        components = {name: round(100.0 * weights[name] * value, 4) for name, value in factors.items()}
+        components.update({
+            "exhaustion_penalty": round(-100.0 * exhaustion_penalty, 4),
+            "risk_flags_penalty": round(-100.0 * flag_penalty, 4),
+            "binary_event_penalty": round(-100.0 * binary_event_penalty, 4),
+            "fundamentals_penalty": round(-100.0 * fundamentals_penalty, 4),
+        })
+        score = clamp(sum(components.values()) / 100.0, 0.0, 1.0)
         confidence = 100.0 * score
         candidate["setup_quality_score"] = round(confidence, 1)
         candidate["score_is_calibrated_probability"] = False
         candidate["overall_confidence_score"] = round(confidence, 1)
         candidate["holding_horizon_days"] = HOLDING_HORIZON_DAYS
+        candidate["score_components"] = components
+        candidate["score_weights"] = weights
+        candidate["score_method"] = "heuristic equity quality; eligibility is a gate, option quality and hype are separate context"
         return confidence
 
 
@@ -7585,7 +8304,8 @@ class OptionsEvaluator:
 class SellMonitor:
     """
     Checks existing positions against hard sell rules.
-    ANY single trigger = immediate exit signal.
+    Signals use finalized daily closes; they do not execute broker stops or
+    guarantee an intraday stop fill. Missing data requires review, not a sale.
     """
 
     @staticmethod
@@ -7600,15 +8320,24 @@ class SellMonitor:
         for pos in positions:
             ticker = pos.get("ticker")
             entry_date = pos.get("entry_date")
-            entry_price = pos.get("entry_price", 0)
+            entry_price = normalize_api_scalar(pos.get("entry_price", 0))
+            try:
+                entry_price = float(entry_price)
+                if not np.isfinite(entry_price) or entry_price < 0:
+                    entry_price = 0.0
+            except (TypeError, ValueError):
+                entry_price = 0.0
 
             df = all_data.get(ticker)
-            if df is None:
-                exits.append({"ticker": ticker, "reason": "No data available"})
+            if df is None or df.empty:
+                exits.append({"ticker": ticker, "reason": "No data available", "action": "REVIEW DATA"})
                 continue
 
             last = df.iloc[-1]
-            close = last["Close"]
+            close = normalize_api_scalar(last.get("Close"))
+            if is_missing_value(close) or not isinstance(close, (int, float, np.number)) or not np.isfinite(close) or close <= 0:
+                exits.append({"ticker": ticker, "reason": "Invalid close", "action": "REVIEW DATA"})
+                continue
             ema20 = last.get("EMA_20", np.nan)
             ema10 = last.get("EMA_10", np.nan)
             rsi = last.get("RSI_14", np.nan)
@@ -7656,15 +8385,16 @@ class SellMonitor:
                 })
                 continue
 
-            # SELL_03: Time Stop -- > 20 trading days
+            # SELL_03: close of the 20th trading session including entry day,
+            # matching the model's next-open to signal+20 close horizon.
             if entry_date:
                 try:
                     ed = pd.Timestamp(entry_date)
-                    days_held = len(df.loc[ed:]) - 1
-                    if days_held > 20:
+                    days_held = trading_sessions_between(ed.date(), pd.Timestamp(df.index[-1]).date()) + (1 if is_trading_day(ed.date()) else 0)
+                    if days_held >= HOLDING_HORIZON_DAYS:
                         exits.append({
                             "ticker": ticker,
-                            "reason": f"SELL_03: Held {days_held} days (> 20)",
+                            "reason": f"SELL_03: Held {days_held} sessions (>= {HOLDING_HORIZON_DAYS})",
                             "price": close,
                         })
                         continue
@@ -7674,10 +8404,19 @@ class SellMonitor:
             # SELL_04: Trailing Profit Lock
             if entry_price > 0:
                 gain = (close - entry_price) / entry_price
-                if gain >= 0.10 and not pd.isna(ema10) and close < ema10:
+                peak_price = normalize_api_scalar(pos.get("peak_price"))
+                if entry_date:
+                    try:
+                        historical_peak = df.loc[pd.Timestamp(entry_date):, "Close"].max()
+                        if is_missing_value(peak_price) or historical_peak > peak_price:
+                            peak_price = historical_peak
+                    except Exception:
+                        pass
+                peak_gain = (float(peak_price) - entry_price) / entry_price if not is_missing_value(peak_price) else gain
+                if peak_gain >= 0.10 and not pd.isna(ema10) and close < ema10:
                     exits.append({
                         "ticker": ticker,
-                        "reason": f"SELL_04: +{gain:.1%} gain, Close < EMA(10)",
+                        "reason": f"SELL_04: peak +{peak_gain:.1%}, current +{gain:.1%}, Close < EMA(10)",
                         "price": close,
                     })
 
@@ -7687,6 +8426,56 @@ class SellMonitor:
 # ═══════════════════════════════════════════════════════════════════════════════
 # OUTPUT FORMATTER
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def json_safe(value: Any) -> Any:
+    """Convert provider/numpy values into portable, strict JSON values."""
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, np.ndarray)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if value is None or value is pd.NA or value is pd.NaT:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, (date, datetime, pd.Timestamp)):
+        return value.isoformat()
+    return value
+
+
+def build_risk_plan(close: Any, atr: Any, sma50: Any, regime_scalar: Any) -> Dict:
+    """Plan a standalone position from the signal close, without forecasting price."""
+    close, atr, sma50, scalar = [
+        normalize_api_scalar(value) for value in (close, atr, sma50, regime_scalar)
+    ]
+    if any(is_missing_value(value) or not math.isfinite(float(value))
+           for value in (close, atr, scalar)) or close <= 0 or atr <= 0:
+        return {}
+    vol_stop = close - 2.5 * atr
+    stop = max(sma50, vol_stop, 0.0) if not is_missing_value(sma50) and sma50 > 0 else vol_stop
+    if not math.isfinite(stop) or stop <= 0 or stop >= close:
+        stop = close * 0.92
+    risk = max(close - stop, 0.01)
+    risk_pct = round(clamp(float(scalar), 0.0, 1.0), 2)
+    risk_shares = math.floor(10000.0 * risk_pct / 100.0 / risk)
+    notional_shares = math.floor(10000.0 * MAX_POSITION_PCT / close)
+    shares = max(0, min(risk_shares, notional_shares))
+    return {
+        "stop_loss": round(stop, 2),
+        "target_price": round(close + 2.5 * risk, 2),
+        "target_kind": "illustrative_2.5R_planning_level_not_forecast",
+        "risk_per_share": round(risk, 2),
+        "reward_risk_ratio": 2.5,
+        "pct_equity_risk": risk_pct,
+        "shares_per_10k_risk": shares,
+        "position_value_per_10k": round(shares * close, 2),
+        "position_pct_per_10k": round(shares * close / 100.0, 2),
+        "position_cap_pct": round(MAX_POSITION_PCT * 100.0, 1),
+        "sizing_basis": "standalone_position_at_signal_close; refresh_at_actual_entry",
+        "risk_limit_is_guaranteed": False,
+    }
+
 
 class OutputFormatter:
     """Formats and saves the final ranked output."""
@@ -7705,6 +8494,15 @@ class OutputFormatter:
             return "WAIT: EARNINGS"
         if candidate.get("fundamentals_quality") == "failed":
             return "WATCH: DATA GAP"
+        if "EARNINGS_DATE_UNVERIFIED" in flags:
+            return "WAIT: CALENDAR GAP"
+        if "DAILY_RESET_LEVERAGE_RISK" in flags:
+            return "WATCH: DAILY RESET FUND"
+        if candidate.get("ml_probability_usable") is False:
+            return "WATCH: ML UNVALIDATED"
+        lift = normalize_api_scalar(candidate.get("ml_probability_lift"))
+        if not is_missing_value(lift) and lift <= 0.0:
+            return "WATCH: NO ML LIFT"
 
         panel = normalize_api_scalar(
             candidate.get("panel_composite_score")
@@ -7753,6 +8551,7 @@ class OutputFormatter:
         ml_params: Dict,
         feature_importances: Dict,
         macro: Optional["MacroRegime"] = None,
+        diagnostics: Optional[Dict] = None,
     ) -> pd.DataFrame:
         """
         Create the final ranked table, save to CSV and JSON.
@@ -7766,7 +8565,7 @@ class OutputFormatter:
 
         # Sort by best call-trade quality first, then underlying quality.
         survivors_sorted = sorted(
-            survivors,
+            [dict(candidate) for candidate in survivors],
             key=lambda x: (
                 x.get("overall_confidence_score", x.get("trade_setup_score", 0)),
                 x.get("hard_buy_pass", False),
@@ -7807,6 +8606,19 @@ class OutputFormatter:
             "insider_sell_transactions", "short_pct_float",
             "rvol_5", "stretch_atr", "pct_from_52w_high",
             "holding_horizon_days",
+            "quote_type", "earnings_verification", "earnings_event_source",
+            "quote_type_source", "benchmark_excess_20d",
+            "benchmark_excess_63d", "benchmark_excess_126d",
+            "instrument_risk_flags", "panel_data_coverage",
+            "insider_evidence_available", "insider_evidence_quality",
+            "insider_evidence_asof", "fundamental_data_coverage",
+            "short_interest_evidence_available", "short_interest_asof",
+            "setup_archetype", "setup_archetypes", "strategy_gate",
+            "ml_probability_usable", "ml_reference_base_rate",
+            "ml_probability_lift", "ml_probability_calibrated",
+            "ml_active_models", "ml_target_definition",
+            "score_components", "score_weights", "sizing_basis",
+            "target_kind", "risk_limit_is_guaranteed",
             "fundamentals_quality", "fundamentals_sources",
             "live_earnings_date", "days_to_earnings",
             "catalyst_categories", "live_headlines",
@@ -7816,6 +8628,14 @@ class OutputFormatter:
             "option_mid", "option_break_even", "option_break_even_pct",
             "option_iv", "option_theta", "option_moneyness_pct",
             "option_score", "option_source",
+            "option_quote_timestamp", "option_quote_status",
+            "option_quote_timeframe", "option_underlying_timestamp",
+            "option_shares_per_contract", "option_ask",
+            "option_contract_symbol", "option_max_loss_per_contract",
+            "option_actionable", "option_minimum_expiry",
+            "option_rejection_reason", "option_rejection_counts",
+            "option_data_status",
+            "option_delta_source", "option_underlying_price",
             "flags",
         ]
 
@@ -7830,7 +8650,11 @@ class OutputFormatter:
             s["recommended_shares_per_10k"] = (
                 s.get("shares_per_10k_risk", 0) if actionable else 0
             )
-            s["flags"] = ", ".join(s.get("flags", []))
+            flags = s.get("flags") or []
+            s["flags"] = (
+                flags if isinstance(flags, str)
+                else ", ".join(dict.fromkeys(str(flag) for flag in flags))
+            )
             if isinstance(s.get("failed_rules"), list):
                 s["failed_rules"] = ", ".join(s.get("failed_rules", []))
             s.setdefault("holding_horizon_days", HOLDING_HORIZON_DAYS)
@@ -7880,7 +8704,8 @@ class OutputFormatter:
                 "output_limit": TARGET_FINAL_CANDIDATES,
                 "output_is_quota": False,
                 "setup_quality_is_probability": False,
-                "follows": ["insider buying", "short interest fuel", "crowd/volume momentum"],
+                "follows": ["strict bullish breakout eligibility", "validated ML lift", "dated open-market insider evidence"],
+                "context_only": ["short interest", "price/volume hype", "option contract quality"],
                 "avoids": [
                     f"extension > {MAX_EXTENSION_ABOVE_SMA50:.0%} above the 50DMA",
                     f"blow-off RSI > {MAX_EXHAUSTION_RSI:.0f}",
@@ -7906,6 +8731,7 @@ class OutputFormatter:
                 "fundamentals": dict(DATA_SOURCE_USAGE["fundamentals"]),
                 "options": dict(DATA_SOURCE_USAGE["options"]),
             },
+            "scan_diagnostics": diagnostics or {},
             "macro_regime": macro.to_dict() if macro is not None else None,
             "stage_counts": stage_counts,
             "ml_hyperparameters": ml_params,
@@ -7918,6 +8744,15 @@ class OutputFormatter:
                 "limitations": [
                     "The live universe contains securities listed today; it is not a point-in-time delisted universe.",
                     "Panel and setup-quality scores are transparent heuristics, not estimated win probabilities.",
+                    "The five panel scores are coded style heuristics, not five independent expert opinions.",
+                    "Hype measures price/volume activity, not measured social-media sentiment.",
+                    "The classifier estimates a greater-than-5% terminal return event, not probability of any profit or option profitability.",
+                    "Targets are risk/reward planning levels; stops and position risk are not guaranteed against gaps.",
+                    "Positive classification skill does not establish net trading profitability after costs or stop/target execution.",
+                    "Broad-panel calibration has not been separately validated for the ten-rule selected trading policy.",
+                    "Provider histories can have different adjustment policies; the coverage report discloses this heterogeneity.",
+                    "Volatility contraction uses three ATR snapshots, not a validated VCP pattern detector.",
+                    "An estimated option delta uses an approximate European model; it is not a provider Greek or an option-profit forecast.",
                     "No scanner can guarantee predictive accuracy or eliminate gap, liquidity, and geopolitical risk.",
                 ],
             },
@@ -7954,13 +8789,65 @@ class OutputFormatter:
                     "days_to_earnings": s.get("days_to_earnings"),
                     "catalyst_categories": s.get("catalyst_categories") or [],
                     "live_headlines": s.get("live_headlines") or [],
+                    "price": s.get("price"),
+                    "stop_loss": s.get("stop_loss"),
+                    "target_price": s.get("target_price"),
+                    "target_kind": s.get("target_kind"),
+                    "sizing_basis": s.get("sizing_basis"),
+                    "risk_per_share": s.get("risk_per_share"),
+                    "reward_risk_ratio": s.get("reward_risk_ratio"),
+                    "recommended_shares_per_10k": s.get("recommended_shares_per_10k", 0),
+                    "position_cap_pct": s.get("position_cap_pct"),
+                    "fundamentals_quality": s.get("fundamentals_quality"),
+                    "fundamentals_sources": s.get("fundamentals_sources") or [],
+                    "quote_type": s.get("quote_type"),
+                    "quote_type_source": s.get("quote_type_source"),
+                    "benchmark_excess_20d": s.get("benchmark_excess_20d"),
+                    "benchmark_excess_63d": s.get("benchmark_excess_63d"),
+                    "benchmark_excess_126d": s.get("benchmark_excess_126d"),
+                    "instrument_risk_flags": s.get("instrument_risk_flags") or [],
+                    "panel_data_coverage": s.get("panel_data_coverage"),
+                    "insider_evidence_quality": s.get("insider_evidence_quality"),
+                    "fundamental_data_coverage": s.get("fundamental_data_coverage"),
+                    "insider_evidence_asof": s.get("insider_evidence_asof"),
+                    "setup_archetype": s.get("setup_archetype"),
+                    "setup_archetypes": s.get("setup_archetypes") or [],
+                    "strategy_gate": s.get("strategy_gate"),
+                    "earnings_verification": s.get("earnings_verification"),
+                    "ml_probability_usable": s.get("ml_probability_usable"),
+                    "ml_reference_base_rate": s.get("ml_reference_base_rate"),
+                    "ml_probability_lift": s.get("ml_probability_lift"),
+                    "ml_probability_calibrated": s.get("ml_probability_calibrated"),
+                    "ml_active_models": s.get("ml_active_models") or [],
+                    "ml_target_definition": s.get("ml_target_definition"),
+                    "score_components": s.get("score_components") or {},
+                    "score_weights": s.get("score_weights") or {},
+                    "flags": s.get("flags"),
+                    "option_candidate": s.get("option_candidate"),
+                    "option_strike": s.get("option_strike"),
+                    "option_expiry": s.get("option_expiry"),
+                    "option_ask": s.get("option_ask"),
+                    "option_break_even": s.get("option_break_even"),
+                    "option_quote_timestamp": s.get("option_quote_timestamp"),
+                    "option_quote_status": s.get("option_quote_status"),
+                    "option_quote_timeframe": s.get("option_quote_timeframe"),
+                    "option_underlying_timestamp": s.get("option_underlying_timestamp"),
+                    "option_shares_per_contract": s.get("option_shares_per_contract"),
+                    "option_actionable": s.get("option_actionable", False),
+                    "option_max_loss_per_contract": s.get("option_max_loss_per_contract"),
+                    "option_minimum_expiry": s.get("option_minimum_expiry"),
+                    "option_rejection_reason": s.get("option_rejection_reason"),
+                    "option_rejection_counts": s.get("option_rejection_counts") or {},
+                    "option_data_status": s.get("option_data_status"),
+                    "option_delta_source": s.get("option_delta_source"),
+                    "option_underlying_price": s.get("option_underlying_price"),
                 }
                 for s in survivors_sorted[:25]
             ],
         }
         json_path = OUTPUT_DIR / f"scan_{timestamp}.json"
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, default=str)
+            json.dump(json_safe(report), f, indent=2, default=str, allow_nan=False)
         log.info(f"Report saved to {json_path}")
 
         # Console output
@@ -7976,6 +8863,13 @@ class OutputFormatter:
         print(f"  Engine: {report.get('engine', ENGINE_NAME)} v{report.get('engine_version', ENGINE_VERSION)}")
         print(f"  Scan Time: {report['scan_timestamp']}")
         print("=" * 100)
+
+        diagnostics = report.get("scan_diagnostics") or {}
+        if diagnostics:
+            coverage = diagnostics.get("data_coverage") or {}
+            print("\n  DATA COVERAGE: " + json.dumps(json_safe(coverage), sort_keys=True))
+        print("  Setup = heuristic quality; ML = P(20-session terminal return > 5%), not P(any profit).")
+        print("  Stops/targets/sizing use the signal close and must be refreshed at the actual entry.")
 
         # Macro regime context
         macro_dict = report.get("macro_regime") or {}
@@ -8085,6 +8979,7 @@ class OutputFormatter:
         reason: str,
         stage_counts: Dict[str, int],
         macro: Optional["MacroRegime"] = None,
+        diagnostics: Optional[Dict] = None,
     ) -> Path:
         """Persist an auditable incomplete-run artifact before exiting nonzero."""
         OUTPUT_DIR.mkdir(exist_ok=True)
@@ -8095,13 +8990,14 @@ class OutputFormatter:
             "engine": ENGINE_NAME,
             "engine_version": ENGINE_VERSION,
             "scan_timestamp": now_et(),
-            "reason": str(reason),
+            "reason": redact_sensitive_text(reason),
             "stage_counts": dict(stage_counts),
             "macro_regime": macro.to_dict() if macro is not None else None,
+            "scan_diagnostics": diagnostics or {},
             "total_survivors": 0,
         }
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, default=str)
+            json.dump(json_safe(payload), handle, indent=2, default=str, allow_nan=False)
         log.info(f"Incomplete-run status saved to {path}")
         return path
 
@@ -8110,15 +9006,12 @@ class OutputFormatter:
         near_misses: List[Dict],
         stage_counts: Dict[str, int],
         macro: Optional["MacroRegime"] = None,
+        diagnostics: Optional[Dict] = None,
     ) -> Optional[pd.DataFrame]:
         """
         Save and display the near-miss report when zero survivors emerge.
         Outputs top 3 tickers closest to passing all 10 hard buy rules.
         """
-        if not near_misses:
-            log.info("No near-miss candidates to report.")
-            return None
-
         OUTPUT_DIR.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -8139,7 +9032,11 @@ class OutputFormatter:
                 "return_20d": nm.get("return_20d"),
             })
 
-        df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows, columns=[
+            "near_miss_rank", "ticker", "price", "rules_passed", "rules_failed",
+            "passed_rules", "failed_rules", "rsi_14", "macd_histogram",
+            "volume_ratio", "return_20d",
+        ])
 
         # Save CSV
         csv_path = OUTPUT_DIR / f"near_misses_{timestamp}.csv"
@@ -8160,6 +9057,7 @@ class OutputFormatter:
             "total_survivors": 0,
             "stage_counts": stage_counts,
             "macro_regime": macro.to_dict() if macro is not None else None,
+            "scan_diagnostics": diagnostics or {},
             "near_misses": [
                 {
                     "rank": nm["near_miss_rank"],
@@ -8173,7 +9071,7 @@ class OutputFormatter:
             ],
         }
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, default=str)
+            json.dump(json_safe(report), f, indent=2, default=str, allow_nan=False)
 
         # Console output
         print("\n" + "=" * 100)
@@ -8259,13 +9157,20 @@ def main():
     log.info(f"  Wall-clock budget: {PIPELINE_BUDGET_MINUTES:.0f} min")
     log.info(
         f"  Strategy: {HOLDING_HORIZON_DAYS}-session horizon, target "
-        f"+{ML_TARGET_RETURN:.0%}, insider/hype weighted, anti-chase guard on"
+        f"+{ML_TARGET_RETURN:.0%}, validated ML lift and dated insider evidence, anti-chase guard on"
     )
     log.info("=" * 70)
 
     stage_counts = {}
     ml_params = {}
     feature_importances = {}
+    diagnostics: Dict[str, Any] = {
+        "mandate": "liquid_US_listed_long_breakout_equities_and_ETFs",
+        "selection_policy": "all_10_technical_rules_required; not_all_investment_styles",
+        "setup_rules_are_independent_evidence": False,
+        "portfolio_sizing": "standalone_per_name; not_simultaneous_portfolio_allocations",
+        "net_profitability_validated": False,
+    }
     near_misses: List[Dict] = []
     macro: Optional[MacroRegime] = None
 
@@ -8289,26 +9194,37 @@ def main():
         discovery = UniverseDiscovery(MASSIVE_API_KEY)
         tickers = discovery.discover()
         stage_counts["Stage 1: Universe Discovered"] = len(tickers)
+        diagnostics["discovery"] = getattr(discovery, "coverage", {})
 
         # ── DATA FETCH: OHLCV via MBOUM primary + live fallbacks ──────
         clock.check("Data Fetch")
         fetcher = DataFetcher(clock=clock)
+        diagnostics["data_coverage"] = getattr(fetcher, "coverage", {})
         all_data = fetcher.fetch_ohlcv(tickers)
+        diagnostics["data_coverage"] = getattr(fetcher, "coverage", {})
         stage_counts["Data Fetch: Tickers with OHLCV"] = len(all_data)
 
         # ── COMPUTE TECHNICALS ───────────────────────────────────────
         log.info("Computing technical indicators for all tickers...")
+        technical_failures = []
         for ticker in list(all_data.keys()):
             try:
                 all_data[ticker] = TechnicalEngine.compute_all(all_data[ticker])
             except Exception as e:
                 log.debug(f"  Tech calc failed for {ticker}: {e}")
+                technical_failures.append(ticker)
                 del all_data[ticker]
+        diagnostics["technical_calculation_failures"] = technical_failures
         stage_counts["Technicals Computed"] = len(all_data)
 
         # ── STAGE 2: Execution Guards ────────────────────────────────
         clock.check("Stage 2: Execution Guards")
         guarded_data, guard_rejected = ExecutionGuards.apply(all_data)
+        guard_counts: Dict[str, int] = {}
+        for reason in guard_rejected.values():
+            label = str(reason).split(":", 1)[0]
+            guard_counts[label] = guard_counts.get(label, 0) + 1
+        diagnostics["execution_guard_rejections"] = guard_counts
         stage_counts["Stage 2: Passed Guards"] = len(guarded_data)
 
         if len(guarded_data) == 0:
@@ -8317,6 +9233,13 @@ def main():
         # ── STAGE 3: Hard Buy Rules ──────────────────────────────────
         clock.check("Stage 3: Hard Buy Rules")
         strict_survivors, buy_rejected = HardBuyRules.apply(guarded_data)
+        rule_counts: Dict[str, int] = {}
+        for ticker, frame in guarded_data.items():
+            rule_result = HardBuyRules._evaluate_all_rules(ticker, frame) or {}
+            for failed in rule_result.get("failed_rules", []):
+                rule_counts[failed] = rule_counts.get(failed, 0) + 1
+        diagnostics["hard_rule_failure_counts"] = rule_counts
+        diagnostics["hard_rule_failure_counts_overlap"] = True
         stage_counts["Stage 3: Strict Hard Buy Rules"] = len(strict_survivors)
 
         if len(strict_survivors) < TARGET_FINAL_CANDIDATES:
@@ -8339,7 +9262,7 @@ def main():
         if len(survivors) == 0:
             # No-trade is a valid model decision, not a failed workflow.
             OutputFormatter.save_near_misses(
-                near_misses, stage_counts, macro=macro
+                near_misses, stage_counts, macro=macro, diagnostics=diagnostics
             )
             log.info(
                 "No ticker passed every hard rule. Completed successfully with "
@@ -8363,8 +9286,7 @@ def main():
         )
         survivors = ranker.rank(survivors, all_data, training_universe=ml_training_pool)
         ml_params = {
-            "XGBoost": "n_estimators=200, max_depth=6, lr=0.05, subsample=0.8",
-            "RandomForest": "n_estimators=200, max_depth=8, min_samples_leaf=20",
+            "model_specs": getattr(ranker, "model_specs", {}),
             "LSTM": (
                 "Experimental informational layer enabled"
                 if ENABLE_EXPERIMENTAL_LSTM and LSTM_AVAILABLE
@@ -8386,6 +9308,10 @@ def main():
             ),
             "validation_metrics": dict(ranker.validation_metrics),
             "probabilities_calibrated": ranker.probabilities_calibrated,
+            "per_model_probabilities_calibrated": getattr(ranker, "model_probabilities_calibrated", {}),
+            "active_models": getattr(ranker, "active_models", []),
+            "ensemble_validation_metrics": getattr(ranker, "ensemble_validation_metrics", {}),
+            "net_trade_profitability_validated": False,
             "survivorship_bias_controlled": False,
             "survivorship_bias_note": (
                 "Training histories belong to securities listed today; "
@@ -8397,7 +9323,8 @@ def main():
             log.warning(
                 "  ML ensemble degraded this run -- "
                 f"{', '.join(ranker.degraded_models)} scored 0.5 for every "
-                "survivor. Ranking leans on the hard rules and panel."
+                "survivor. Failed models are excluded from the ensemble; "
+                "unvalidated ensemble probabilities cannot authorize a BUY."
             )
         feature_importances = ranker.feature_importances
 
@@ -8430,6 +9357,21 @@ def main():
         survivors = panel.score_all(
             survivors, all_data, fundamentals, apply_filter=False
         )
+        for candidate in survivors:
+            info = fundamentals.get(candidate["ticker"], {})
+            quote_type = str(info.get("quote_type") or "UNKNOWN").upper()
+            candidate["quote_type"] = quote_type
+            candidate["earnings_event_source"] = info.get("earnings_event_source")
+            earnings = normalize_earnings_date(candidate.get("live_earnings_date"))
+            if quote_type in {"ETF", "ETN", "MUTUALFUND"}:
+                candidate["earnings_verification"] = "fund_no_issuer_earnings"
+            elif earnings and pd.Timestamp(earnings).date() >= today_et():
+                candidate["earnings_verification"] = "upcoming_date_available"
+            else:
+                candidate["earnings_verification"] = "unverified"
+                flags = candidate.setdefault("flags", [])
+                if isinstance(flags, list) and "EARNINGS_DATE_UNVERIFIED" not in flags:
+                    flags.append("EARNINGS_DATE_UNVERIFIED")
         panel_qualified = [
             s for s in survivors
             if s.get("panel_composite_score", 0) >= 60 and s.get("panel_consensus", 0) >= 3
@@ -8489,43 +9431,14 @@ def main():
             df = all_data.get(s["ticker"])
             if df is not None and len(df) > 0:
                 last = df.iloc[-1]
-                close = float(last.get("Close", 0.0)) or 0.0
-                atr = float(last.get("ATR_14", 0.0)) or 0.0
-                sma50 = float(last.get("SMA_50", 0.0)) or 0.0
-                # Stop = max(SMA50, close - 2.5 * ATR) -- tighter of structural
-                # support and volatility-based stop. Matches Minervini protocol.
-                vol_stop = close - 2.5 * atr
-                stop_loss = max(sma50, vol_stop, 0.0) if sma50 > 0 else vol_stop
-                if stop_loss <= 0 or stop_loss >= close:
-                    stop_loss = close * 0.92  # 8% fallback
-                # Target: 2.5x risk (asymmetric R/R Druckenmiller-style)
-                risk = max(close - stop_loss, 0.01)
-                target = close + 2.5 * risk
-                # 1% risk-of-equity sizing scaled by macro regime
-                regime_scalar = macro.position_sizing_scalar()
-                pct_of_equity = round(1.0 * regime_scalar, 2)  # % of portfolio risked
-                risk_limited_shares = math.floor(
-                    (10000.0 * (pct_of_equity / 100.0)) / max(risk, 0.01)
+                plan = build_risk_plan(
+                    last.get("Close"), last.get("ATR_14"), last.get("SMA_50"),
+                    macro.position_sizing_scalar(),
                 )
-                notional_limited_shares = math.floor(
-                    (10000.0 * MAX_POSITION_PCT) / max(close, 0.01)
-                )
-                shares_per_10k = max(
-                    0, min(risk_limited_shares, notional_limited_shares)
-                )
-                s["stop_loss"] = round(stop_loss, 2)
-                s["target_price"] = round(target, 2)
-                s["risk_per_share"] = round(risk, 2)
-                s["reward_risk_ratio"] = round((target - close) / risk, 2)
-                s["pct_equity_risk"] = pct_of_equity
-                s["shares_per_10k_risk"] = int(shares_per_10k)
-                s["position_value_per_10k"] = round(
-                    shares_per_10k * close, 2
-                )
-                s["position_pct_per_10k"] = round(
-                    shares_per_10k * close / 10000.0 * 100.0, 2
-                )
-                s["position_cap_pct"] = round(MAX_POSITION_PCT * 100.0, 1)
+                if not plan:
+                    s.setdefault("flags", []).append("INVALID_RISK_INPUTS")
+                    s["fundamentals_quality"] = "failed"
+                s.update(plan)
 
         # ── PRE-OUTPUT VERIFICATION ──────────────────────────────────
         log.info("Running pre-output verification...")
@@ -8569,6 +9482,8 @@ def main():
                 elif isinstance(s.get("flags"), str):
                     s["flags"] = s["flags"] + ", LOW_FLOAT" if s["flags"] else "LOW_FLOAT"
 
+            # Include verification-time risk flags in the published score.
+            s["trade_setup_score"] = round(OptionsEvaluator._trade_setup_score(s), 1)
             verified.append(s)
 
         # Remove duplicate tickers
@@ -8603,7 +9518,8 @@ def main():
 
         # ── FORMAT AND SAVE OUTPUT ───────────────────────────────────
         result_df = OutputFormatter.format_and_save(
-            final, stage_counts, ml_params, feature_importances, macro=macro
+            final, stage_counts, ml_params, feature_importances, macro=macro,
+            diagnostics=diagnostics,
         )
 
         elapsed = time.time() - pipeline_start
@@ -8619,7 +9535,7 @@ def main():
             OutputFormatter.save_near_misses(
                 near_misses, stage_counts, macro=macro
             )
-            OutputFormatter.save_status_report(str(e), stage_counts, macro)
+            OutputFormatter.save_status_report(str(e), stage_counts, macro, diagnostics)
         except Exception as inner:
             log.error(f"  Could not save near-miss diagnostics: {inner}")
         print(f"\n*** PIPELINE BUDGET EXCEEDED ***\n{e}\n")
@@ -8628,7 +9544,7 @@ def main():
     except PipelineError as e:
         log.error(f"PIPELINE STOPPED: {e}")
         try:
-            OutputFormatter.save_status_report(str(e), stage_counts, macro)
+            OutputFormatter.save_status_report(str(e), stage_counts, macro, diagnostics)
         except Exception as inner:
             log.error(f"  Could not save incomplete-run status: {inner}")
         print(f"\n*** PIPELINE STOPPED ***\n{e}\n")
@@ -8638,7 +9554,7 @@ def main():
         log.error(f"Unexpected error: {e}")
         log.error(traceback.format_exc())
         try:
-            OutputFormatter.save_status_report(str(e), stage_counts, macro)
+            OutputFormatter.save_status_report(str(e), stage_counts, macro, diagnostics)
         except Exception as inner:
             log.error(f"  Could not save incomplete-run status: {inner}")
         print(f"\n*** UNEXPECTED ERROR ***\n{e}\n")

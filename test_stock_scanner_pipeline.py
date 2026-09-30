@@ -293,22 +293,23 @@ class ScannerRegressionTests(unittest.TestCase):
                 status = scanner.verify_api_credentials()
         self.assertEqual(status["MASSIVE_API_KEY"], "env")
         self.assertEqual(status["MBOUM_API_KEY"], "absent")
-        self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
-        self.assertEqual(status["FINNHUB_API_KEY"], "embedded")
+        self.assertEqual(status["TWELVEDATA_API_KEY"], "absent")
+        self.assertEqual(status["FINNHUB_API_KEY"], "absent")
 
-    def test_committed_fallback_keys_are_used_when_secrets_are_empty(self):
+    def test_no_api_keys_are_committed_and_empty_environment_uses_public_sources(self):
         with patch.dict(os.environ, {}, clear=True):
             with patch.object(scanner.log, "warning"), patch.object(scanner.log, "info"):
                 status = scanner.verify_api_credentials()
             massive = scanner._resolve_api_key("MASSIVE_API_KEY")
             twelve = scanner._resolve_api_key("TWELVEDATA_API_KEY")
             finnhub = scanner._resolve_api_key("FINNHUB_API_KEY")
-        self.assertEqual(status["MASSIVE_API_KEY"], "embedded")
-        self.assertEqual(status["TWELVEDATA_API_KEY"], "embedded")
-        self.assertEqual(status["FINNHUB_API_KEY"], "embedded")
-        self.assertTrue(massive)
-        self.assertTrue(twelve)
-        self.assertTrue(finnhub)
+        self.assertEqual(status["MASSIVE_API_KEY"], "absent")
+        self.assertEqual(status["TWELVEDATA_API_KEY"], "absent")
+        self.assertEqual(status["FINNHUB_API_KEY"], "absent")
+        self.assertFalse(massive)
+        self.assertFalse(twelve)
+        self.assertFalse(finnhub)
+        self.assertEqual(scanner.EMBEDDED_FALLBACK_KEYS, {})
 
     def test_credential_status_ignores_import_time_key_snapshot(self):
         # On Actions every secret is exported for the whole job, so the module
@@ -323,7 +324,7 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertEqual(status["MBOUM_API_KEY"], "absent")
         self.assertEqual(status["MBOUM_OPTIONS_KEY"], "absent")
 
-    def test_env_secrets_win_over_committed_fallback_keys(self):
+    def test_env_secrets_are_the_only_credential_source(self):
         secrets = {
             "MASSIVE_API_KEY": "massive-secret",
             "MBOUM_API_KEY": "mboum-secret",
@@ -348,7 +349,8 @@ class ScannerRegressionTests(unittest.TestCase):
             self.assertEqual(scanner._resolve_api_key("MBOUM_API_KEY"), "")
             self.assertEqual(scanner._resolve_api_key("MBOUM_OPTIONS_KEY"), "")
 
-    def test_ohlcv_router_keeps_mboum_primary_when_it_returns_history(self):
+    @patch.object(scanner, "expected_last_closed_trading_day", return_value=date(2026, 4, 29))
+    def test_ohlcv_router_keeps_mboum_primary_when_it_returns_history(self, _expected):
         history = _guard_ready_df(datetime(2026, 4, 29).date())
         router = scanner.MarketDataRouter()
         with patch.object(router, "_provider_enabled", return_value=True):
@@ -360,7 +362,8 @@ class ScannerRegressionTests(unittest.TestCase):
         mboum.assert_called_once_with("AAPL")
         massive.assert_not_called()
 
-    def test_ohlcv_router_falls_back_to_massive_when_mboum_is_out_of_credit(self):
+    @patch.object(scanner, "expected_last_closed_trading_day", return_value=date(2026, 4, 29))
+    def test_ohlcv_router_falls_back_to_massive_when_mboum_is_out_of_credit(self, _expected):
         history = _guard_ready_df(datetime(2026, 4, 29).date())
         router = scanner.MarketDataRouter()
         with patch.object(router, "_provider_enabled", return_value=True):
@@ -377,7 +380,8 @@ class ScannerRegressionTests(unittest.TestCase):
         massive.assert_called_once_with("AAPL")
         twelve.assert_not_called()
 
-    def test_ohlcv_router_skips_tripped_mboum_circuit_on_later_tickers(self):
+    @patch.object(scanner, "expected_last_closed_trading_day", return_value=date(2026, 4, 29))
+    def test_ohlcv_router_skips_tripped_mboum_circuit_on_later_tickers(self, _expected):
         history = _guard_ready_df(datetime(2026, 4, 29).date())
         router = scanner.MarketDataRouter()
         scanner.ProviderCircuit.get("MBOUM-OHLCV", fail_limit=4).trip("credits exhausted")
@@ -419,7 +423,7 @@ class ScannerRegressionTests(unittest.TestCase):
                 {"symbol": "FAKE", "mic": "XNAS", "type": "Warrant"},
             ]
         )
-        self.assertEqual(cleaned, ["TEST"])
+        self.assertEqual(cleaned, ["BRK.A", "TEST"])
 
     def test_nasdaq_listing_parser_keeps_listed_equities_not_warrants(self):
         nasdaq_text = "\n".join([
@@ -1010,7 +1014,10 @@ class ScannerRegressionTests(unittest.TestCase):
         self.assertEqual(ranker.degraded_models, ["XGBoost"])
         self.assertEqual(out[0]["ml_score_xgb"], 0.5)
         self.assertEqual(out[0]["ml_score_rf"], 0.8)
-        self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.65)
+        self.assertAlmostEqual(out[0]["ml_ensemble_score"], 0.8)
+        # A dead model's neutral placeholder is excluded from the ensemble;
+        # the surviving model's score is preserved without inventing calibration.
+        self.assertFalse(out[0]["ml_probability_usable"])
         # A 0.5 from a dead model is the absence of a signal, so it is flagged
         # rather than presented as a neutral read on the name.
         self.assertIn("ML_DEGRADED:XGBoost", out[0]["flags"])
