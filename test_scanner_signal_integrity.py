@@ -1,5 +1,8 @@
 """Numerical, provider-schema, and admission invariants; no live API requests."""
 from datetime import date, datetime, timedelta
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -180,6 +183,15 @@ class SignalIntegrityTests(unittest.TestCase):
         self.assertEqual(result["insider_sell_transactions"], 1.)
         self.assertEqual(result["insider_net_shares"], 50.)
         self.assertEqual(result["insider_data_asof"], "2026-09-28")
+
+        candidate = {"ticker": "TEST"}
+        candidate.update(scanner.MomentumQuality.evidence(pd.Series(dtype=float), result))
+        with tempfile.TemporaryDirectory() as directory, patch.object(scanner, "OUTPUT_DIR", Path(directory)), patch.object(scanner.OutputFormatter, "_print_results"):
+            scanner.OutputFormatter.format_and_save([candidate], {}, {}, {})
+            report = json.loads(next(Path(directory).glob("*.json")).read_text())
+            csv = pd.read_csv(next(Path(directory).glob("*.csv")))
+        self.assertEqual(csv.loc[0, "insider_data_asof"], "2026-09-28")
+        self.assertEqual(report["top_25"][0]["insider_data_asof"], "2026-09-28")
 
     def test_single_insider_trade_does_not_manufacture_full_conviction(self):
         self.assertAlmostEqual(scanner.MomentumQuality.insider_score({"insider_buy_transactions": 1, "insider_sell_transactions": 0}), 100 * 2 / 3)
