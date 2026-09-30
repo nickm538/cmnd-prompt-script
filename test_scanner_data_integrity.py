@@ -1,6 +1,7 @@
 """Regression cases for provider recovery, coverage and credential containment."""
 
 from datetime import date, timedelta
+import json
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
@@ -28,6 +29,43 @@ def history(end=SESSION, count=260):
 class DataIntegrityTests(TestCase):
     def setUp(self):
         scanner.reset_market_router()
+
+    def test_successful_month_fields_and_quota_words_are_not_api_errors(self):
+        payloads = [
+            {"meta": {"status": 200, "shortName": "1-3 Month Treasury"}, "body": {}},
+            {"body": {"priceToSalesTrailing12Months": 3.5}},
+            {"body": [{"averageDailyVolume3Month": 100_000}]},
+            {"results": [{"description": "Credit Limit and Quota Solutions"}]},
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertEqual(scanner.classify_http_error(200, json.dumps(payload)), "other")
+
+    def test_mboum_valid_data_never_trips_history_fundamental_or_option_circuit(self):
+        payload = {"meta": {"status": 200}, "body": {"averageDailyVolume3Month": 100_000}}
+        response = Mock(status_code=200, text=json.dumps(payload))
+        response.json.return_value = payload
+        api = scanner.MboumAPI("test-key")
+        for name in ["MBOUM-OHLCV", "MBOUM-Fundamentals", "MBOUM-Options"]:
+            circuit = scanner.ProviderCircuit.get(name)
+            with self.subTest(provider=name):
+                self.assertEqual(api._decode_payload(response, circuit, "test"), payload)
+                self.assertTrue(circuit.available())
+
+    def test_explicit_quota_rate_and_auth_envelopes_remain_provider_errors(self):
+        cases = [
+            ({"error": "API credits exhausted this month"}, "credit"),
+            ({"meta": {"status": 429, "message": "Limit reached for the current minute"}}, "rate"),
+            ({"meta": {"status": 403}}, "auth"),
+            ({"body": "API credits exhausted this month"}, "credit"),
+        ]
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                self.assertEqual(scanner.classify_http_error(200, json.dumps(payload)), expected)
+
+    def test_month_word_in_symbol_miss_does_not_mean_exhausted_credits(self):
+        for status in [200, 404]:
+            self.assertEqual(scanner.classify_http_error(status, "No data for the current month"), "other")
 
     def test_safe_div_is_defined_and_rejects_missing_or_nonfinite_values(self):
         self.assertEqual(scanner.safe_div(6, 3), 2)

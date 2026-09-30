@@ -676,7 +676,7 @@ _CREDIT_HINTS = (
     "out of credit", "out of api credits", "insufficient credit",
     "no credits", "credit limit", "not enough credit", "credits exhausted",
     "quota", "payment required", "upgrade your plan", "exceeded your",
-    "monthly limit", "api call credits", "usage limit", "plan limit",
+    "monthly limit", "daily limit", "api call credits", "usage limit", "plan limit",
     "you have run out", "limit reached", "not entitled",
 )
 _MINUTE_HINTS = ("per minute", "current minute", "too many requests")
@@ -684,13 +684,48 @@ _MINUTE_HINTS = ("per minute", "current minute", "too many requests")
 
 def classify_http_error(status_code: int, body: str = "") -> str:
     """Classify a provider error as credit, rate, auth, or other."""
-    text = (body or "").lower()
+    # Inspect error envelopes, not successful market-data fields. Names such as
+    # priceToSalesTrailing12Months and averageDailyVolume3Month are normal data,
+    # and must never disable a provider for the rest of the scan.
+    error_text = body or ""
+    try:
+        payload = json.loads(error_text)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        messages: List[str] = []
+        envelopes = [payload]
+        if isinstance(payload.get("meta"), dict):
+            envelopes.append(payload["meta"])
+        if isinstance(payload.get("body"), str):
+            messages.append(payload["body"])
+        elif isinstance(payload.get("body"), dict) and any(
+            key in payload["body"] for key in ("error", "errors", "message")
+        ):
+            envelopes.append(payload["body"])
+        for envelope in envelopes:
+            for key in ("status", "status_code", "code"):
+                value = envelope.get(key)
+                if isinstance(value, (int, str)) and str(value).isdigit() and int(value) >= 400:
+                    status_code = int(value)
+            for key in ("error", "errors", "message", "note", "Note", "information", "Information", "detail", "reason"):
+                value = envelope.get(key)
+                if isinstance(value, str):
+                    messages.append(value)
+                elif key in {"error", "errors"} and isinstance(value, (dict, list)):
+                    messages.append(json.dumps(value))
+        error_text = " ".join(messages) if messages or status_code < 400 else error_text
+    elif isinstance(payload, list) and status_code < 400:
+        error_text = ""
+    elif isinstance(payload, str):
+        error_text = payload
+    text = error_text.lower()
     minute = any(hint in text for hint in _MINUTE_HINTS)
     monthly = any(hint in text for hint in ("month", "daily limit", "per day", "current day"))
     credit = any(hint in text for hint in _CREDIT_HINTS)
     if minute and not monthly:
         return "rate"
-    if status_code == 402 or monthly or (credit and not minute):
+    if status_code == 402 or (credit and (monthly or not minute)):
         return "credit"
     if status_code in (401, 403):
         return "auth"

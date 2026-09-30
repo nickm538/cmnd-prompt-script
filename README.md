@@ -41,7 +41,7 @@ Store keys in local environment variables or **repository Actions secrets**:
 | `MBOUM_OPTIONS_KEY` | Preferred options chains |
 | `TWELVEDATA_API_KEY` | History and fundamentals fallback |
 | `FINNHUB_API_KEY` | Listings, history if entitled, fundamentals, dated insiders, news and calendars |
-| `ALPHAVANTAGE_API_KEY` | Supported optional provider configuration |
+| `ALPHAVANTAGE_API_KEY` | Reserved configuration; no active Alpha Vantage fetch path |
 
 There are no working fallback keys in source. **Rotate the Massive, TwelveData,
 and Finnhub keys that were previously public in git history** and save replacements

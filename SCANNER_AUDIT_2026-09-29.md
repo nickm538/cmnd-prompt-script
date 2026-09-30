@@ -74,6 +74,7 @@ introduce another production application or a second scanner entry point.
 | History integrity | UTC candle labels, mixed multi-index responses, malformed OHLC, and unfinished bars could corrupt signals | Correct dates/symbol selection; reject nonfinite or inconsistent bars; normalize duplicates/order; apply XNYS finalization |
 | Incomplete scanning | A numerical minimum history count could hide weak market coverage | Export attempted/loaded/unavailable lists and denominator; stop below 80% retained-history coverage |
 | Runtime work | Unbounded submitted futures and invalid budgets undermined predictable completion | Bound queued futures, cancel pending work on interruption, and validate a finite positive budget |
+| False quota exhaustion | Valid MBOUM fields containing `Month`, including security names, fundamentals and option quotes, disabled whole providers | Classify explicit error envelopes and status codes; successful data fields cannot trip credit circuits |
 | Technical formulas | RSI/ATR/ADX initialization deviated from Wilder; flat RSI and missing values could mislead | Arithmetic-seeded Wilder smoothing, flat RSI 50, explicit missingness and OHLC integrity |
 | Strict admission | Separate reporting and admission evaluators disagreed, including volume/VWAP edge cases | One evaluator; complete rule outcomes, failure counts, and setup archetypes |
 | Fundamentals | Unit errors, stale quality flags and optional endpoint failure could distort valuation/growth or discard good base fields | Provider-specific percent/ratio/field normalization, quality recovery, endpoint-scoped circuits and coverage provenance |
@@ -136,7 +137,7 @@ results inform engineering choices; none validates this exact scanner.
 
 ## Validation evidence
 
-- Local Python 3.12: **135 tests run: 134 passed, one optional Torch test skipped**. This includes 71 additional regression cases across data, signals, models and output, plus corrections to existing expectations.
+- Local Python 3.12: **139 tests run: 138 passed, one optional Torch test skipped**. This includes 75 additional regression cases across data, signals, models and output, plus corrections to existing expectations.
 - Compiled the scanner and summary script; `git diff --check` passed.
 - Offline cases cover provider circuits, class aliases, incomplete discovery, missing quick quotes, malformed bars, session labels, Wilder calculations, fundamental units, insider dates, date purges, missing labels, ensemble calibration/failures, option timing/deliverables, action vetoes, sizing, strict JSON and empty/repeated exports.
 - Full live GitHub Actions scan: **pending in this audit draft**. Its results will be recorded before delivery. The temporary branch-only validation workflow will be removed after verification.
