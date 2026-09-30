@@ -74,11 +74,11 @@ jobs:
 
       - name: Check out repository
         if: steps.schedule_window.outputs.run_scan == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Python
         if: steps.schedule_window.outputs.run_scan == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
           cache: pip
@@ -129,7 +129,7 @@ jobs:
           report TWELVEDATA_API_KEY "$TWELVEDATA_API_KEY"
           report FINNHUB_API_KEY "$FINNHUB_API_KEY"
           if [[ -z "$MASSIVE_API_KEY" ]]; then
-            echo "::notice::MASSIVE_API_KEY secret is empty; the engine will use its committed fallback key."
+            echo "::notice::MASSIVE_API_KEY is empty; official exchange listings and other configured price providers will be used."
           fi
           if [[ -z "$MBOUM_API_KEY" ]]; then
             echo "::warning::MBOUM_API_KEY repository secret is empty in this job. Put it in Settings → Secrets and variables → Actions as MBOUM_API_KEY (not a Variable, and not an Environment secret unless the job sets environment:)."
@@ -138,10 +138,10 @@ jobs:
             echo "::warning::MBOUM_OPTIONS_KEY repository secret is empty in this job; options chains will fall back to Massive/Yahoo."
           fi
           if [[ -z "$TWELVEDATA_API_KEY" ]]; then
-            echo "::notice::TWELVEDATA_API_KEY secret is empty; the engine will use its committed fallback key."
+            echo "::notice::TWELVEDATA_API_KEY is empty; this provider is skipped."
           fi
           if [[ -z "$FINNHUB_API_KEY" ]]; then
-            echo "::notice::FINNHUB_API_KEY secret is empty; the engine will use its committed fallback key."
+            echo "::notice::FINNHUB_API_KEY is empty; company earnings and calendar coverage may be limited."
           fi
           echo "Credential check complete. MBOUM is primary when the key and credits are present."
 
@@ -149,14 +149,22 @@ jobs:
         if: >-
           steps.schedule_window.outputs.run_scan == 'true' &&
           (github.event_name != 'workflow_dispatch' || inputs.run_tests)
-        run: python -m unittest -v test_stock_scanner_pipeline.py
+        run: python -m unittest discover -v -p 'test_*.py'
 
       - name: Run live stock scanner
         if: steps.schedule_window.outputs.run_scan == 'true'
         env:
           SCAN_BUDGET_MINUTES: ${{ inputs.scan_budget_minutes || '100' }}
           LOG_LEVEL: ${{ inputs.log_level || 'INFO' }}
-        run: python new_stock_scanner_pipeline_claude_opus_41426.py
+        run: |
+          python - <<'PY'
+          import math
+          import os
+          budget = float(os.environ['SCAN_BUDGET_MINUTES'])
+          if not math.isfinite(budget) or not 0 < budget <= 110:
+              raise SystemExit('scan_budget_minutes must be positive, finite, and no more than 110 (job timeout is 120).')
+          PY
+          python new_stock_scanner_pipeline_claude_opus_41426.py
 
       - name: Publish results summary
         if: always() && steps.schedule_window.outputs.run_scan == 'true'
@@ -183,7 +191,7 @@ jobs:
 
       - name: Upload scan outputs
         if: always() && steps.schedule_window.outputs.run_scan == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: stock-scan-results
           path: |
