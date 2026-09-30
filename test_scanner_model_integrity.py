@@ -170,6 +170,16 @@ class OptionIntegrityTests(unittest.TestCase):
         self.assertEqual(result["option_candidate"], "N")
         self.assertIn("expires_before_thesis_and_buffer", result["option_rejection_counts"])
 
+    def test_individually_fresh_mixed_delay_quotes_must_also_be_synchronized(self):
+        delayed_underlying = pd.Timestamp(self.now - timedelta(minutes=16)).value
+        mismatched = {**self.contract, "underlying_timestamp": delayed_underlying, "underlying_timeframe": "DELAYED"}
+        self.assertEqual(scanner.OptionsEvaluator._quote_context(mismatched, self.now)["status"], "unsynchronized_quote_and_underlying")
+        result = self.evaluate([mismatched])
+        self.assertNotEqual(result["option_candidate"], "Y")
+        self.assertTrue(result["option_rejection_reason"])
+        synchronized = self.evaluate([{**self.contract, "quote_timestamp": delayed_underlying, "quote_timeframe": "DELAYED", "underlying_timestamp": delayed_underlying, "underlying_timeframe": "DELAYED"}])
+        self.assertEqual(synchronized["option_candidate"], "Y")
+
     def test_stale_and_future_quotes_never_become_call_buys(self):
         for stamp in (pd.Timestamp(self.now - timedelta(days=7)).value, pd.Timestamp(self.now + timedelta(hours=1)).value):
             result = self.evaluate([{**self.contract, "quote_timestamp": stamp}])

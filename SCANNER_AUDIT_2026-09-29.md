@@ -136,7 +136,7 @@ results inform engineering choices; none validates this exact scanner.
 
 ## Validation evidence
 
-- Local Python 3.12: **134 tests run: 133 passed, one optional Torch test skipped**. This includes 70 additional regression cases across data, signals, models and output, plus corrections to existing expectations.
+- Local Python 3.12: **135 tests run: 134 passed, one optional Torch test skipped**. This includes 71 additional regression cases across data, signals, models and output, plus corrections to existing expectations.
 - Compiled the scanner and summary script; `git diff --check` passed.
 - Offline cases cover provider circuits, class aliases, incomplete discovery, missing quick quotes, malformed bars, session labels, Wilder calculations, fundamental units, insider dates, date purges, missing labels, ensemble calibration/failures, option timing/deliverables, action vetoes, sizing, strict JSON and empty/repeated exports.
 - Full live GitHub Actions scan: **pending in this audit draft**. Its results will be recorded before delivery. The temporary branch-only validation workflow will be removed after verification.

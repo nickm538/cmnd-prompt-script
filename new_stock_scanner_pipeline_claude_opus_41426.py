@@ -7415,6 +7415,13 @@ class OptionsEvaluator:
         if delay not in {"REAL-TIME", "REALTIME", "DELAYED"} or underlying_delay not in {"REAL-TIME", "REALTIME", "DELAYED"}:
             result["status"] = "unverified_quote_delay"
             return result
+        # Each leg can be individually fresh for its provider's delay while
+        # describing different markets (e.g. a real-time option and a stock
+        # quote from fifteen minutes earlier). Do not calculate executable
+        # moneyness/breakeven against that unsynchronized underlying snapshot.
+        if abs(quote_at - underlying_at) > pd.Timedelta(minutes=OptionsEvaluator.QUOTE_STALENESS_MINUTES):
+            result["status"] = "unsynchronized_quote_and_underlying"
+            return result
         today = now.date()
         market_open = market_close = None
         if is_trading_day(today):
